@@ -15,6 +15,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/httpproxy"
@@ -39,6 +40,7 @@ type App struct {
 
 	pool     *nodes.Pool    // 出口节点选择/冷却
 	connPool *connpool.Pool // 上游空闲隧道连接池（预热）
+	limiter  *connlimit.Limiter
 	status   *status.Status
 
 	httpLn     net.Listener
@@ -63,6 +65,7 @@ func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
 	}
 
 	app := &App{cfg: cfg, logger: logger, metrics: metrics.New()}
+	app.limiter = connlimit.New(cfg.Limits.EffectiveMaxConnections())
 
 	baseTLS, err := buildClientTLS(cfg)
 	if err != nil {
@@ -118,14 +121,20 @@ func (a *App) Listen() error {
 		if err != nil {
 			return fmt.Errorf("clientapp: listen http %s: %w", addr, err)
 		}
-		a.httpLn = ln
+		a.httpLn = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
+			a.metrics.ConnRejected(metrics.ProtoHTTP)
+			httpproxy.WriteOverloaded(conn)
+		})
 	}
 	if addr := a.cfg.Inbound.SOCKS5; addr != "" {
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("clientapp: listen socks5 %s: %w", addr, err)
 		}
-		a.socksLn = ln
+		a.socksLn = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
+			a.metrics.ConnRejected(metrics.ProtoSOCKS5)
+			socks5.WriteOverloadReply(conn)
+		})
 	}
 	if addr := a.cfg.Metrics.Listen; addr != "" {
 		ln, err := net.Listen("tcp", addr)
@@ -253,6 +262,13 @@ func (a *App) runtimeStats() status.Runtime {
 				CooldownRemaining: status.Seconds(n.CooldownRemaining),
 				Idle:              idle[n.Addr],
 			})
+		}
+	}
+	if a.limiter != nil {
+		rt.Limit = &status.Limit{
+			MaxConnections: a.limiter.Max(),
+			Current:        a.limiter.Active(),
+			Rejected:       a.limiter.Rejected(),
 		}
 	}
 	return rt

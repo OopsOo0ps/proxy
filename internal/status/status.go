@@ -79,6 +79,14 @@ type Memory struct {
 type Runtime struct {
 	Connections Connections
 	Upstreams   []Upstream
+	Limit       *Limit
+}
+
+// Limit 是连接上限与拒绝统计（仅配置了连接上限时输出）。
+type Limit struct {
+	MaxConnections int    `json:"max_connections"` // 0 = 不限制
+	Current        int    `json:"current"`         // 当前占用
+	Rejected       uint64 `json:"rejected"`        // 累计被拒绝的连接数
 }
 
 // healthResponse 是 /health 的响应体。
@@ -94,6 +102,7 @@ type statsResponse struct {
 	Uptime      float64     `json:"uptime"` // 秒
 	Connections Connections `json:"connections"`
 	Upstreams   []Upstream  `json:"upstreams,omitempty"`
+	Limit       *Limit      `json:"limit,omitempty"`
 	Memory      Memory      `json:"memory"`
 }
 
@@ -141,6 +150,7 @@ func (s *Status) Stats() http.Handler {
 			Uptime:      Seconds(time.Since(s.start)),
 			Connections: rt.Connections,
 			Upstreams:   rt.Upstreams,
+			Limit:       rt.Limit,
 			Memory:      readMemory(),
 		})
 	})

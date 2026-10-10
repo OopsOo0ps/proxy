@@ -547,3 +547,23 @@ func TestServeForceClosesTunnelAfterShutdownTimeout(t *testing.T) {
 		t.Fatal("tunnel should be closed after forced shutdown")
 	}
 }
+
+func TestWriteOverloaded(t *testing.T) {
+	server, client := net.Pipe()
+	go WriteOverloaded(server)
+
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	raw, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	text := string(raw)
+	if !strings.HasPrefix(text, "HTTP/1.1 503 Service Unavailable") {
+		t.Fatalf("status line = %q, want 503", strings.SplitN(text, "\r\n", 2)[0])
+	}
+	for _, want := range []string{"Retry-After: 1", "Connection: close", "proxy overloaded: connection limit reached"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("overload response missing %q:\n%s", want, text)
+		}
+	}
+}

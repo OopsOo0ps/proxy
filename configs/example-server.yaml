@@ -19,6 +19,11 @@ users:
 # 认证失败 / 非协议流量时返回的自定义伪装页面（可选）。
 decoy_file: ""
 
+# 过载保护：进程级并发隧道上限；0 = 不限制。
+# 超限连接直接关闭（TLS 层无法携带错误语义），并计入 connections_rejected_total。
+limits:
+  max_connections: 1024
+
 timeouts:
   dial: 10s
   handshake: 10s

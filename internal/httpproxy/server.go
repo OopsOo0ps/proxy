@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -35,6 +36,19 @@ import (
 type TargetDialer interface {
 	DialTarget(ctx context.Context, host string, port uint16) (net.Conn, dialer.Route, error)
 	RouteFor(host string) routing.Action
+}
+
+// WriteOverloaded 对因连接上限被拒绝的连接写明确的 503 响应后关闭。
+// 响应文案固定，不包含任何内部信息；写操作带 2s 期限，慢客户端不会卡住拒绝路径。
+func WriteOverloaded(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	const body = "proxy overloaded: connection limit reached\n"
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, _ = io.WriteString(conn, "HTTP/1.1 503 Service Unavailable\r\n"+
+		"Content-Type: text/plain; charset=utf-8\r\n"+
+		"Retry-After: 1\r\n"+
+		"Content-Length: "+strconv.Itoa(len(body))+"\r\n"+
+		"Connection: close\r\n\r\n"+body)
 }
 
 // Server 是 HTTP/HTTPS 正向代理服务。

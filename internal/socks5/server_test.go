@@ -475,3 +475,20 @@ func TestServeForceClosesAfterShutdownTimeout(t *testing.T) {
 		t.Fatal("connection should be closed after forced shutdown")
 	}
 }
+
+func TestWriteOverloadReply(t *testing.T) {
+	server, client := net.Pipe()
+	go WriteOverloadReply(server)
+
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var reply [2]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil {
+		t.Fatalf("read overload reply: %v", err)
+	}
+	if reply[0] != Version || reply[1] != MethodNoAcceptable {
+		t.Fatalf("overload reply = %v, want [0x05 0xFF]", reply)
+	}
+	if _, err := client.Read(reply[:1]); err == nil {
+		t.Fatal("connection should be closed after the overload reply")
+	}
+}
