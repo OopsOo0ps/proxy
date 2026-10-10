@@ -1,6 +1,8 @@
 package clientapp
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,6 +34,71 @@ func baseReloadCfg(t *testing.T, rulesPath string) *config.Client {
 func boolPtr(v bool) *bool { return &v }
 
 func intPtr(v int) *int { return &v }
+
+// scrapeAppMetrics 直接从应用的指标处理器抓取文本（无需监听端口）。
+func scrapeAppMetrics(t *testing.T, app *App) string {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	app.metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	return rec.Body.String()
+}
+
+// TestReloadFileCountsEveryAttempt 验证 ReloadFile 对所有失败点计数：
+// 解析 / 校验失败（还没走到构建阶段）也计入 config_reloads_total，
+// 成功与失败各计一次，不多不少。
+func TestReloadFileCountsEveryAttempt(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	if err := os.WriteFile(rulesPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(baseReloadCfg(t, rulesPath), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(dir, "client.yaml")
+	goodYAML := `inbound: { http: "127.0.0.1:0" }
+nodes: [{ addr: "node1.example.com:443", password: "pw-1" }]
+routing: { default: proxy, rules_file: "` + rulesPath + `" }
+timeouts: { dial: 3s, handshake: 3s, idle: 30s, shutdown: 3s }
+log: { level: info, format: json }
+`
+	if err := os.WriteFile(cfgPath, []byte("unknown_field: 1\n"+goodYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ReloadFile(cfgPath, ""); err == nil {
+		t.Fatal("config with unknown field must fail to reload")
+	}
+	if body := scrapeAppMetrics(t, app); !strings.Contains(body, `config_reloads_total{result="error"} 1`) {
+		t.Fatalf("parse failure not counted:\n%s", grepLines(body, "config_reloads_total"))
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(goodYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ReloadFile(cfgPath, ""); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	body := scrapeAppMetrics(t, app)
+	if !strings.Contains(body, `config_reloads_total{result="success"} 1`) {
+		t.Fatalf("success not counted:\n%s", grepLines(body, "config_reloads_total"))
+	}
+	if !strings.Contains(body, `config_reloads_total{result="error"} 1`) {
+		t.Fatalf("error count changed after success:\n%s", grepLines(body, "config_reloads_total"))
+	}
+}
+
+// grepLines 返回文本中包含 substr 的行（用于测试失败时的可读输出）。
+func grepLines(body, substr string) string {
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return strings.Join(out, "\n")
+}
 
 // TestReloadRereadsRulesFile 验证规则文件在每次重载时重读：
 // 同一路径下内容变化（不改配置字段）也能生效。

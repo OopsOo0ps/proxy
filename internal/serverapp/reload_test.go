@@ -3,10 +3,12 @@ package serverapp_test
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -226,4 +228,40 @@ func scrapeMetricsBody(t *testing.T, addr string) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+// TestReloadFileCountsParseFailures 验证 ReloadFile 的计数口径：
+// 文件解析失败与构建成功都恰好各计入一次 config_reloads_total。
+func TestReloadFileCountsParseFailures(t *testing.T) {
+	cfg := baseServerCfg(t)
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	app := startReloadApp(t, cfg)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.yaml")
+	if err := os.WriteFile(path, []byte("unknown_field: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ReloadFile(path, ""); err == nil {
+		t.Fatal("config with unknown field must fail to reload")
+	}
+
+	good := fmt.Sprintf("listen: %q\ntls: { cert_file: %q, key_file: %q }\nusers: [{ username: bob, password: new-secret }]\nmetrics: { listen: %q }\n",
+		cfg.Listen, cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.Metrics.Listen)
+	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.ReloadFile(path, ""); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	body := scrapeMetricsBody(t, app.MetricsAddr())
+	for _, want := range []string{
+		`config_reloads_total{result="success"} 1`,
+		`config_reloads_total{result="error"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics missing %q:\n%s", want, body)
+		}
+	}
 }

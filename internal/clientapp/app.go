@@ -433,6 +433,22 @@ func (a *App) Reload(next *config.Client) (err error) {
 	return nil
 }
 
+// ReloadFile 读取、校验并应用配置文件（path 与启动时相同）。
+// levelOverride 是启动参数 -log-level 的显式覆盖，非空时同样优先于文件值。
+// 解析 / 校验失败与构建失败一样保持旧配置继续服务，
+// 并且每次尝试（无论失败在哪一步）都恰好计入一次 config_reloads_total。
+func (a *App) ReloadFile(path, levelOverride string) error {
+	cfg, err := config.LoadClient(path)
+	if err != nil {
+		a.metrics.ConfigReload(metrics.ReloadError)
+		return err
+	}
+	if levelOverride != "" {
+		cfg.Log.Level = levelOverride
+	}
+	return a.Reload(cfg)
+}
+
 // buildRuntime 依据配置构建完整运行时；reuse 非 nil 时复用未变更的上游栈
 // （节点池与预热池），避免无关重载抖动预热连接。规则文件在每次构建时重读，
 // 因此规则文件内容的修改也能通过重载生效。任何失败都不产生外部副作用
