@@ -2,16 +2,20 @@ package httpproxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +23,45 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
+
+// syncBuffer 是并发安全的日志缓冲（slog handler 可能与测试协程并发写入）。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitLogRecord 轮询日志缓冲，直到出现包含 substr 的 JSON 记录。
+func waitLogRecord(t *testing.T, buf *syncBuffer, substr string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if !strings.Contains(line, substr) {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("log line is not valid JSON: %v (%q)", err, line)
+			}
+			return rec
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("log line containing %q not found in:\n%s", substr, buf.String())
+	return nil
+}
 
 // stubDialer 是可注入的 TargetDialer 测试桩。
 type stubDialer struct {
@@ -133,6 +176,73 @@ func TestConnectTunnel(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+}
+
+// TestConnectClientResetAfterDataIsOK：浏览器式收尾——数据已完整转发后
+// 客户端直接 RST（内置内核在接收缓冲尚有未读收尾字节时的行为）。
+// 完成记录必须记为 result=ok（错误详情保留在日志），不能误判为 error。
+func TestConnectClientResetAfterDataIsOK(t *testing.T) {
+	echoAddr := startEcho(t)
+	logs := &syncBuffer{}
+	proxyAddr := startProxy(t, &Server{
+		Dialer: echoDialer(t),
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echoAddr, echoAddr); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "200") {
+		t.Fatalf("status line = %q, want 200", status)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	payload := []byte("tunnel data")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+
+	// 数据已送达：不发 FIN，直接 RST 模拟浏览器的 abortive close。
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		t.Fatal("connection is not *net.TCPConn")
+	}
+	if err := tcp.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	_ = tcp.Close()
+
+	rec := waitLogRecord(t, logs, "request completed")
+	if rec["result"] != "ok" {
+		t.Fatalf("result = %v, want ok (record: %v)", rec["result"], rec)
+	}
+	if detail, _ := rec["error"].(string); !strings.Contains(detail, "connection reset") {
+		t.Fatalf("error detail = %q, want 收到 connection reset 详情", detail)
 	}
 }
 

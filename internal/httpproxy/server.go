@@ -295,11 +295,11 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	// 这些字节可能已被 bufio 预读，必须通过 PrefixConn 原样转发。
 	stats, relayErr := relay.BiCopy(r.Context(), relay.PrefixConn(clientConn, brw.Reader), conn, h.srv.idleTimeout())
 	result := metrics.ResultOK
-	if !relay.IsExpected(relayErr) {
+	if relay.IsFailure(relayErr) {
 		result = metrics.ResultError
 	}
 	elapsed := time.Since(start)
-	logger.Info("request completed",
+	attrs := []any{
 		"method", "CONNECT",
 		"target", target,
 		"route", route.Action.String(),
@@ -309,7 +309,11 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 		"bytes_up", stats.ClientToUpstream,
 		"bytes_down", stats.UpstreamToClient,
 		"result", result,
-	)
+	}
+	if relayErr != nil {
+		attrs = append(attrs, "error", relayErr.Error())
+	}
+	logger.Info("request completed", attrs...)
 	h.srv.Metrics.Observe(metrics.ProtoHTTP, route.Action.String(), result, elapsed)
 }
 

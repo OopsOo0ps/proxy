@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -209,6 +210,170 @@ func TestIsExpected(t *testing.T) {
 		// context.DeadlineExceeded 不在预期列表内（由调用方决定语义）。
 		t.Fatal("deadline exceeded should not be classified as expected by default")
 	}
+}
+
+// TestSideErrorClassification 固化收尾竞态的分类语义：
+// 对端主动中止（RST/EPIPE，含两侧）都不计故障，但错误带来源标注。
+func TestSideErrorClassification(t *testing.T) {
+	clientReset := &SideError{Side: SideClient, Err: syscall.ECONNRESET}
+	clientPipe := &SideError{Side: SideClient, Err: syscall.EPIPE}
+	clientOther := &SideError{Side: SideClient, Err: errors.New("boom")}
+	clientCanceled := &SideError{Side: SideClient, Err: context.Canceled}
+	upstreamReset := &SideError{Side: SideUpstream, Err: syscall.ECONNRESET}
+
+	if IsExpected(clientReset) {
+		t.Error("对端 RST 不是正常收尾，不应由 IsExpected 判定")
+	}
+	if !IsPeerAbort(clientReset) || IsFailure(clientReset) {
+		t.Error("入站侧 RST 应判定为对端主动中止，不计故障")
+	}
+	if !IsPeerAbort(clientPipe) || IsFailure(clientPipe) {
+		t.Error("入站侧 EPIPE 应判定为对端主动中止，不计故障")
+	}
+	if IsPeerAbort(clientOther) || !IsFailure(clientOther) {
+		t.Error("入站侧普通错误应保留为故障")
+	}
+	if IsFailure(clientCanceled) {
+		t.Error("上下文取消属于正常收尾，不应计故障")
+	}
+	// Linux 上 TLS 目标站点读到 close_notify 后关闭连接、未读 FIN 触发
+	// 内核 RST 是常态收尾竞态，同样不计故障。
+	if !IsPeerAbort(upstreamReset) || IsFailure(upstreamReset) {
+		t.Error("出站侧 RST 是收尾中止，不计故障")
+	}
+
+	// 错误文本带来源标注，供日志定位；errors.Is 应穿透标注。
+	if !strings.Contains(clientReset.Error(), "client:") || !strings.Contains(upstreamReset.Error(), "upstream:") {
+		t.Errorf("SideError 文本缺少来源标注: %q / %q", clientReset.Error(), upstreamReset.Error())
+	}
+	if !errors.Is(clientReset, syscall.ECONNRESET) || !errors.Is(upstreamReset, syscall.ECONNRESET) {
+		t.Error("SideError 应支持 errors.Is 穿透")
+	}
+}
+
+// TestBiCopyClientResetIsBenign：入站侧对端在数据已送达后直接 RST（浏览器式
+// abortive close），转发应以「对端主动中止」收尾而非故障。
+func TestBiCopyClientResetIsBenign(t *testing.T) {
+	client, clientSide := tcpPair(t)
+	server, serverSide := tcpPair(t)
+
+	var (
+		done  = make(chan error, 1)
+		stats Stats
+	)
+	go func() {
+		s, err := BiCopy(context.Background(), clientSide, serverSide, 5*time.Second)
+		stats = s
+		done <- err
+	}()
+
+	payload := []byte("req")
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("read forwarded payload: %v", err)
+	}
+
+	// 入站侧对端不发 FIN，直接 RST；随后出站侧半关闭让转发收尾。
+	tcp, ok := client.(*net.TCPConn)
+	if !ok {
+		t.Fatal("client is not *net.TCPConn")
+	}
+	if err := tcp.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	_ = tcp.Close()
+	_ = server.(*net.TCPConn).CloseWrite()
+
+	select {
+	case err := <-done:
+		if !IsPeerAbort(err) || IsFailure(err) {
+			t.Fatalf("client reset should be benign, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("BiCopy did not finish")
+	}
+	if stats.ClientToUpstream != int64(len(payload)) {
+		t.Fatalf("ClientToUpstream = %d, want %d", stats.ClientToUpstream, len(payload))
+	}
+}
+
+// TestBiCopyUpstreamResetIsPeerAbort：出站侧对端 RST（Linux 上目标站点收尾
+// 的常态）同样按对端中止分类、不计故障，但错误来源标注为 upstream。
+func TestBiCopyUpstreamResetIsPeerAbort(t *testing.T) {
+	client, clientSide := tcpPair(t)
+	server, serverSide := tcpPair(t)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := BiCopy(context.Background(), clientSide, serverSide, 5*time.Second)
+		done <- err
+	}()
+
+	tcp, ok := server.(*net.TCPConn)
+	if !ok {
+		t.Fatal("server is not *net.TCPConn")
+	}
+	if err := tcp.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	_ = tcp.Close()
+	_ = client.(*net.TCPConn).CloseWrite()
+
+	select {
+	case err := <-done:
+		var se *SideError
+		if !errors.As(err, &se) || se.Side != SideUpstream {
+			t.Fatalf("reset should originate from upstream, got %v", err)
+		}
+		if !IsPeerAbort(err) || IsFailure(err) {
+			t.Fatalf("upstream reset should be a peer abort, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("BiCopy did not finish")
+	}
+}
+
+// TestDrainConnAvoidsCloseReset：close 时接收缓冲仍有未读数据会向对端发 RST；
+// drainConn 先读空在途字节再关闭，对端应看到干净的 FIN（EOF）。
+func TestDrainConnAvoidsCloseReset(t *testing.T) {
+	// 对照组：不排空直接关闭 → 对端读到 RST。
+	t.Run("without drain", func(t *testing.T) {
+		peer, ours := tcpPair(t)
+		if _, err := peer.Write([]byte("tail")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond) // 回环投递，确保字节已在接收缓冲
+		_ = ours.Close()
+
+		_ = peer.(*net.TCPConn).SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 16)
+		if _, err := peer.Read(buf); !errors.Is(err, syscall.ECONNRESET) {
+			t.Fatalf("close with unread data should reset peer, got %v", err)
+		}
+	})
+
+	// 修复行为：drainConn 后关闭 → 对端读到干净 FIN。
+	t.Run("with drain", func(t *testing.T) {
+		peer, ours := tcpPair(t)
+		if _, err := peer.Write([]byte("tail")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+		_ = peer.(*net.TCPConn).CloseWrite()
+
+		drainConn(ours)
+		_ = ours.Close()
+
+		_ = peer.(*net.TCPConn).SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 16)
+		n, err := peer.Read(buf)
+		if n != 0 || !errors.Is(err, io.EOF) {
+			t.Fatalf("peer should observe clean FIN after drain, got n=%d err=%v", n, err)
+		}
+	})
 }
 
 // BenchmarkCopyLoopPooled 测量真实转发路径（缓冲来自 sync.Pool）：
