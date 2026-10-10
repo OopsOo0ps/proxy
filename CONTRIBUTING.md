@@ -13,10 +13,13 @@
 ```sh
 make build    # 构建三个二进制到 bin/
 make test     # 运行全部单元测试
+make cover    # 运行测试并打印总覆盖率
 make lint     # 运行 golangci-lint
 make run      # 前台运行 proxy-server
 make help     # 查看全部目标
 ```
+
+单元测试包含本机回环上的端到端用例（会短暂绑定本地端口），无需外部网络。
 
 ## 提交规范
 

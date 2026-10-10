@@ -1,0 +1,49 @@
+# proxy-client 示例配置（生产模板）。
+# 字段说明见 README「配置」章节；未知字段会导致启动失败（严格解析）。
+
+inbound:
+  # 本机入站代理，两者至少启用一个。
+  http: "127.0.0.1:8080"
+  socks5: "127.0.0.1:1080"
+  # 入站认证（HTTP Proxy-Authorization / SOCKS5 用户名密码）。
+  # 监听非环回地址时必填；环回地址建议也填写，防止本机其它程序滥用。
+  auth:
+    - username: alice
+      password: change-me
+
+# 出口节点（Trojan over TLS）；建议至少 3 个以保证可用性。
+# 密码采用 SHA-224 摘要接入隧道，请使用强口令并与服务端 users 对应。
+nodes:
+  - addr: "node1.example.com:443"
+    password: node1-token
+    sni: www.example.com   # 可选：TLS SNI / 证书校验名
+  - addr: "node2.example.com:443"
+    password: node2-token
+  - addr: "node3.example.com:443"
+    password: node3-token
+
+# 连接出口节点的 TLS 参数。
+tls:
+  ca_file: ""                 # 使用自签证书时填写 CA 证书路径
+  insecure_skip_verify: false # 仅调试使用：跳过证书校验
+
+# 分流：未命中规则时的默认动作；规则文件中的 default 会覆盖此值。
+routing:
+  default: proxy
+  rules_file: ""        # 例如 configs/example-rules.yaml
+  private_direct: true  # 环回 / 私网 / 链路本地 / 组播目标一律直连
+
+# 超时。纯数字按秒解释。
+timeouts:
+  dial: 10s       # 建立目标 / 节点连接
+  handshake: 10s  # 隧道握手（TLS + Trojan）
+  idle: 90s       # 连接空闲回收
+
+# Prometheus 指标端点；建议只监听本机或置于防火墙之后。
+metrics:
+  listen: "127.0.0.1:9100"
+
+# 日志：json | text；级别 debug | info | warn | error。
+log:
+  level: info
+  format: json

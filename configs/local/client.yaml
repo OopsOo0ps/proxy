@@ -1,0 +1,31 @@
+# 本机三节点演示配置（配合 make dev-cert 与 configs/local/server-*.yaml 使用）。
+# 演示命令见 README「本地三节点演示」。
+
+inbound:
+  http: "127.0.0.1:18080"
+  socks5: "127.0.0.1:11080"
+  auth:
+    - username: alice
+      password: change-me
+
+nodes:
+  - addr: "127.0.0.1:18443"
+    password: local-node-1
+  - addr: "127.0.0.1:18444"
+    password: local-node-2
+  - addr: "127.0.0.1:18445"
+    password: local-node-3
+
+tls:
+  insecure_skip_verify: true  # 本机自签证书演示
+
+routing:
+  default: proxy
+  private_direct: false  # 演示：本机/内网目标也走节点，便于观察隧道流量
+
+metrics:
+  listen: "127.0.0.1:19100"
+
+log:
+  level: info
+  format: json

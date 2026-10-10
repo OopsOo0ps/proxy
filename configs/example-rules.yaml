@@ -1,0 +1,23 @@
+# 分流规则示例。
+# match 条目支持：
+#   - 精确域名          "example.com"（仅匹配裸域名）
+#   - 通配子域名        "*.example.com"（不匹配裸域名）
+#   - 精确 IP           "1.2.3.4" / "2001:db8::1"
+#   - CIDR 网段         "10.0.0.0/8" / "fc00::/7"
+# 规则自上而下匹配，先命中者生效；未命中时使用 default。
+
+default: proxy
+
+rules:
+  - action: direct
+    match:
+      - "localhost"
+      - "*.local"
+      - "*.lan"
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+      - "fc00::/7"
+  - action: proxy
+    match:
+      - "*.google.com"

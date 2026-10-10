@@ -1,4 +1,5 @@
-// Command proxy-server 是 Proxy 的远端服务端进程（当前为骨架实现）。
+// Command proxy-server 是远端出口：监听 Trojan（over TLS）隧道，
+// 校验口令并转发到目标站点。
 package main
 
 import (
@@ -9,34 +10,67 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/logging"
+	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/pkg/version"
 )
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version information and exit")
-	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+	configPath := flag.String("config", "", "path to server config file (YAML)")
+	logLevel := flag.String("log-level", "", "override log level from config: debug|info|warn|error")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("proxy-server %s\n", version.Get())
 		return
 	}
+	if *configPath == "" {
+		fmt.Fprintln(os.Stderr, "proxy-server: -config is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	cfg, err := config.LoadServer(*configPath)
+	if err != nil {
+		fatal(err)
+	}
+	if *logLevel != "" {
+		cfg.Log.Level = *logLevel
+	}
 
 	info := version.Get()
-	logger := logging.New(*logLevel)
+	logger := logging.New(cfg.Log.Level, cfg.Log.Format)
 	logger.Info("starting proxy-server",
 		"version", info.Version,
 		"commit", info.Commit,
 		"platform", info.Platform,
 	)
 
-	// 骨架阶段：尚未监听端口。这里先演示生产服务的基本形态——阻塞等待
-	// 退出信号并优雅收尾；代理转发能力将按 README 路线图逐步合入。
+	app, err := serverapp.New(cfg, logger)
+	if err != nil {
+		fatal(err)
+	}
+	if err := app.Listen(); err != nil {
+		fatal(err)
+	}
+	logger.Info("listening",
+		"tunnel", app.TunnelAddr(),
+		"metrics", app.MetricsAddr(),
+		"users", len(cfg.Users),
+	)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("skeleton build: proxy core is not implemented yet; waiting for shutdown signal")
-	<-ctx.Done()
-	logger.Info("shutdown signal received, exiting")
+	if err := app.Serve(ctx); err != nil {
+		fatal(err)
+	}
+	logger.Info("shutdown complete")
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "proxy-server: %v\n", err)
+	os.Exit(1)
 }
