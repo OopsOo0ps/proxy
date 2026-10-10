@@ -6,7 +6,7 @@
 
 Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
 
-当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点自动切换）、域名分流、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
+当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点轮询 + 主动健康检查摘除 / 自动加回 + 失败冷却转移）、域名分流、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
 
 ## 架构
 
@@ -44,7 +44,7 @@ flowchart LR
 | --- | --- |
 | HTTP/HTTPS 入站 | 支持 `CONNECT` 隧道与绝对地址形式的 HTTP 请求转发 |
 | SOCKS5 入站 | TCP `CONNECT`；用户名/密码认证可选（RFC 1928 / RFC 1929） |
-| 隧道出站 | Trojan over TLS；出口节点轮询、失败自动切换与冷却退避 |
+| 隧道出站 | Trojan over TLS；出口节点轮询、主动健康检查（连续失败摘除 / 连续成功自动加回）、失败自动切换与冷却退避 |
 | 连接池 | 上游隧道预热池：启动预热、请求领取，省去一次完整握手；空闲数与 TTL 可配，失效自动回退新建 |
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超过 `timeouts.shutdown`（默认 15s）强制断开剩余连接 |
 | 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误：HTTP 503 / SOCKS5 失败回复 / 隧道直接关闭，并计入 `connections_rejected_total` |
@@ -55,8 +55,8 @@ flowchart LR
 | 动态日志级别 | 运维端点 `GET/PUT /log/level` 运行时切换 debug/info/warn/error，无需重启 |
 | 配置热加载 | `SIGHUP` 重新加载配置文件：先校验、后原子切换；失败保持旧配置继续服务（见「配置热加载」） |
 | 指标 | `/metrics` 暴露 `requests_total`、`request_duration_seconds`、`active_connections` |
-| 健康检查 | `/health` 存活与依赖检查；依赖不可用时返回 503（`proxy-client` 检查出口节点池，`proxy-server` 检查 TLS 证书有效期） |
-| 运行时状态 | `/stats` 运行时快照：活跃连接数、出口节点状态（健康 / 连续失败 / 冷却剩余）、内存占用 |
+| 健康检查 | `/health` 存活与依赖检查；依赖不可用时返回 503（`proxy-client` 检查出口节点池：全部节点被摘除或处于冷却时不可用；`proxy-server` 检查 TLS 证书有效期） |
+| 运行时状态 | `/stats` 运行时快照：活跃连接数、出口节点状态（健康 / 摘除 / 连续失败 / 冷却剩余）、内存占用 |
 
 规划中：控制端动态配置、systemd / 发行包、UDP 与 TUN 支持（见「限制说明」与「路线图」）。
 
@@ -105,6 +105,10 @@ curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duratio
   `request_id`、`client_ip`、`upstream`、`duration` 字段。
 - 客户端默认会为每个节点预热空闲隧道（每节点 2 条），可在 `/metrics` 中通过
   `upstream_pool_*` 指标观察预热与领取情况。
+- 上游故障自愈：停掉任一 `proxy-server` 进程后，客户端的主动健康检查会在连续
+  失败若干个周期后摘除该节点（warn 日志 `exit node removed by active health check`，
+  `/stats` 中 `removed: true`），流量继续由其余节点承载；重启该节点后连续探测成功
+  即自动加回（info 日志 `exit node rejoined after passing health checks`）。
 - DNS 查询走哪个节点、解析耗时多少，见客户端日志的 `dns query completed`
   记录；`/metrics` 的 `dns_queries_total` 按 `route`（direct / proxy）统计。
 
@@ -146,6 +150,12 @@ pool:                       # 上游空闲隧道连接池（预热复用）
   max_idle: 2               # 每节点最大空闲连接数；0 = 关闭
   idle_ttl: 5s              # 空闲连接最长保留时间；应小于服务端 handshake 超时
 
+health_check:               # 出口节点主动健康检查（故障自愈）
+  interval: 10s             # 探测周期（TCP+TLS 握手，不发 Trojan 请求）；0 = 关闭
+  timeout: 3s               # 单次探测超时
+  failures: 3               # 连续失败 N 次后摘除该节点
+  successes: 2              # 摘除后连续成功 M 次自动加回
+
 limits:                     # 过载保护
   max_connections: 1024     # 进程级并发连接上限（HTTP + SOCKS5 合计）；0 = 不限制
 
@@ -181,7 +191,10 @@ log:      { level: info, format: json }   # json | text
 - 空闲超过 `pool.idle_ttl` 的连接会被回收；请保持该值小于服务端
   `timeouts.handshake`（默认 10s），否则连接可能在池中已被服务端回收；
 - 预热采用“启动预热 + 领取后按需补齐”，空闲期不产生周期性握手流量；
-- 预热拨号失败只计数与记录 debug 日志，节点健康仍由真实请求的被动拨号更新。
+- 节点被主动健康检查摘除时，其空闲预热连接会被立即清理并暂停补池；节点加回后
+  随流量自动恢复预热；
+- 预热拨号失败只计数与记录 debug 日志，不参与节点健康判定（节点健康由主动探测
+  与真实拨号共同维护，见「健康检查与运行时状态」）。
 
 ### 优雅关闭（graceful shutdown）
 
@@ -344,6 +357,7 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 | --- | --- | --- |
 | 入站凭据 / 隧道用户 | ✅ `inbound.auth` | ✅ `users` |
 | 出口节点与分流 | ✅ `nodes`、`routing.*`（含规则文件内容变化） | — |
+| 健康检查 | ✅ `health_check.*` | — |
 | TLS | ✅ `tls.ca_file`、`tls.insecure_skip_verify` | ✅ `tls.cert_file` / `key_file`（证书轮换） |
 | 连接池 / 超时 / 连接上限 | ✅ `pool.*`、`timeouts.*`、`limits.*` | ✅ `timeouts.*`、`limits.*` |
 | 日志级别与格式 | ✅ `log.*` | ✅ `log.*` |
@@ -352,8 +366,9 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 
 说明：
 
-- 重载会重建受影响的运行时组件：出口节点或连接池参数变化时预热池整体重建
-  （旧空闲连接关闭、按新配置重新预热）；只改分流规则或凭据时不会抖动预热连接。
+- 重载会重建受影响的运行时组件：出口节点、连接池或健康检查参数变化时，预热池与
+  探测循环整体重建（旧空闲连接关闭、旧探测循环停止、按新配置重新预热与探测）；
+  只改分流规则或凭据时不会抖动预热连接。
 - 每次重载尝试都计入 `config_reloads_total{result}`；成功时日志输出
   `configuration reloaded`，失败时输出
   `config reload failed; keeping current configuration` 与具体原因。
@@ -386,6 +401,8 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 | `upstream_pool_claims_total` | counter | `node`、`result` | 空闲连接领取结果（`hit` / `miss` / `stale`） |
 | `upstream_pool_idle_connections` | gauge | `node` | 各节点当前空闲（已握手待用）连接数 |
 | `upstream_pool_warm_failures_total` | counter | `node` | 后台预热拨号失败次数 |
+| `upstream_health_probes_total` | counter | `node`、`result` | 主动健康探测次数（`success` / `failure`） |
+| `upstream_healthy` | gauge | `node` | 节点当前是否可接流量（1 = 可接，0 = 已被主动摘除） |
 | `dns_queries_total` | counter | `route`、`result` | DNS 网关查询数（`route`：`direct` / `proxy` / `none`，`result`：`ok` / `error` / `invalid`） |
 | `dns_query_duration_seconds` | histogram | `route` | DNS 网关查询耗时（秒），含隧道往返 |
 | `config_reloads_total` | counter | `result` | 配置热加载尝试数（`success` / `error`） |
@@ -393,7 +410,8 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 `proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
 `result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
 `upstream_pool_*` 系列仅 `proxy-client` 输出：连接池默认开启（`pool.max_idle: 2`），
-关闭后不产生这些序列。`dns_*` 系列仅 `proxy-client` 启用 DNS 网关后输出
+关闭后不产生这些序列；`upstream_health_probes_total` / `upstream_healthy` 在配置了
+出口节点时输出（主动探测关闭后不再更新）。`dns_*` 系列仅 `proxy-client` 启用 DNS 网关后输出
 （`route=none` 表示被拒绝 / 丢弃的非法查询，只计入 counter）。
 
 ```sh
@@ -412,22 +430,36 @@ curl -s http://127.0.0.1:9100/health
 
 curl -s http://127.0.0.1:9100/stats
 # {"version":"...","uptime":12.34,"connections":{"http":1,"total":1},
-#  "upstreams":[{"addr":"node1:443","healthy":true,"fails":0,"cooldown_remaining":0,"idle":2}],
+#  "upstreams":[{"addr":"node1:443","healthy":true,"fails":0,"cooldown_remaining":0,
+#                "removed":false,"probe_fails":0,"idle":2}],
 #  "memory":{"alloc_bytes":...,"sys_bytes":...,"num_gc":...,"goroutines":...}}
 ```
 
 - `GET /health`：进程存活时返回 `{"status":"ok","uptime":<秒>}`；依赖不可用时返回
   `503` 与 `{"status":"unavailable","reason":"..."}`。依赖定义：
-  - `proxy-client`：配置了出口节点且没有任何健康节点（全部处于冷却）时不可用；
+  - `proxy-client`：配置了出口节点且没有任何可接流量的节点（全部被主动摘除或处于
+    冷却中）时不可用；
   - `proxy-server`：TLS 证书在运行中过期时不可用。
 - `GET /stats`：运行时快照，字段见上例。`upstreams` 仅 `proxy-client` 输出；
   `proxy-server` 的 `connections` 只统计隧道连接。`upstreams[].idle` 是当前空闲
-  预热连接数（未启用连接池时为 0）。配置了连接上限时另有 `limit` 字段：
+  预热连接数（未启用连接池时为 0）；`removed` 表示是否被主动健康检查摘除，
+  `probe_fails` 是当前连续探测失败次数。配置了连接上限时另有 `limit` 字段：
   上限、当前占用与累计拒绝数（0 = 不限制时不输出）。
 - `/health`、`/stats` 只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
   请仅在环回地址或防火墙之后暴露；运行时日志级别端点 `/log/level` 见下节。
-- 节点健康状态来源于真实拨号的被动更新（失败后进入冷却），不发送主动探测；
-  主动健康检查见路线图「基础故障转移」。
+
+出口节点健康由两套机制共同维护，节点“可接流量 = 未被摘除 且 不在冷却中”：
+
+- **主动健康检查**（`health_check`，默认开启）：按 `interval`（默认 10s）对每个节点
+  做一次 TCP+TLS 握手探测——不发送 Trojan 请求、不占用预热连接池。连续失败
+  `failures`（默认 3）次后**摘除**该节点：它不再参与任何新拨号（硬摘除），其空闲
+  预热连接被立即清理；摘除后继续探测，连续成功 `successes`（默认 2）次**自动加回**
+  并清空被动失败计数与冷却。摘除 / 加回分别记录 warn / info 日志；
+  `interval: 0` 关闭主动探测。
+- **被动冷却**：真实拨号失败后按指数退避冷却（10s 起、5m 封顶），冷却期跳过该节点；
+  全部节点处于冷却（且均未被摘除）时仍会全量尝试，避免“有节点但永远不试”的黑洞。
+- 探测只验证节点可达性与 TLS 握手，**不校验隧道口令**：口令错误、协议异常等隧道层
+  问题仍由真实流量的被动冷却兜底；反之，真实拨号的成功 / 失败不改变摘除状态。
 
 ### 日志级别动态调整
 
@@ -497,9 +529,14 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   空闲超过服务端 `timeouts.handshake` 的连接会被服务端回收，客户端领取时通过
   存活探测丢弃并回退新建。请保持 `pool.idle_ttl`（默认 5s）小于服务端握手超时
   （默认 10s）；节点不可达时预热会失败并计入 `upstream_pool_warm_failures_total`。
+- **主动健康检查的边界**：探测只验证 TCP+TLS 可达性，不发送 Trojan 请求、不校验
+  隧道口令——口令错误、协议异常等隧道层问题由真实流量的被动冷却兜底；摘除判定按
+  探测周期累计（默认 10s × 连续 3 次失败，最坏约 30s 后摘除），判定完成前的少量
+  请求仍可能失败；全部节点被摘除时拨号快速失败、不再降级尝试，等待探测恢复自动加回。
 - **配置热加载的边界**：监听地址变更需要重启（热加载明确拒绝并提示）；重载会重建
-  出口节点池与预热连接池，节点冷却状态随之重置；运行期通过 `/log/level` 做的
-  级别调整会被重载后的文件（或启动参数）值覆盖。
+  出口节点池与预热连接池（当 `nodes`、`pool`、`health_check`、`tls`、`timeouts`
+  变化时），节点冷却与摘除状态随之重置；运行期通过 `/log/level` 做的级别调整会被
+  重载后的文件（或启动参数）值覆盖。
 - `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
 - 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
 - 尚未提供 systemd 单元与发行包，请通过源码构建使用。
@@ -592,12 +629,14 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 - `make dev-cert`：生成本地演示用自签证书
 
 端到端测试使用本机回环与自签证书，覆盖：CONNECT 转发成功率（100 次请求，
-验收线 ≥95%）、三节点轮询、节点故障转移、连接池预热与领取命中、私网直连、
+验收线 ≥95%）、三节点轮询、节点故障转移、主动健康检查摘除 / 加回（含空闲预热
+连接清理与热加载生效）、连接池预热与领取命中、私网直连、
 优雅关停排空（存量请求不被中断、新连接被拒绝）、过载保护（超限拒绝与恢复）、
 SOCKS5 与入站认证、DNS 网关（代理名字经出口远程解析且本地解析器零触达、
 直连名字走本机解析器、TC 截断回退 TCP、非法查询拒绝）、指标暴露与日志字段。
 配置热加载同样有端到端覆盖：坏配置重载后旧配置继续服务、凭据与出口节点热替换、
-证书轮换、监听地址变更被拒绝、成功 / 失败计数进入 `config_reloads_total`。
+证书轮换、健康检查参数热切换、监听地址变更被拒绝、成功 / 失败计数进入
+`config_reloads_total`。
 CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
@@ -614,6 +653,7 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 - [x] 动态日志级别（`/log/level` 运行时切换）
 - [x] DNS 处理策略（remote DNS 默认 + 可选 DNS 网关；fake-IP 权衡与下一步条件记录）
 - [x] 配置热加载（SIGHUP：校验失败保持旧配置，成功原子生效）
+- [x] 上游故障自愈（主动健康检查：连续失败摘除、连续成功自动加回；被动冷却转移）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
