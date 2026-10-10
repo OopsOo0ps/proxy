@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -86,4 +87,35 @@ func TestVerifyTunnel(t *testing.T) {
 			t.Fatalf("malformed hash %q must not verify", bad)
 		}
 	}
+}
+
+// BenchmarkStoreVerify 测量入站凭据校验热路径（SHA-256 摘要 + 常量时间比较）。
+// 16 个用户的量级模拟小型自用部署；用户数不影响单次校验成本（map 查找 + 单次比较）。
+func BenchmarkStoreVerify(b *testing.B) {
+	users := make([]User, 0, 16)
+	for i := 0; i < 16; i++ {
+		users = append(users, User{
+			Username: fmt.Sprintf("user-%02d", i),
+			Password: fmt.Sprintf("secret-%02d", i),
+		})
+	}
+	s, err := NewStore(users)
+	if err != nil {
+		b.Fatalf("NewStore: %v", err)
+	}
+
+	b.Run("hit", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if !s.Verify("user-07", "secret-07") {
+				b.Fatal("valid credential must verify")
+			}
+		}
+	})
+	b.Run("miss", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if s.Verify("nobody", "secret-07") {
+				b.Fatal("unknown user must not verify")
+			}
+		}
+	})
 }

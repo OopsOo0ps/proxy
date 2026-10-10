@@ -567,3 +567,60 @@ func TestWriteOverloaded(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkConnectHandshake 测量 CONNECT 入站握手热路径：
+// 建连 → 解析请求 → 出站拨号（内存管道上游）→ 200 响应 → 关闭。
+// 上游用内存管道隔离网络变量，度量代理自身处理开销；每次迭代会新建一条本机 TCP 连接。
+func BenchmarkConnectHandshake(b *testing.B) {
+	srv := &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, string, uint16) (net.Conn, error) {
+		upstream, peer := net.Pipe()
+		// 立即关闭对端：上游方向读到 EOF 后转发自然结束，不会因管道不可半关闭而死等。
+		_ = peer.Close()
+		return upstream, nil
+	}}}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, ln) }()
+	b.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			b.Error("Serve did not stop")
+		}
+	})
+	addr := ln.Addr().String()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			b.Fatalf("dial proxy: %v", err)
+		}
+		if _, err := fmt.Fprintf(conn, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"); err != nil {
+			b.Fatalf("write CONNECT: %v", err)
+		}
+		br := bufio.NewReader(conn)
+		status, err := br.ReadString('\n')
+		if err != nil {
+			b.Fatalf("read status: %v", err)
+		}
+		if !strings.Contains(status, "200") {
+			b.Fatalf("status = %q, want 200", status)
+		}
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				b.Fatalf("read header: %v", err)
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_ = conn.Close()
+	}
+}

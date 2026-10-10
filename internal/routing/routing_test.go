@@ -223,3 +223,36 @@ func TestShippedExampleRulesParse(t *testing.T) {
 		t.Fatalf("NewEngine: %v", err)
 	}
 }
+
+// BenchmarkDecide 测量分流决策热路径。规则集模拟常见形态：
+// 一组直连规则（域名 / 通配 / 网段）+ 默认 proxy + 内建私网直连。
+func BenchmarkDecide(b *testing.B) {
+	rules := &Rules{Rules: []Rule{
+		{Action: Direct, Match: []string{"localhost", "*.internal.example.com", "10.0.0.0/8", "192.168.0.0/16", "1.2.3.4"}},
+		{Action: Proxy, Match: []string{"*.google.com", "*.github.com"}},
+	}}
+	e, err := NewEngine(rules, Options{Default: Proxy, PrivateDirect: true})
+	if err != nil {
+		b.Fatalf("NewEngine: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		host string
+		want Action
+	}{
+		{"direct-rule", "api.internal.example.com", Direct},
+		{"proxy-rule", "api.github.com", Proxy},
+		{"private-direct", "192.168.1.10", Direct},
+		{"default", "example.org", Proxy},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if got := e.Decide(tc.host); got != tc.want {
+					b.Fatalf("Decide(%q) = %v, want %v", tc.host, got, tc.want)
+				}
+			}
+		})
+	}
+}
