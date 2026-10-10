@@ -112,7 +112,7 @@ func TestReloadRereadsRulesFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := app.policy.load().router.Decide("a.example.org"); got != routing.Direct {
+	if got := app.policy.load().rules.Decide("a.example.org"); got != routing.Direct {
 		t.Fatalf("initial rules: decide = %v, want direct", got)
 	}
 
@@ -124,10 +124,10 @@ func TestReloadRereadsRulesFile(t *testing.T) {
 	if err := app.Reload(next); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if got := app.policy.load().router.Decide("a.example.net"); got != routing.Direct {
+	if got := app.policy.load().rules.Decide("a.example.net"); got != routing.Direct {
 		t.Fatalf("updated rules: decide = %v, want direct", got)
 	}
-	if got := app.policy.load().router.Decide("a.example.org"); got != routing.Proxy {
+	if got := app.policy.load().rules.Decide("a.example.org"); got != routing.Proxy {
 		t.Fatalf("updated rules leaked old match: decide = %v, want proxy", got)
 	}
 }
@@ -160,7 +160,7 @@ func TestReloadFailureLeavesEverythingUntouched(t *testing.T) {
 	if got := app.policy.load().auth; got != nil {
 		t.Fatalf("failed reload leaked new auth store: %v", got)
 	}
-	if got := app.policy.load().router.Decide("a.example.org"); got != routing.Direct {
+	if got := app.policy.load().rules.Decide("a.example.org"); got != routing.Direct {
 		t.Fatalf("failed reload changed routing: decide = %v, want direct", got)
 	}
 	if got := app.limiter.Max(); got != limitBefore {

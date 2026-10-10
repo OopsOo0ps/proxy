@@ -6,7 +6,7 @@
 
 Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
 
-当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点轮询 + 主动健康检查摘除 / 自动加回 + 失败冷却转移）、域名分流、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
+当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点轮询 + 主动健康检查摘除 / 自动加回 + 失败冷却转移）、域名分流（本地规则文件 / 远程 URL 动态加载）、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
 
 ## 架构
 
@@ -49,6 +49,7 @@ flowchart LR
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超过 `timeouts.shutdown`（默认 15s）强制断开剩余连接 |
 | 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误：HTTP 503 / SOCKS5 失败回复 / 隧道直接关闭，并计入 `connections_rejected_total` |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
+| 规则集动态加载 | 规则源二选一：本地 `rules_file` 或远程 `rules_url`；远程规则启动拉取、按周期刷新（缺省 30m），内容变化原子生效（新连接），拉取失败保持现有规则继续服务（见「规则集动态加载」） |
 | DNS 处理 | **remote DNS（默认）**：代理名字不在本机解析，域名随隧道到出口解析（防污染 / 防泄漏 / CDN 按出口就近）；**可选 DNS 网关**：本机环回 UDP/TCP 监听，把“先查 DNS”的应用查询按同一分流规则转发（代理名字经出口远程解析，直连名字走本机解析器）。详见「DNS 处理策略」 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
@@ -164,9 +165,11 @@ tls:
   insecure_skip_verify: false # 仅调试：跳过证书校验
 
 routing:
-  default: proxy        # direct | proxy
-  rules_file: ""        # 例如 configs/example-rules.yaml
-  private_direct: true  # 环回 / 私网 / 链路本地目标一律直连
+  default: proxy               # direct | proxy
+  rules_file: ""               # 本地规则文件（与 rules_url 二选一），例如 configs/example-rules.yaml
+  rules_url: ""                # 远程规则 URL（http/https，与 rules_file 二选一）
+  rules_refresh_interval: 30m  # 远程规则刷新周期（缺省 30m；0 = 仅启动拉取一次）
+  private_direct: true         # 环回 / 私网 / 链路本地目标一律直连
 
 dns:                    # 可选 DNS 网关；listen 为空 = 关闭（见「DNS 处理策略」）
   listen: ""            # 例如 "127.0.0.1:53"；仅允许环回地址
@@ -258,6 +261,65 @@ rules:
 - 规则自上而下匹配，**先命中者生效**；规则文件的 `default` 优先于客户端配置。
 - 内置安全行为：环回、私网（RFC 1918 / ULA）、链路本地、组播地址与 `localhost`
   在 `private_direct: true`（默认）时一律直连，避免把内网流量误发到远端。
+
+### 规则集动态加载（远程规则）
+
+除本地规则文件外，规则也可以从 URL 拉取并按周期刷新（两个来源**二选一**，
+同时配置会直接报错）：
+
+```yaml
+routing:
+  default: proxy
+  rules_url: "https://rules.example.com/proxy-rules.yaml"  # 仅允许 http / https
+  rules_refresh_interval: 30m   # 刷新周期（缺省 30m）；0 = 仅启动拉取一次
+```
+
+- 启动时同步拉取一次；**拉取失败不阻止启动**：告警后以空规则（仅默认动作与
+  内置直连行为）继续运行，后续刷新周期会自动重试（`rules_refresh_interval: 0`
+  时可发 SIGHUP 或重启重试）；
+- 运行期按周期重新拉取：内容与上次成功加载完全一致时不做任何重建；有变化时
+  重新解析、校验、编译后**原子替换**——生效边界为“新连接”，与配置热加载一致；
+- 规则变化（含 SIGHUP 重拉）会同时丢弃**转发路径**（绝对地址 HTTP 请求）的空闲
+  上游连接，避免后续请求复用到旧路由建立的连接；在途请求不受影响，新请求按
+  新规则重新建连（CONNECT 隧道本就每次请求新建，不受影响）；
+- **失败不炸线上**：拉取失败（网络 / 非 2xx / 超时）、内容非法（YAML / 未知字段 /
+  匹配项校验失败）或超过大小上限时，保持现有规则继续服务，并计入
+  `ruleset_refreshes_total{result="error"}`、日志 warn（`ruleset: refresh failed; …`）；
+- 约束：仅 `http` / `https`；单次拉取超时 15s；响应体上限 8 MiB；规则内容与
+  本地文件同款严格解析（未知字段报错）；不支持自定义请求头与认证；
+- SIGHUP 热加载会对远程规则立即重拉一次：成功时新内容立即生效；失败只告警并
+  保持现有规则（容错语义，不影响本次重载的其余变更）。本地规则文件仍是严格
+  语义：读取 / 解析失败会拒绝整次重载。
+
+`/stats` 的 `ruleset` 字段（仅配置了规则源时输出）与下方指标可直接观察规则源状态：
+
+```sh
+curl -s http://127.0.0.1:9100/stats | python3 -m json.tool | grep -A8 ruleset
+# "ruleset": {
+#   "source": "url",
+#   "target": "https://rules.example.com/proxy-rules.yaml",
+#   "refresh_seconds": 1800,
+#   "loaded": true,
+#   "rules": 12,
+#   "last_success": "2026-10-10T12:00:00Z"
+# }
+```
+
+本机演示（远程规则按周期自动生效）：
+
+```sh
+# 1) 用任意静态服务器托管规则文件，例如：
+mkdir -p /tmp/rules && cp configs/example-rules.yaml /tmp/rules/rules.yaml
+python3 -m http.server 18081 -d /tmp/rules &
+
+# 2) 客户端配置：
+#    routing:
+#      rules_url: "http://127.0.0.1:18081/rules.yaml"
+#      rules_refresh_interval: 10s
+
+# 3) 修改 /tmp/rules/rules.yaml（例如把某条规则的 action 从 proxy 改为 direct），
+#    等一个刷新周期后新连接即按新规则分流；/metrics 中 ruleset_refreshes_total 增长。
+```
 
 ### DNS 处理策略
 
@@ -356,7 +418,7 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 | 配置 | proxy-client | proxy-server |
 | --- | --- | --- |
 | 入站凭据 / 隧道用户 | ✅ `inbound.auth` | ✅ `users` |
-| 出口节点与分流 | ✅ `nodes`、`routing.*`（含规则文件内容变化） | — |
+| 出口节点与分流 | ✅ `nodes`、`routing.*`（含规则文件内容变化；远程规则立即重拉，失败保持现有规则） | — |
 | 健康检查 | ✅ `health_check.*` | — |
 | TLS | ✅ `tls.ca_file`、`tls.insecure_skip_verify` | ✅ `tls.cert_file` / `key_file`（证书轮换） |
 | 连接池 / 超时 / 连接上限 | ✅ `pool.*`、`timeouts.*`、`limits.*` | ✅ `timeouts.*`、`limits.*` |
@@ -369,6 +431,11 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 - 重载会重建受影响的运行时组件：出口节点、连接池或健康检查参数变化时，预热池与
   探测循环整体重建（旧空闲连接关闭、旧探测循环停止、按新配置重新预热与探测）；
   只改分流规则或凭据时不会抖动预热连接。
+- 分流规则在重载时立即重新检查：本地规则文件严格重读（失败拒绝本次重载，
+  保持旧配置原样服务）；远程规则立即重拉（失败只告警、保持现有规则继续服务，
+  与周期刷新一致的容错语义）。若本次重载更换了规则源（路径 / URL / 刷新周期
+  变化），则按与新启动相同的语义构建新来源：URL 首次拉取失败时告警并以空规则
+  运行，等待后续刷新成功。
 - 每次重载尝试都计入 `config_reloads_total{result}`；成功时日志输出
   `configuration reloaded`，失败时输出
   `config reload failed; keeping current configuration` 与具体原因。
@@ -406,9 +473,14 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 | `dns_queries_total` | counter | `route`、`result` | DNS 网关查询数（`route`：`direct` / `proxy` / `none`，`result`：`ok` / `error` / `invalid`） |
 | `dns_query_duration_seconds` | histogram | `route` | DNS 网关查询耗时（秒），含隧道往返 |
 | `config_reloads_total` | counter | `result` | 配置热加载尝试数（`success` / `error`） |
+| `ruleset_refreshes_total` | counter | `result` | 规则集加载 / 刷新尝试数（`success` / `unchanged` / `error`，含启动首次加载） |
+| `ruleset_last_success_timestamp_seconds` | gauge | — | 最近一次成功加载规则的时间戳（Unix 秒；从未成功时不输出） |
+| `ruleset_rules` | gauge | — | 当前生效的规则条数 |
 
 `proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
 `result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
+`ruleset_*` 系列仅 `proxy-client` 配置了规则源（`routing.rules_file` 或
+`routing.rules_url`）时产生数据。
 `upstream_pool_*` 系列仅 `proxy-client` 输出：连接池默认开启（`pool.max_idle: 2`），
 关闭后不产生这些序列；`upstream_health_probes_total` / `upstream_healthy` 在配置了
 出口节点时输出（主动探测关闭后不再更新）。`dns_*` 系列仅 `proxy-client` 启用 DNS 网关后输出
@@ -432,6 +504,8 @@ curl -s http://127.0.0.1:9100/stats
 # {"version":"...","uptime":12.34,"connections":{"http":1,"total":1},
 #  "upstreams":[{"addr":"node1:443","healthy":true,"fails":0,"cooldown_remaining":0,
 #                "removed":false,"probe_fails":0,"idle":2}],
+#  "ruleset":{"source":"url","target":"https://rules.example.com/proxy-rules.yaml",
+#             "refresh_seconds":1800,"loaded":true,"rules":12,"last_success":"2026-10-10T12:00:00Z"},
 #  "memory":{"alloc_bytes":...,"sys_bytes":...,"num_gc":...,"goroutines":...}}
 ```
 
@@ -445,6 +519,10 @@ curl -s http://127.0.0.1:9100/stats
   预热连接数（未启用连接池时为 0）；`removed` 表示是否被主动健康检查摘除，
   `probe_fails` 是当前连续探测失败次数。配置了连接上限时另有 `limit` 字段：
   上限、当前占用与累计拒绝数（0 = 不限制时不输出）。
+- `ruleset`（仅配置了规则源时输出）：规则来源（`file` / `url`）、目标（文件路径或
+  URL）、URL 刷新周期（秒，0 = 仅启动拉取一次）、是否已成功加载、当前规则条数、
+  最近一次成功加载时间（RFC3339）与最近一次失败原因（成功后清空）；
+  `loaded: false` 表示远程规则尚未成功拉取过（按空规则运行），见「规则集动态加载」。
 - `/health`、`/stats` 只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
   请仅在环回地址或防火墙之后暴露；运行时日志级别端点 `/log/level` 见下节。
 
@@ -537,6 +615,11 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   出口节点池与预热连接池（当 `nodes`、`pool`、`health_check`、`tls`、`timeouts`
   变化时），节点冷却与摘除状态随之重置；运行期通过 `/log/level` 做的级别调整会被
   重载后的文件（或启动参数）值覆盖。
+- **远程规则（`rules_url`）的边界**：不含本地缓存——进程重启后若首次拉取失败，
+  会以空规则（仅默认动作与内置直连行为）继续运行，直到某次刷新或 SIGHUP 重拉
+  成功；仅支持单一规则源（本地文件与远程 URL 二选一，不支持多 URL 合并）；
+  拉取为同步 HTTP（15s 超时、8 MiB 上限、仅 http/https），不支持自定义请求头 /
+  认证；变更检测基于内容摘要——远端语义相同但字节不同也会触发一次重建（无害）。
 - `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
 - 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
 - 尚未提供 systemd 单元与发行包，请通过源码构建使用。
@@ -611,6 +694,7 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 │   ├── nodes/            #   出口节点池（轮询/冷却/切换）
 │   ├── relay/            #   双向转发（半关闭/空闲超时）
 │   ├── routing/          #   分流规则引擎
+│   ├── ruleset/          #   规则源（本地文件 / 远程 URL）与定时刷新
 │   ├── serverapp/        #   proxy-server 组装
 │   ├── socks5/           #   SOCKS5 入站与地址编码
 │   ├── testutil/         #   测试辅助（自签证书）
@@ -637,6 +721,9 @@ SOCKS5 与入站认证、DNS 网关（代理名字经出口远程解析且本地
 配置热加载同样有端到端覆盖：坏配置重载后旧配置继续服务、凭据与出口节点热替换、
 证书轮换、健康检查参数热切换、监听地址变更被拒绝、成功 / 失败计数进入
 `config_reloads_total`。
+规则集动态加载也有端到端覆盖：远程规则按周期刷新生效（路由翻转）、非法内容与
+拉取失败保持旧规则并在源恢复后自动收敛、启动拉取失败告警后继续运行、SIGHUP
+立即重拉（失败容错）、`ruleset_refreshes_total` 与 `/stats` 的 `ruleset` 字段按预期记录。
 CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
@@ -654,6 +741,7 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 - [x] DNS 处理策略（remote DNS 默认 + 可选 DNS 网关；fake-IP 权衡与下一步条件记录）
 - [x] 配置热加载（SIGHUP：校验失败保持旧配置，成功原子生效）
 - [x] 上游故障自愈（主动健康检查：连续失败摘除、连续成功自动加回；被动冷却转移）
+- [x] 规则集动态加载（远程 URL 拉取 + 定时刷新；失败保持现有规则，SIGHUP 立即重拉）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式

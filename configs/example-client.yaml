@@ -48,9 +48,12 @@ tls:
   insecure_skip_verify: false # 仅调试使用：跳过证书校验
 
 # 分流：未命中规则时的默认动作；规则文件中的 default 会覆盖此值。
+# 规则源二选一：本地 rules_file 或远程 rules_url（同时配置会报错）。
 routing:
   default: proxy
-  rules_file: ""        # 例如 configs/example-rules.yaml
+  rules_file: ""        # 本地规则文件，例如 configs/example-rules.yaml
+  rules_url: ""         # 远程规则 URL（仅 http/https），例如 "https://rules.example.com/proxy-rules.yaml"
+  # rules_refresh_interval: 30m  # 远程规则刷新周期（缺省 30m；0 = 仅启动拉取一次）
   private_direct: true  # 环回 / 私网 / 链路本地 / 组播目标一律直连
 
 # DNS 网关（可选）：把本机 DNS 查询纳入分流——代理名字经出口节点远程解析

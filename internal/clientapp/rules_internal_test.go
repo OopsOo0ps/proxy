@@ -1,0 +1,108 @@
+package clientapp
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/OopsOo0ps/proxy/internal/routing"
+)
+
+func writeRules(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReloadReusesRulesProviderWhenSourceUnchanged 验证规则源配置未变时重载
+// 复用同一 Provider（不重建、不重启刷新循环），并立即重读文件内容生效。
+func TestReloadReusesRulesProviderWhenSourceUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	writeRules(t, rulesPath, "rules:\n  - action: direct\n    match: [\"*.example.org\"]\n")
+	app, err := New(baseReloadCfg(t, rulesPath), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := app.policy.load().rules
+
+	writeRules(t, rulesPath, "rules:\n  - action: direct\n    match: [\"*.example.net\"]\n")
+	next := baseReloadCfg(t, rulesPath)
+	if err := app.Reload(next); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	after := app.policy.load().rules
+	if after != before {
+		t.Fatal("rules provider must be reused when the source is unchanged")
+	}
+	if got := after.Decide("a.example.net"); got != routing.Direct {
+		t.Fatalf("new file content not applied: decide = %v", got)
+	}
+	if got := after.Decide("a.example.org"); got != routing.Proxy {
+		t.Fatalf("old rules leaked: decide = %v", got)
+	}
+}
+
+// TestReloadSwitchesRulesProviderWhenSourceChanges 验证规则源配置变化时重建
+// Provider（旧规则不再生效，新源立即加载）。
+func TestReloadSwitchesRulesProviderWhenSourceChanges(t *testing.T) {
+	dir := t.TempDir()
+	rulesA := filepath.Join(dir, "a.yaml")
+	rulesB := filepath.Join(dir, "b.yaml")
+	writeRules(t, rulesA, "rules:\n  - action: direct\n    match: [\"*.example.org\"]\n")
+	writeRules(t, rulesB, "rules:\n  - action: direct\n    match: [\"*.example.net\"]\n")
+	app, err := New(baseReloadCfg(t, rulesA), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := app.policy.load().rules
+
+	next := baseReloadCfg(t, rulesB)
+	if err := app.Reload(next); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	after := app.policy.load().rules
+	if after == before {
+		t.Fatal("rules provider must be rebuilt when the source changes")
+	}
+	if after.Spec().Target != rulesB {
+		t.Fatalf("spec target = %q, want %q", after.Spec().Target, rulesB)
+	}
+	if got := after.Decide("a.example.net"); got != routing.Direct {
+		t.Fatalf("new source rules not applied: decide = %v", got)
+	}
+	if got := after.Decide("a.example.org"); got != routing.Proxy {
+		t.Fatalf("old source rules leaked: decide = %v", got)
+	}
+}
+
+// TestRuntimeStatsIncludesRuleset 验证 /stats 快照包含规则源状态。
+func TestRuntimeStatsIncludesRuleset(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	writeRules(t, rulesPath, "rules:\n  - action: direct\n    match: [\"*.example.org\"]\n")
+	app, err := New(baseReloadCfg(t, rulesPath), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := app.runtimeStats()
+	if rt.Ruleset == nil {
+		t.Fatal("stats must include the ruleset section when a source is configured")
+	}
+	if rt.Ruleset.Source != "file" || rt.Ruleset.Target != rulesPath ||
+		!rt.Ruleset.Loaded || rt.Ruleset.Rules != 1 || rt.Ruleset.LastSuccess == "" {
+		t.Fatalf("unexpected ruleset stats: %+v", rt.Ruleset)
+	}
+}
+
+// TestRuntimeStatsOmitsRulesetWithoutSource 验证未配置规则源时不输出 ruleset 段。
+func TestRuntimeStatsOmitsRulesetWithoutSource(t *testing.T) {
+	app, err := New(baseReloadCfg(t, ""), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rt := app.runtimeStats(); rt.Ruleset != nil {
+		t.Fatalf("ruleset section must be omitted without a source: %+v", rt.Ruleset)
+	}
+}

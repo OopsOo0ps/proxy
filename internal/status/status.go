@@ -77,10 +77,22 @@ type Memory struct {
 	Goroutines int    `json:"goroutines"`  // 当前协程数
 }
 
+// Ruleset 是分流规则源的运行时状态（仅 proxy-client 配置了规则源时输出）。
+type Ruleset struct {
+	Source      string  `json:"source"`                    // file | url
+	Target      string  `json:"target"`                    // 规则文件路径或 URL
+	Refresh     float64 `json:"refresh_seconds,omitempty"` // URL 定时刷新周期（秒）；0 = 仅启动拉取一次
+	Loaded      bool    `json:"loaded"`                    // 是否已有成功加载的规则
+	Rules       int     `json:"rules"`                     // 当前生效的规则条数
+	LastSuccess string  `json:"last_success,omitempty"`    // 最近一次成功加载时间（RFC3339）
+	LastError   string  `json:"last_error,omitempty"`      // 最近一次失败原因；成功后清空
+}
+
 // Runtime 是运行时可变部分的快照。
 type Runtime struct {
 	Connections Connections
 	Upstreams   []Upstream
+	Ruleset     *Ruleset
 	Limit       *Limit
 }
 
@@ -104,6 +116,7 @@ type statsResponse struct {
 	Uptime      float64     `json:"uptime"` // 秒
 	Connections Connections `json:"connections"`
 	Upstreams   []Upstream  `json:"upstreams,omitempty"`
+	Ruleset     *Ruleset    `json:"ruleset,omitempty"`
 	Limit       *Limit      `json:"limit,omitempty"`
 	Memory      Memory      `json:"memory"`
 }
@@ -134,7 +147,7 @@ func (s *Status) Health() http.Handler {
 	})
 }
 
-// Stats 返回 /stats 处理器：连接数、上游状态与内存占用快照。
+// Stats 返回 /stats 处理器：连接数、上游状态、规则源状态与内存占用快照。
 func (s *Status) Stats() http.Handler {
 	if s == nil {
 		return http.NotFoundHandler()
@@ -152,6 +165,7 @@ func (s *Status) Stats() http.Handler {
 			Uptime:      Seconds(time.Since(s.start)),
 			Connections: rt.Connections,
 			Upstreams:   rt.Upstreams,
+			Ruleset:     rt.Ruleset,
 			Limit:       rt.Limit,
 			Memory:      readMemory(),
 		})

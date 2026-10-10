@@ -13,6 +13,9 @@
 //   - dns_queries_total（counter，标签 route/result）与 dns_query_duration_seconds
 //     （histogram，标签 route）：DNS 网关查询（路线图 3.1）
 //   - config_reloads_total（counter，标签 result）：配置热加载次数（路线图 3.2）
+//   - ruleset_refreshes_total（counter，标签 result）：规则集加载 / 刷新次数（路线图 3.4）
+//   - ruleset_last_success_timestamp_seconds（gauge）：最近一次成功加载规则的时间戳
+//   - ruleset_rules（gauge）：当前生效的规则条数
 package metrics
 
 import (
@@ -66,6 +69,13 @@ const (
 	ReloadError   = "error"
 )
 
+// 规则集加载/刷新结果标签值。
+const (
+	RulesetSuccess   = "success"
+	RulesetUnchanged = "unchanged"
+	RulesetError     = "error"
+)
+
 // Metrics 聚合全部指标。请使用 New 构造；方法对 nil 接收者安全（no-op），
 // 便于在不需要指标的测试中省略构造。
 type Metrics struct {
@@ -82,6 +92,10 @@ type Metrics struct {
 	dnsQueries    *prometheus.CounterVec
 	dnsDuration   *prometheus.HistogramVec
 	configReloads *prometheus.CounterVec
+
+	rulesetRefreshes   *prometheus.CounterVec
+	rulesetLastSuccess prometheus.Gauge
+	rulesetRules       prometheus.Gauge
 }
 
 // New 创建独立的指标集合（使用私有 registry，不污染全局默认值）。
@@ -138,8 +152,20 @@ func New() *Metrics {
 			Name: "config_reloads_total",
 			Help: "Total number of configuration reload attempts by result (success/error).",
 		}, []string{"result"}),
+		rulesetRefreshes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "ruleset_refreshes_total",
+			Help: "Total number of rule set load/refresh attempts by result (success/unchanged/error).",
+		}, []string{"result"}),
+		rulesetLastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ruleset_last_success_timestamp_seconds",
+			Help: "Unix timestamp of the last successful rule set load.",
+		}),
+		rulesetRules: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "ruleset_rules",
+			Help: "Number of rules in the currently active rule set.",
+		}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.healthProbes, m.upstreamAlive, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.healthProbes, m.upstreamAlive, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads, m.rulesetRefreshes, m.rulesetLastSuccess, m.rulesetRules)
 	m.preInitialize()
 	return m
 }
@@ -167,6 +193,9 @@ func (m *Metrics) preInitialize() {
 	}
 	for _, result := range []string{ReloadSuccess, ReloadError} {
 		m.configReloads.WithLabelValues(result)
+	}
+	for _, result := range []string{RulesetSuccess, RulesetUnchanged, RulesetError} {
+		m.rulesetRefreshes.WithLabelValues(result)
 	}
 }
 
@@ -303,4 +332,28 @@ func (m *Metrics) ConfigReload(result string) {
 		return
 	}
 	m.configReloads.WithLabelValues(result).Inc()
+}
+
+// RulesetRefresh 记录一次规则集加载 / 刷新尝试（result 取值 success / unchanged / error）。
+func (m *Metrics) RulesetRefresh(result string) {
+	if m == nil {
+		return
+	}
+	m.rulesetRefreshes.WithLabelValues(result).Inc()
+}
+
+// SetRulesetLastSuccess 记录最近一次成功加载规则的时间戳（Unix 秒）；零值忽略。
+func (m *Metrics) SetRulesetLastSuccess(t time.Time) {
+	if m == nil || t.IsZero() {
+		return
+	}
+	m.rulesetLastSuccess.Set(float64(t.Unix()))
+}
+
+// SetRulesetRules 记录当前生效的规则条数。
+func (m *Metrics) SetRulesetRules(n int) {
+	if m == nil {
+		return
+	}
+	m.rulesetRules.Set(float64(n))
 }

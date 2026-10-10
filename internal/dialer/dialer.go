@@ -36,9 +36,15 @@ func (r Route) Label() string {
 	return "direct"
 }
 
+// Router 是拨号前的分流决策器：*routing.Engine（静态规则）与
+// *ruleset.Provider（含远程刷新的动态规则源）都满足该接口。
+type Router interface {
+	Decide(host string) routing.Action
+}
+
 // Dialer 是路由感知的出站拨号器，可安全并发使用。
 type Dialer struct {
-	router *routing.Engine
+	router Router
 	pool   *nodes.Pool // 可为 nil（未配置节点，仅支持直连）
 	direct *net.Dialer
 }
@@ -46,7 +52,7 @@ type Dialer struct {
 // Options 是 Dialer 构造参数。
 type Options struct {
 	// Router 分流引擎（必填）。
-	Router *routing.Engine
+	Router Router
 	// Pool 出口节点池；为空时仅能直连。
 	Pool *nodes.Pool
 	// DialTimeout 连接超时，默认 10s。
