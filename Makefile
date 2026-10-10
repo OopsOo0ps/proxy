@@ -1,0 +1,101 @@
+# Proxy — 构建与开发入口。
+#
+# 常用目标：
+#   make build   构建全部二进制到 bin/
+#   make test    运行全部单元测试
+#   make lint    运行 golangci-lint（首次自动下载到 .bin/，带校验）
+#   make run     构建并前台启动 proxy-server
+# 完整目标列表见 make help。
+#
+# 提示：网络受限时可用镜像覆盖下载源，例如：
+#   make lint GOLANGCI_LINT_BASE=https://<mirror>/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
+
+GO         ?= go
+BIN_DIR    := bin
+TOOL_DIR   := .bin
+MODULE     := github.com/OopsOo0ps/proxy
+
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+
+LDFLAGS := -s -w \
+  -X '$(MODULE)/pkg/version.Version=$(VERSION)' \
+  -X '$(MODULE)/pkg/version.Commit=$(COMMIT)' \
+  -X '$(MODULE)/pkg/version.BuildDate=$(BUILD_DATE)'
+
+GOLANGCI_LINT_VERSION ?= v2.14.0
+GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
+GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
+
+.PHONY: all build test lint fmt vet run run-server run-client run-controller clean help
+
+all: build
+
+build:
+	@mkdir -p $(BIN_DIR)
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-server ./cmd/server
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-client ./cmd/client
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-controller ./cmd/controller
+
+test:
+	$(GO) test ./...
+
+lint: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run
+
+$(GOLANGCI_LINT):
+	@mkdir -p $(TOOL_DIR)
+	@set -e; \
+	os=$$(uname -s | tr 'A-Z' 'a-z'); \
+	arch=$$(uname -m); \
+	case "$$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac; \
+	ver=$$(printf '%s' '$(GOLANGCI_LINT_VERSION)' | sed 's/^v//'); \
+	file="golangci-lint-$$ver-$$os-$$arch.tar.gz"; \
+	tmp=$$(mktemp -d); \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	echo "downloading $$file"; \
+	curl -sSfL "$(GOLANGCI_LINT_BASE)/$$file" -o "$$tmp/$$file"; \
+	curl -sSfL "$(GOLANGCI_LINT_BASE)/golangci-lint-$$ver-checksums.txt" -o "$$tmp/checksums.txt"; \
+	if command -v sha256sum >/dev/null 2>&1; then sum='sha256sum'; else sum='shasum -a 256'; fi; \
+	expected=$$(grep "[[:space:]]$$file$$" "$$tmp/checksums.txt" | awk '{print $$1}'); \
+	actual=$$($$sum "$$tmp/$$file" | awk '{print $$1}'); \
+	if [ -z "$$expected" ] || [ "$$expected" != "$$actual" ]; then \
+		echo "error: checksum verification failed for $$file" >&2; \
+		exit 1; \
+	fi; \
+	tar -xzf "$$tmp/$$file" -C "$$tmp"; \
+	mv "$$tmp/golangci-lint-$$ver-$$os-$$arch/golangci-lint" $(GOLANGCI_LINT)
+
+fmt:
+	$(GO) fmt ./...
+
+vet:
+	$(GO) vet ./...
+
+run: run-server
+
+run-server: build
+	$(BIN_DIR)/proxy-server
+
+run-client: build
+	$(BIN_DIR)/proxy-client
+
+run-controller: build
+	$(BIN_DIR)/proxy-controller
+
+clean:
+	rm -rf $(BIN_DIR) $(TOOL_DIR)
+
+help:
+	@printf '%s\n' \
+		'可用目标：' \
+		'  build           构建全部二进制到 bin/' \
+		'  test            运行全部单元测试' \
+		'  lint            运行 golangci-lint' \
+		'  fmt             格式化代码（go fmt）' \
+		'  vet             运行 go vet' \
+		'  run             构建并前台启动 proxy-server' \
+		'  run-client      构建并前台启动 proxy-client' \
+		'  run-controller  运行 proxy-controller' \
+		'  clean           清理 bin/ 与 .bin/'
