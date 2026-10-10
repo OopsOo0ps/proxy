@@ -25,9 +25,26 @@ type Stats struct {
 // closeWriter 是支持半关闭写方向的连接（*net.TCPConn、*tls.Conn 均实现）。
 type closeWriter interface{ CloseWrite() error }
 
+// relayBufSize 是单个方向的转发缓冲大小：32KiB 与 io.Copy 的缺省一致，
+// 大于 TLS 记录上限（16KiB），减少单次读写的系统调用次数，同时把每连接
+// 的常驻内存控制在合理范围（双向合计 64KiB）。
+const relayBufSize = 32 * 1024
+
+// bufPool 复用转发缓冲，降低高并发下的 GC 压力。
+//
+// 设计理由：
+//   - 每条转发连接每个方向各占一条缓冲；若逐连接创建，1000 条并发连接
+//     会持续产生约 64MiB 的瞬时垃圾，给 GC 带来与流量无关的固定压力，
+//     复用后大部分连接不再产生这块分配；
+//   - 池中存放 *[]byte 而不是 []byte：把切片头装进 any 会迫使切片头
+//     逃逸到堆上（每次 Put/Get 都多一次分配），存指针可以完全避免；
+//   - 每个方向只有一条缓冲，同时承担读与写（读到的字节立即写出），
+//     相比"读缓冲 + 写缓冲"省掉一半内存，也不引入额外拷贝；
+//   - 归还的缓冲不做清零：转发数据是过路流量，下一次使用会先写满
+//     已读到的字节再写出，不会把旧数据带给对端。
 var bufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, relayBufSize)
 		return &buf
 	},
 }
@@ -113,8 +130,12 @@ func halfClose(conn net.Conn) {
 func copyLoop(dst, src net.Conn, idle time.Duration) (int64, error) {
 	bufPtr := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufPtr)
-	buf := *bufPtr
+	return copyLoopWithBuffer(dst, src, idle, *bufPtr)
+}
 
+// copyLoopWithBuffer 是 copyLoop 的实现主体，缓冲由调用方提供
+// （真实路径来自 bufPool；基准测试用它构造"不复用缓冲"的对照组）。
+func copyLoopWithBuffer(dst, src net.Conn, idle time.Duration, buf []byte) (int64, error) {
 	var total int64
 	for {
 		if idle > 0 {
