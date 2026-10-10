@@ -94,6 +94,10 @@ func TestWriteReadRequestRoundTrip(t *testing.T) {
 		{"example.com", 443},
 		{"1.2.3.4", 80},
 		{"::1", 8443},
+		// 二进制地址/端口含 0x0A 的回归用例：不能按文本行扫描 CRLF。
+		{"127.0.0.1", 0x0A11},
+		{"10.1.2.3", 443},
+		{"example.com", 0x0D0A},
 	}
 	for _, tc := range cases {
 		var buf bytes.Buffer
@@ -135,11 +139,14 @@ func TestWriteRequestFormat(t *testing.T) {
 }
 
 func TestReadRequestRejects(t *testing.T) {
+	validPrefix := strings.Repeat("a", 56) + "\r\n" + "\x01\x01\x01\x01\x01\x00\x50"
 	cases := map[string]string{
-		"http probe":   "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
-		"short hash":   "abc\r\n\x01\x01\x01\x01\x01\x00\x50\r\n",
-		"bad hash hex": strings.Repeat("g", 56) + "\r\n",
-		"no crlf":      strings.Repeat("a", 56) + "\n",
+		"http probe":         "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+		"short hash":         "abc\r\n\x01\x01\x01\x01\x01\x00\x50\r\n",
+		"bad hash hex":       strings.Repeat("g", 56) + "\r\n",
+		"no crlf":            strings.Repeat("a", 56) + "\n",
+		"bad terminator":     validPrefix + "\r\r",
+		"missing terminator": validPrefix,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
