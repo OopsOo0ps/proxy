@@ -75,11 +75,36 @@ func TestNilMetricsSafe(t *testing.T) {
 	m.Observe(ProtoHTTP, RouteDirect, ResultOK, time.Second)
 	m.ConnOpened(ProtoHTTP)
 	m.ConnClosed(ProtoHTTP)
+	m.HealthProbe("n1", true)
+	m.SetUpstreamHealthy("n1", false)
 	if m.Handler() == nil {
 		t.Fatal("nil metrics Handler should not be nil")
 	}
 	if m.ActiveByProto() != nil {
 		t.Fatal("nil metrics ActiveByProto should return nil")
+	}
+}
+
+func TestHealthProbeMetrics(t *testing.T) {
+	m := New()
+	m.HealthProbe("n1", true)
+	m.HealthProbe("n1", false)
+	m.HealthProbe("n1", false)
+	m.SetUpstreamHealthy("n1", false)
+	m.SetUpstreamHealthy("n2", true)
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`upstream_health_probes_total{node="n1",result="success"} 1`,
+		`upstream_health_probes_total{node="n1",result="failure"} 2`,
+		`upstream_healthy{node="n1"} 0`,
+		`upstream_healthy{node="n2"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics missing %q:\n%s", want, body)
+		}
 	}
 }
 

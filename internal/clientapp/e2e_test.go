@@ -846,6 +846,174 @@ func TestE2EHealthReportsNodesCooling(t *testing.T) {
 	}
 }
 
+// durationPtr 返回 config.Duration 指针（测试配置构造用）。
+func durationPtr(d time.Duration) *config.Duration {
+	v := config.Duration(d)
+	return &v
+}
+
+// freeTCPAddr 返回一个刚释放的本地端口地址（供“同址重启节点”的用例）。
+func freeTCPAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}
+
+// upstreamStats 是 /stats 中单个上游节点的字段（测试用子集）。
+type upstreamStats struct {
+	Addr              string  `json:"addr"`
+	Healthy           bool    `json:"healthy"`
+	Fails             int     `json:"fails"`
+	CooldownRemaining float64 `json:"cooldown_remaining"`
+	Removed           bool    `json:"removed"`
+	ProbeFails        int     `json:"probe_fails"`
+	Idle              int     `json:"idle"`
+}
+
+// waitUpstream 轮询 /stats 直到 addr 节点满足条件，返回最后一次快照。
+func waitUpstream(t *testing.T, metricsAddr, addr string, cond func(upstreamStats) bool) upstreamStats {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	var last upstreamStats
+	for time.Now().Before(deadline) {
+		var stats struct {
+			Upstreams []upstreamStats `json:"upstreams"`
+		}
+		if code := getJSON(t, "http://"+metricsAddr+"/stats", &stats); code != http.StatusOK {
+			t.Fatalf("/stats status = %d, want 200", code)
+		}
+		for _, up := range stats.Upstreams {
+			if up.Addr == addr {
+				last = up
+				if cond(up) {
+					return up
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("upstream %s not in expected state, last = %+v", addr, last)
+	return last
+}
+
+// metricSeriesValue 提取 /metrics 中以 series 为前缀的单行指标值；未找到返回 0。
+func metricSeriesValue(t *testing.T, metricsAddr, series string) int {
+	t.Helper()
+	body := scrapeMetrics(t, metricsAddr)
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, series) {
+			continue
+		}
+		fields := strings.Fields(line)
+		v, err := strconv.Atoi(fields[len(fields)-1])
+		if err != nil {
+			t.Fatalf("parse metric line %q: %v", line, err)
+		}
+		return v
+	}
+	return 0
+}
+
+func TestE2EHealthCheckRemovesAndRejoinsNode(t *testing.T) {
+	// 稳定节点 + 可重启节点（固定端口，便于同址重启后再加回）。
+	stable := startServer(t, "stable-secret", nil, false)
+	flakyAddr := freeTCPAddr(t)
+	flakyLogs := &lockedBuffer{}
+	flakyLogger := slog.New(slog.NewJSONHandler(flakyLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	flaky := startServerWith(t, "flaky-secret", flakyLogger, false, func(c *config.Server) {
+		c.Listen = flakyAddr
+	})
+
+	nodes := []config.Node{
+		{Addr: stable.addr, Password: "stable-secret"},
+		{Addr: flaky.addr, Password: "flaky-secret"},
+	}
+	target := startTLSTarget(t)
+	cfg := baseClientCfg(nodes)
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.Pool = config.Pool{MaxIdle: intPtr(2), IdleTTL: config.Duration(30 * time.Second)}
+	cfg.HealthCheck = config.HealthCheck{
+		Interval:  durationPtr(100 * time.Millisecond),
+		Timeout:   config.Duration(300 * time.Millisecond),
+		Failures:  intPtr(2),
+		Successes: intPtr(2),
+	}
+	app := startClient(t, cfg, nil)
+
+	// 初始：两个节点都健康，且各自预热 2 条空闲连接等待摘除时被清理。
+	flakyIdle := `upstream_pool_idle_connections{node="` + flaky.addr + `"}`
+	waitForMetric(t, app.MetricsAddr(), flakyIdle+" 2")
+	waitForMetric(t, app.MetricsAddr(), `upstream_healthy{node="`+flaky.addr+`"} 1`)
+
+	// 停掉 flaky 节点：健康检查连续失败后应摘除（硬摘除），并清空其空闲连接。
+	flaky.stop()
+	up := waitUpstream(t, app.MetricsAddr(), flaky.addr, func(up upstreamStats) bool { return up.Removed })
+	if up.Healthy || up.ProbeFails < 2 {
+		t.Fatalf("removed upstream = %+v, want 已摘除且探测失败 ≥ 2", up)
+	}
+	waitForMetric(t, app.MetricsAddr(), `upstream_healthy{node="`+flaky.addr+`"} 0`)
+	waitForMetric(t, app.MetricsAddr(), flakyIdle+" 0")
+	waitForMetric(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+flaky.addr+`",result="failure"}`)
+
+	// 剩余健康节点仍然可用：流量全部成功，/health 保持 200。
+	client := browser(t, "http://"+app.HTTPAddr(), 10)
+	for i := 0; i < 6; i++ {
+		resp, err := client.Get(target.URL)
+		if err != nil {
+			t.Fatalf("request %d during removal: %v", i, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+	var health struct {
+		Status string `json:"status"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/health", &health); code != http.StatusOK || health.Status != "ok" {
+		t.Fatalf("/health = %d/%s, want 200/ok（仍有健康节点）", code, health.Status)
+	}
+
+	// 同址重启 flaky 节点：健康检查连续成功达阈值后自动加回并重新承载流量。
+	flaky = startServerWith(t, "flaky-secret", flakyLogger, false, func(c *config.Server) {
+		c.Listen = flakyAddr
+	})
+	up = waitUpstream(t, app.MetricsAddr(), flaky.addr, func(up upstreamStats) bool { return !up.Removed })
+	if !up.Healthy || up.ProbeFails != 0 {
+		t.Fatalf("rejoined upstream = %+v, want 已加回且探测失败清零", up)
+	}
+	waitForMetric(t, app.MetricsAddr(), `upstream_healthy{node="`+flaky.addr+`"} 1`)
+	waitForMetric(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+flaky.addr+`",result="success"}`)
+
+	for i := 0; i < 4; i++ {
+		resp, err := client.Get(target.URL)
+		if err != nil {
+			t.Fatalf("request %d after rejoin: %v", i, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d after rejoin status = %d, want 200", i, resp.StatusCode)
+		}
+	}
+	// 加回后的节点应实际承载隧道流量（以服务端完成日志为证据）。
+	record := waitForLog(t, flakyLogs, "tunnel completed")
+	assertLogFields(t, record, map[string]func(any) error{
+		"result": func(v any) error {
+			if v != "ok" {
+				return fmt.Errorf("result = %v", v)
+			}
+			return nil
+		},
+	})
+}
+
 func TestE2EUpstreamPoolClaimHit(t *testing.T) {
 	h := startServer(t, "node-secret", nil, false)
 	target := startTLSTarget(t)
