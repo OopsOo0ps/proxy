@@ -42,6 +42,16 @@ func testTimeouts() config.Timeouts {
 	}
 }
 
+// testServerTimeouts 是测试用服务端超时：握手超时明显大于客户端预热池的
+// 空闲 TTL（默认 5s，个别用例 30s），与生产默认 10s > 5s 的关系一致。
+// 两者接近或相等时，空闲连接可能在池中就被服务端按握手超时回收并回放
+// 伪装响应，把「领取竞态」人为放大成常态。
+func testServerTimeouts() config.Timeouts {
+	tt := testTimeouts()
+	tt.Handshake = config.Duration(60 * time.Second)
+	return tt
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 func intPtr(v int) *int { return &v }
@@ -71,7 +81,7 @@ func startServerWith(t *testing.T, password string, logger *slog.Logger, withMet
 		Listen:   "127.0.0.1:0",
 		TLS:      config.ServerTLS{CertFile: certFile, KeyFile: keyFile},
 		Users:    []config.User{{Username: "node-user", Password: password}},
-		Timeouts: testTimeouts(),
+		Timeouts: testServerTimeouts(),
 		Log:      config.Log{Level: "debug", Format: "json"},
 	}
 	if withMetrics {

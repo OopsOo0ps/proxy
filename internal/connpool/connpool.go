@@ -6,9 +6,10 @@
 // 省去一次到出口节点的完整握手往返。
 //
 // 设计要点：
-//   - 领取时做存活探测（短窗口的单字节读，见 probeAlive）：服务端已关闭、
-//     或已按握手超时回收并回放伪装响应的连接会被识别为失效并丢弃，
-//     调用方回退新建，因此死连接不会流入业务；
+//   - 领取时做非阻塞存活探测（即时检查 + 一个探测窗口复核，见 probeAlive）：
+//     服务端已关闭、或已按握手超时回收并回放伪装响应的连接会被识别为失效并
+//     丢弃，调用方回退新建，因此失效连接不会流入业务；探测不依赖读超时，
+//     协程被调度延迟也不会漏检；
 //   - 空闲连接受 IdleTTL 约束（默认 5s）。该值应明显小于服务端 handshake
 //     超时（默认 10s），否则连接可能在池中就已经被服务端回收；
 //   - 采用“按需补充”：启动预热到 MaxIdle，每次领取后异步补回 MaxIdle；
@@ -388,11 +389,57 @@ func (p *Pool) prune() {
 	}
 }
 
-// probeWindow 是存活探测的等待窗口。窗口内无数据（超时）即视为健康；
-// 健康连接上的等待通常远小于 1ms（仅调度开销），相对省下的握手往返可忽略。
+// probeWindow 是存活探测窗口：给在途的收尾字节（服务端回放的伪装响应、
+// FIN/RST）留出到达时间；健康连接上什么都没有，等待即为探测成本。
 const probeWindow = time.Millisecond
 
-// probeAlive 对空闲连接做存活探测：短暂等待后读一个字节。
+// probeAlive 判断空闲连接是否仍可复用。
+//
+// 对 TCP 连接（含 *tls.Conn 包装）使用非阻塞套接字探测（MSG_PEEK，见
+// probeTCP）：不消费数据、不设置读期限，因此不受协程调度影响。
+// 这一点是「预热池领取竞态」的修复关键：期限读在协程被延迟调度时会先
+// 到期，Go 网络栈直接返回超时、忽略已排队的数据，把「服务端已按握手
+// 超时回收并回放伪装响应」的连接误判为健康，伪装响应随后随隧道流入业务。
+// 非 TCP 连接（如测试用 net.Pipe）退回期限读探测（probeAliveRead）。
+func probeAlive(conn net.Conn) error {
+	if tcp := tcpConnOf(conn); tcp != nil {
+		if err, supported := probeTCP(tcp); supported {
+			return err
+		}
+	}
+	return probeAliveRead(conn)
+}
+
+// probeTCP 两阶段非阻塞探测：先即时检查一次（已排队的伪装响应、已收到的
+// FIN/RST 立刻命中），无异常时等待一个探测窗口让在途数据到达，再复核一次。
+// 两次检查都基于 MSG_PEEK，不受调度延迟影响；池中空闲连接在领取前没有
+// 任何读取，服务端回放的伪装响应必然停留在内核缓冲，peek 可见。
+func probeTCP(conn *net.TCPConn) (error, bool) {
+	err, supported := probeTCPSyscall(conn)
+	if !supported || err != nil {
+		return err, supported
+	}
+	time.Sleep(probeWindow)
+	return probeTCPSyscall(conn)
+}
+
+// tcpConnOf 取出连接背后的 *net.TCPConn：直接是 TCPConn，或经 NetConn()
+// （*tls.Conn 等）包装的 TCPConn；无法还原时返回 nil。
+func tcpConnOf(conn net.Conn) *net.TCPConn {
+	for i := 0; i < 4 && conn != nil; i++ {
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			return tcp
+		}
+		wrapped, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil
+		}
+		conn = wrapped.NetConn()
+	}
+	return nil
+}
+
+// probeAliveRead 是退回路径的存活探测：短暂等待后读一个字节。
 // 预期结果是超时——服务端在收到 Trojan 请求前不会发送任何应用数据；
 // 读到数据（服务端已按握手超时回收并回放伪装响应）或 EOF/错误都表示连接不可用。
 // 探测通过后清除读期限，连接可正常使用。
@@ -400,7 +447,8 @@ const probeWindow = time.Millisecond
 // 注意：不能把读期限设为“立即到期”来“零等待”探测——Go 的网络栈在检测到
 // 期限已过时会直接返回超时，不再检查已排队的 EOF/数据（也会跳过 TLS 内部的
 // 握手后消息，如 NewSessionTicket），反而探测不出失效连接。
-func probeAlive(conn net.Conn) error {
+// 期限读依赖协程被及时调度，仅用于无法做非阻塞探测的连接。
+func probeAliveRead(conn net.Conn) error {
 	if err := conn.SetReadDeadline(time.Now().Add(probeWindow)); err != nil {
 		return err
 	}

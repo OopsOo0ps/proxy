@@ -3,6 +3,7 @@ package connpool
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -93,7 +94,7 @@ func waitIdle(t *testing.T, p *Pool, addr string, want int) {
 }
 
 // tcpPair 建立一对本地 TCP 连接用于探测类测试（时序语义与生产一致）。
-func tcpPair(t *testing.T) (net.Conn, net.Conn) {
+func tcpPair(t testing.TB) (net.Conn, net.Conn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -273,6 +274,141 @@ func TestClaimSkipsConnWithPendingData(t *testing.T) {
 	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
 		t.Fatal("conn with pending data must not be claimed")
 	}
+}
+
+// delayedReadConn 包装真实 TCP 连接，模拟「探测读被调度延迟」：
+// Read 先等待超过探测窗口再委托给底层连接——读取执行时读期限已过，
+// Go 网络栈直接返回超时、忽略已排队的数据（存活探测的旧实现即由此漏检）。
+type delayedReadConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c *delayedReadConn) Read(p []byte) (int, error) {
+	time.Sleep(c.delay)
+	return c.Conn.Read(p)
+}
+
+// NetConn 暴露底层连接，使非阻塞探测能取到原始套接字。
+func (c *delayedReadConn) NetConn() net.Conn { return c.Conn }
+
+// TestClaimSkipsConnWhenProbeReadIsDelayed 是「预热池领取竞态」的回归用例：
+// 服务端已按握手超时回收连接并回放伪装响应（数据已排队），但领取时的
+// 期限读探测被调度延迟——旧的期限读会返回超时、把连接误判为健康，
+// 随后把 Trojan 请求写进这条死连接，伪装响应最终流入业务（浏览器报
+// "server gave HTTP response to HTTPS client"）。非阻塞探测不依赖调度，
+// 必须识别出队列中的数据并丢弃连接。
+func TestClaimSkipsConnWhenProbeReadIsDelayed(t *testing.T) {
+	n := &fakeNode{}
+	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+
+	client, server := tcpPair(t)
+	if _, err := server.Write([]byte("HTTP/1.1 200 OK\r\n\r\nIt works!\r\n")); err != nil {
+		t.Fatalf("write decoy: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // 伪装响应到达并排队
+
+	conn := &delayedReadConn{Conn: client, delay: 5 * probeWindow}
+	injectIdle(p, "n1", conn, time.Now())
+
+	// 前提校验：期限读在此连接上必然漏检（超时被当作健康）。
+	if err := probeAliveRead(conn); err != nil {
+		t.Fatalf("前提不成立：期限读应因调度延迟返回超时（漏检），got %v", err)
+	}
+
+	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+		t.Fatal("已回放伪装响应且探测被延迟的连接不得被领取")
+	}
+}
+
+// TestClaimWithDelayedProbeKeepsHealthyConn：调度延迟不影响健康连接的领取
+// （非阻塞探测不消费数据、不误判）。
+func TestClaimWithDelayedProbeKeepsHealthyConn(t *testing.T) {
+	n := &fakeNode{}
+	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+
+	client, server := tcpPair(t)
+	conn := &delayedReadConn{Conn: client, delay: 5 * probeWindow}
+	injectIdle(p, "n1", conn, time.Now())
+
+	got, ok := p.Claim(context.Background(), "n1", "example.com", 443)
+	if !ok {
+		t.Fatal("healthy conn must be claimed even when probe reads would be delayed")
+	}
+	if got != net.Conn(conn) {
+		t.Fatalf("claim = %v, want the injected conn", got)
+	}
+	// 探测不得消费数据：服务端正常发送的目标字节仍完整可读。
+	if _, err := server.Write([]byte("target-bytes")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, len("target-bytes"))
+	if _, err := io.ReadFull(got, buf); err != nil {
+		t.Fatalf("read after claim: %v", err)
+	}
+	if string(buf) != "target-bytes" {
+		t.Fatalf("payload = %q", buf)
+	}
+}
+
+// TestProbeAliveTCP 固化非阻塞探测的契约：排队数据 / EOF / RST 视为失效，
+// 健康连接返回 nil 且数据不被消费。
+func TestProbeAliveTCP(t *testing.T) {
+	t.Run("healthy", func(t *testing.T) {
+		client, server := tcpPair(t)
+		if err := probeAlive(client); err != nil {
+			t.Fatalf("healthy conn: %v", err)
+		}
+		// 探测后数据仍可读取（MSG_PEEK 不消费）。
+		if _, err := server.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		_ = client.SetReadDeadline(time.Now().Add(time.Second))
+		var one [1]byte
+		if _, err := io.ReadFull(client, one[:]); err != nil {
+			t.Fatalf("read after probe: %v", err)
+		}
+	})
+
+	t.Run("pending data", func(t *testing.T) {
+		client, server := tcpPair(t)
+		if _, err := server.Write([]byte("decoy")); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond)
+		if err := probeAlive(client); err == nil {
+			t.Fatal("conn with pending data must be stale")
+		}
+	})
+
+	t.Run("closed", func(t *testing.T) {
+		client, server := tcpPair(t)
+		_ = server.Close()
+		time.Sleep(50 * time.Millisecond)
+		if err := probeAlive(client); err == nil {
+			t.Fatal("conn with closed peer must be stale")
+		}
+	})
+
+	t.Run("reset", func(t *testing.T) {
+		client, server := tcpPair(t)
+		if tcp, ok := server.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = server.Close()
+		time.Sleep(50 * time.Millisecond)
+		if err := probeAlive(client); err == nil {
+			t.Fatal("conn with reset peer must be stale")
+		}
+	})
 }
 
 func TestClaimStartFailureDiscardsConn(t *testing.T) {
@@ -488,9 +624,9 @@ func TestDropNodeClosesIdleConnsAndPausesRefill(t *testing.T) {
 	nilPool.DropNode("n1")
 }
 
-// BenchmarkClaimHit 测量一次“领取成功”的固定开销：首先是存活探测
-// （等待探测窗口，健康连接上无数据即超时），其次是 Trojan 请求写入。
-// 使用内存管道、超长 TTL，结果即为领取路径的下限（约等于 probeWindow）。
+// BenchmarkClaimHit 测量一次“领取成功”的固定开销：存活探测（即时检查 +
+// 一个探测窗口复核，健康连接上约等于 probeWindow）与 Trojan 请求写入。
+// 用少量真实 TCP 连接循环注入 / 领取，替代逐次新建连接（会耗尽临时端口）。
 func BenchmarkClaimHit(b *testing.B) {
 	n := &fakeNode{}
 	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1, IdleTTL: time.Hour})
@@ -499,14 +635,16 @@ func BenchmarkClaimHit(b *testing.B) {
 	}
 	b.Cleanup(p.Close)
 
-	// 预备 b.N 条空闲连接（不启动后台任务，避免补池干扰计时）。
-	for i := 0; i < b.N; i++ {
-		client, _ := net.Pipe()
-		injectIdle(p, "n1", client, p.opts.Now())
+	const ring = 64
+	conns := make([]net.Conn, 0, ring)
+	for i := 0; i < ring; i++ {
+		client, _ := tcpPair(b)
+		conns = append(conns, client)
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		injectIdle(p, "n1", conns[i%ring], p.opts.Now())
 		conn, ok := p.Claim(context.Background(), "n1", "example.com", 443)
 		if !ok {
 			b.Fatal("claim miss in benchmark")
