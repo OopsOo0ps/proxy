@@ -56,6 +56,21 @@ type RouteDecider interface {
 	Decide(host string) routing.Action
 }
 
+// LivePolicy 提供配置热加载后的动态解析策略。
+// 为 nil 时使用 Server 构造时的静态字段（测试与直接构造场景）。
+type LivePolicy interface {
+	// Router 返回当前分流引擎。
+	Router() RouteDecider
+	// Remote 返回当前远程解析服务器（host:port）。
+	Remote() string
+	// Local 返回当前本机解析器列表；为空表示不可用。
+	Local() []string
+	// Timeout 返回当前单次查询超时。
+	Timeout() time.Duration
+	// ShutdownTimeout 返回关停排空期限。
+	ShutdownTimeout() time.Duration
+}
+
 // ProxyDialFunc 强制经出口节点建立 TCP 连接，返回连接与命中的节点标签
 // （用于日志的 upstream 字段）。
 type ProxyDialFunc func(ctx context.Context, host string, port uint16) (net.Conn, string, error)
@@ -66,7 +81,8 @@ type Options struct {
 	ListenAddr string
 	// Remote 是经出口节点访问的 DNS 服务器（host:port），缺省 DefaultRemote。
 	Remote string
-	// Local 是直连名字使用的本机解析器列表；为空时读取 ResolvConfPath。
+	// Local 是直连名字使用的本机解析器列表；为空时读取 ResolvConfPath
+	// （启用 Live 时由调用方负责解析生效列表，构造器不做缺省读取）。
 	Local []string
 	// Timeout 是单次查询超时，缺省 DefaultTimeout。
 	Timeout time.Duration
@@ -82,6 +98,8 @@ type Options struct {
 	Metrics *metrics.Metrics
 	// ShutdownTimeout 关停时等待存量查询结束的最长时间，缺省 15s。
 	ShutdownTimeout time.Duration
+	// Live 提供热加载后的动态解析策略；非 nil 时优先于上方静态选项。
+	Live LivePolicy
 }
 
 // Server 是 DNS 网关。
@@ -95,6 +113,7 @@ type Server struct {
 	metrics         *metrics.Metrics
 	shutdownTimeout time.Duration
 	direct          *net.Dialer // 直连本机解析器
+	live            LivePolicy
 }
 
 // New 校验参数、补齐缺省值并构造网关。
@@ -113,6 +132,7 @@ func New(opts Options) (*Server, error) {
 		logger:          opts.Logger,
 		metrics:         opts.Metrics,
 		shutdownTimeout: opts.ShutdownTimeout,
+		live:            opts.Live,
 	}
 	if s.remote == "" {
 		s.remote = DefaultRemote
@@ -131,12 +151,13 @@ func New(opts Options) (*Server, error) {
 			return nil, fmt.Errorf("dnsgw: invalid local resolver %q: %w", addr, err)
 		}
 	}
-	if len(local) == 0 {
+	// Live 启用时缺省解析由调用方在快照构建阶段完成（可随热加载更新）。
+	if len(local) == 0 && opts.Live == nil {
 		path := opts.ResolvConfPath
 		if path == "" {
 			path = DefaultResolvConfPath
 		}
-		resolved, err := localResolversFromResolvConf(path, opts.ListenAddr)
+		resolved, err := LocalResolversFromResolvConf(path, opts.ListenAddr)
 		switch {
 		case err != nil:
 			s.log().Warn("dns gateway: cannot read system resolvers, direct-routed names will fail",
@@ -285,7 +306,7 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 	br := bufio.NewReader(conn)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
+		_ = conn.SetReadDeadline(time.Now().Add(s.timeoutNow()))
 		payload, err := readFrame(br)
 		if err != nil {
 			return
@@ -295,7 +316,7 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 			// 非查询报文：不再等待同连接上的后续查询。
 			return
 		}
-		_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
+		_ = conn.SetWriteDeadline(time.Now().Add(s.timeoutNow()))
 		if err := writeFrame(conn, resp); err != nil {
 			if !errors.Is(err, io.ErrClosedPipe) {
 				s.log().Debug("dns gateway: write tcp response failed", "error", err)
@@ -324,7 +345,7 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 		resp     []byte
 		upstream string
 	)
-	if s.router.Decide(q.name) == routing.Direct {
+	if s.routerNow().Decide(q.name) == routing.Direct {
 		route = metrics.RouteDirect
 		resp, upstream, err = s.queryLocal(ctx, q)
 	} else {
@@ -375,14 +396,15 @@ func (s *Server) handleInvalid(logger *slog.Logger, payload []byte, err error, s
 
 // queryLocal 依次尝试本机解析器（UDP 优先；截断时按 RFC 1035 改走 TCP）。
 func (s *Server) queryLocal(ctx context.Context, q query) ([]byte, string, error) {
-	if len(s.local) == 0 {
+	local := s.localNow()
+	if len(local) == 0 {
 		return nil, "", errors.New("no local resolvers available")
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.timeoutNow())
 	defer cancel()
 
 	var errs []error
-	for _, upstream := range s.local {
+	for _, upstream := range local {
 		resp, err := s.exchangeUDP(ctx, upstream, q)
 		if err == nil && !isTruncated(resp) {
 			return resp, upstream, nil
@@ -401,23 +423,24 @@ func (s *Server) queryLocal(ctx context.Context, q query) ([]byte, string, error
 
 // queryRemote 经出口节点访问远程解析器（DNS over TCP，走 Trojan 隧道）。
 func (s *Server) queryRemote(ctx context.Context, q query) ([]byte, string, error) {
-	host, portString, err := net.SplitHostPort(s.remote)
+	remote := s.remoteNow()
+	host, portString, err := net.SplitHostPort(remote)
 	if err != nil {
-		return nil, "", fmt.Errorf("remote resolver %q: %w", s.remote, err)
+		return nil, "", fmt.Errorf("remote resolver %q: %w", remote, err)
 	}
 	port, err := strconv.ParseUint(portString, 10, 16)
 	if err != nil || port == 0 {
-		return nil, "", fmt.Errorf("remote resolver %q: invalid port", s.remote)
+		return nil, "", fmt.Errorf("remote resolver %q: invalid port", remote)
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	ctx, cancel := context.WithTimeout(ctx, s.timeoutNow())
 	defer cancel()
 
 	conn, label, err := s.proxyDial(ctx, host, uint16(port))
 	if err != nil {
-		return nil, "", fmt.Errorf("dial remote resolver %s via exit node: %w", s.remote, err)
+		return nil, "", fmt.Errorf("dial remote resolver %s via exit node: %w", remote, err)
 	}
 	defer func() { _ = conn.Close() }()
-	setDeadlineFromCtx(conn, ctx, s.timeout)
+	setDeadlineFromCtx(conn, ctx, s.timeoutNow())
 
 	if err := writeFrame(conn, q.payload); err != nil {
 		return nil, label, fmt.Errorf("write to remote resolver: %w", err)
@@ -434,12 +457,12 @@ func (s *Server) queryRemote(ctx context.Context, q query) ([]byte, string, erro
 
 // exchangeUDP 通过一次性的本地 UDP 套接字与上游交换报文。
 func (s *Server) exchangeUDP(ctx context.Context, upstream string, q query) ([]byte, error) {
-	conn, err := s.direct.DialContext(ctx, "udp", upstream)
+	conn, err := s.directNow().DialContext(ctx, "udp", upstream)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
-	setDeadlineFromCtx(conn, ctx, s.timeout)
+	setDeadlineFromCtx(conn, ctx, s.timeoutNow())
 
 	if _, err := conn.Write(q.payload); err != nil {
 		return nil, err
@@ -458,12 +481,12 @@ func (s *Server) exchangeUDP(ctx context.Context, upstream string, q query) ([]b
 
 // exchangeLocalTCP 经 TCP 与本机解析器交换报文（UDP 截断后的重试路径）。
 func (s *Server) exchangeLocalTCP(ctx context.Context, upstream string, q query) ([]byte, error) {
-	conn, err := s.direct.DialContext(ctx, "tcp", upstream)
+	conn, err := s.directNow().DialContext(ctx, "tcp", upstream)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
-	setDeadlineFromCtx(conn, ctx, s.timeout)
+	setDeadlineFromCtx(conn, ctx, s.timeoutNow())
 
 	if err := writeFrame(conn, q.payload); err != nil {
 		return nil, err
@@ -521,9 +544,10 @@ func writeFrame(w io.Writer, payload []byte) error {
 	return err
 }
 
-// localResolversFromResolvConf 解析 nameserver 行返回 host:port 列表，
+// LocalResolversFromResolvConf 解析 nameserver 行返回 host:port 列表，
 // 排除 exclude（网关自身监听地址，防止把查询转发给自己形成自环）。
-func localResolversFromResolvConf(path, exclude string) ([]string, error) {
+// 供 Server 构造与配置热加载共用。
+func LocalResolversFromResolvConf(path, exclude string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -563,7 +587,59 @@ func (s *Server) log() *slog.Logger {
 	return s.logger
 }
 
+// routerNow 返回当前生效的分流引擎：Live 存在时以热加载快照为准。
+func (s *Server) routerNow() RouteDecider {
+	if s.live != nil {
+		return s.live.Router()
+	}
+	return s.router
+}
+
+// remoteNow 返回当前生效的远程解析服务器。
+func (s *Server) remoteNow() string {
+	if s.live != nil {
+		if remote := s.live.Remote(); remote != "" {
+			return remote
+		}
+	}
+	return s.remote
+}
+
+// localNow 返回当前生效的本机解析器列表。
+func (s *Server) localNow() []string {
+	if s.live != nil {
+		return s.live.Local()
+	}
+	return s.local
+}
+
+// timeoutNow 返回当前生效的单次查询超时（非法值回退缺省）。
+func (s *Server) timeoutNow() time.Duration {
+	if s.live != nil {
+		if timeout := s.live.Timeout(); timeout > 0 {
+			return timeout
+		}
+	}
+	if s.timeout <= 0 {
+		return DefaultTimeout
+	}
+	return s.timeout
+}
+
+// directNow 返回直连本机解析器的拨号器；超时取自当前快照。
+func (s *Server) directNow() *net.Dialer {
+	if s.live != nil {
+		return &net.Dialer{Timeout: s.timeoutNow()}
+	}
+	return s.direct
+}
+
 func (s *Server) shutdownTimeoutOrDefault() time.Duration {
+	if s.live != nil {
+		if timeout := s.live.ShutdownTimeout(); timeout > 0 {
+			return timeout
+		}
+	}
 	if s.shutdownTimeout <= 0 {
 		return shutdown.DefaultTimeout
 	}

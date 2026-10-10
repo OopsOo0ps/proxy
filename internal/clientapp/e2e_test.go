@@ -26,6 +26,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/clientapp"
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
@@ -1169,15 +1170,13 @@ func TestE2ETunnelOverloadRejectsAndRecovers(t *testing.T) {
 
 func TestE2ELogLevelEndpointAndDynamicFiltering(t *testing.T) {
 	h := startServer(t, "node-secret", nil, false)
-	// 使用真实的 LevelVar + 可观察 logger 组装客户端，覆盖“运行时切换”全链路。
+	// 使用真实的日志控制器 + 可观察 logger 组装客户端，覆盖“运行时切换”全链路。
 	var logs lockedBuffer
-	lv := new(slog.LevelVar)
-	lv.Set(slog.LevelInfo)
-	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: lv}))
+	logger, logCtrl := logging.NewControlWithWriter(&logs, "info", "json")
 
 	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
 	cfg.Metrics.Listen = "127.0.0.1:0"
-	app, err := clientapp.New(cfg, logger, lv)
+	app, err := clientapp.New(cfg, logger, logCtrl)
 	if err != nil {
 		t.Fatalf("clientapp.New: %v", err)
 	}
@@ -1260,8 +1259,8 @@ func TestE2ELogLevelEndpointAndDynamicFiltering(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid level = %d, want 400", resp.StatusCode)
 	}
-	if lv.Level() != slog.LevelDebug {
-		t.Fatalf("level changed by invalid request: %v", lv.Level())
+	if logCtrl.LevelVar().Level() != slog.LevelDebug {
+		t.Fatalf("level changed by invalid request: %v", logCtrl.LevelVar().Level())
 	}
 }
 

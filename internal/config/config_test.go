@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -476,5 +477,87 @@ func TestShippedExampleConfigsParse(t *testing.T) {
 		if _, err := LoadServer(path); err != nil {
 			t.Errorf("LoadServer(%s): %v", path, err)
 		}
+	}
+}
+
+func TestClientRestartOnlyChanges(t *testing.T) {
+	base := func(t *testing.T) *Client {
+		t.Helper()
+		cfg, err := ParseClient([]byte(validClientYAML))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	if got := ClientRestartOnlyChanges(base(t), base(t)); len(got) != 0 {
+		t.Fatalf("identical configs reported restart-only fields: %v", got)
+	}
+
+	// 可热加载字段的变更（凭据 / 节点 / 分流 / 超时 / 日志 / 连接上限）不要求重启。
+	hot := base(t)
+	hot.Inbound.Auth = []User{{Username: "bob", Password: "pw"}}
+	hot.Nodes = hot.Nodes[:1]
+	hot.Routing.Default = "direct"
+	hot.Routing.RulesFile = "other-rules.yaml"
+	hot.Pool.MaxIdle = intPtr(4)
+	hot.Limits.MaxConnections = intPtr(10)
+	hot.Timeouts.Dial = Duration(3 * time.Second)
+	hot.Log.Level = "info"
+	hot.TLS.InsecureSkipVerify = true
+	if got := ClientRestartOnlyChanges(base(t), hot); len(got) != 0 {
+		t.Fatalf("hot-reloadable changes reported as restart-only: %v", got)
+	}
+
+	// 监听地址的变更要求重启。
+	addrs := base(t)
+	addrs.Inbound.HTTP = "127.0.0.1:18080"
+	addrs.Inbound.SOCKS5 = "127.0.0.1:11080"
+	addrs.Metrics.Listen = "127.0.0.1:19100"
+	addrs.DNS.Listen = "127.0.0.1:1053"
+	want := []string{"inbound.http", "inbound.socks5", "metrics.listen", "dns.listen"}
+	if got := ClientRestartOnlyChanges(base(t), addrs); !reflect.DeepEqual(got, want) {
+		t.Fatalf("restart-only fields = %v, want %v", got, want)
+	}
+}
+
+func TestServerRestartOnlyChanges(t *testing.T) {
+	base := func(t *testing.T) *Server {
+		t.Helper()
+		cfg, err := ParseServer([]byte(`
+listen: "0.0.0.0:8443"
+tls: { cert_file: server.crt, key_file: server.key }
+users:
+  - { username: alice, password: change-me }
+metrics: { listen: "127.0.0.1:9200" }
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+
+	if got := ServerRestartOnlyChanges(base(t), base(t)); len(got) != 0 {
+		t.Fatalf("identical configs reported restart-only fields: %v", got)
+	}
+
+	// 可热加载字段：凭据 / 证书文件 / 伪装页 / 超时 / 日志 / 连接上限。
+	hot := base(t)
+	hot.Users = []User{{Username: "bob", Password: "pw"}}
+	hot.TLS.CertFile = "new-server.crt"
+	hot.DecoyFile = "decoy.html"
+	hot.Limits.MaxConnections = intPtr(10)
+	hot.Timeouts.Idle = Duration(30 * time.Second)
+	hot.Log.Level = "debug"
+	if got := ServerRestartOnlyChanges(base(t), hot); len(got) != 0 {
+		t.Fatalf("hot-reloadable changes reported as restart-only: %v", got)
+	}
+
+	restart := base(t)
+	restart.Listen = "0.0.0.0:9443"
+	restart.Metrics.Listen = "127.0.0.1:9300"
+	want := []string{"listen", "metrics.listen"}
+	if got := ServerRestartOnlyChanges(base(t), restart); !reflect.DeepEqual(got, want) {
+		t.Fatalf("restart-only fields = %v, want %v", got, want)
 	}
 }
