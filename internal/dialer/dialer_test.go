@@ -101,6 +101,43 @@ func TestDialProxyWithoutNodesFails(t *testing.T) {
 	}
 }
 
+// TestDialProxyKeepsDomainUnresolved 锁定 remote DNS 的核心保证：
+// 走代理的目标域名必须原样交给出口节点（客户端不做本地解析），
+// 否则 DNS 污染 / 泄漏会重新出现在代理路径上。
+func TestDialProxyKeepsDomainUnresolved(t *testing.T) {
+	var gotHost string
+	var gotPort uint16
+	pool, err := nodes.New(
+		[]config.Node{{Addr: "node1.example.com:443", Password: "p"}},
+		func(_ context.Context, _ config.Node, host string, port uint16) (net.Conn, error) {
+			gotHost, gotPort = host, port
+			return nopConn{}, nil
+		},
+		nodes.Options{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(Options{Router: engine(t, routing.Proxy, false), Pool: pool})
+
+	// 该名字在本机不可解析（.invalid 保留域）；只要出口拨号函数收到的是
+	// 原始域名而非解析结果，就证明客户端未做本地解析。
+	if _, _, err := d.DialProxy(context.Background(), "remote-only.invalid", 8443); err != nil {
+		t.Fatalf("DialProxy: %v", err)
+	}
+	if gotHost != "remote-only.invalid" || gotPort != 8443 {
+		t.Fatalf("exit dial target = %s:%d, want remote-only.invalid:8443（不得本地解析）", gotHost, gotPort)
+	}
+
+	gotHost, gotPort = "", 0
+	if _, _, err := d.DialTarget(context.Background(), "also-remote-only.invalid", 443); err != nil {
+		t.Fatalf("DialTarget: %v", err)
+	}
+	if gotHost != "also-remote-only.invalid" || gotPort != 443 {
+		t.Fatalf("exit dial target = %s:%d, want also-remote-only.invalid:443", gotHost, gotPort)
+	}
+}
+
 func TestRouteFor(t *testing.T) {
 	d := New(Options{Router: engine(t, routing.Proxy, true)})
 	if got := d.RouteFor("127.0.0.1"); got != routing.Direct {

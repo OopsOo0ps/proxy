@@ -18,6 +18,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
+	"github.com/OopsOo0ps/proxy/internal/dnsgw"
 	"github.com/OopsOo0ps/proxy/internal/httpproxy"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
@@ -39,6 +40,7 @@ type App struct {
 
 	httpSrv  *httpproxy.Server
 	socksSrv *socks5.Server
+	dnsSrv   *dnsgw.Server // 可选：DNS 网关（dns.listen 非空时启用）
 
 	pool     *nodes.Pool    // 出口节点选择/冷却
 	connPool *connpool.Pool // 上游空闲隧道连接池（预热）
@@ -47,6 +49,7 @@ type App struct {
 
 	httpLn     net.Listener
 	socksLn    net.Listener
+	dnsLn      *dnsgw.Listener
 	metricsSrv *http.Server
 	metricsLn  net.Listener
 }
@@ -95,6 +98,29 @@ func New(cfg *config.Client, logger *slog.Logger, logLevel *slog.LevelVar) (*App
 		Pool:        pool,
 		DialTimeout: cfg.Timeouts.Dial.Std(),
 	})
+	if cfg.DNS.Listen != "" {
+		dnsSrv, err := dnsgw.New(dnsgw.Options{
+			ListenAddr: cfg.DNS.Listen,
+			Remote:     cfg.DNS.EffectiveRemote(),
+			Local:      cfg.DNS.Local,
+			Timeout:    cfg.DNS.EffectiveTimeout(),
+			Router:     engine,
+			ProxyDial: func(ctx context.Context, host string, port uint16) (net.Conn, string, error) {
+				conn, route, err := targetDialer.DialProxy(ctx, host, port)
+				if err != nil {
+					return nil, "", err
+				}
+				return conn, route.Label(), nil
+			},
+			Logger:          logger,
+			Metrics:         app.metrics,
+			ShutdownTimeout: cfg.Timeouts.Shutdown.Std(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		app.dnsSrv = dnsSrv
+	}
 
 	app.httpSrv = &httpproxy.Server{
 		Auth:              store,
@@ -150,6 +176,13 @@ func (a *App) Listen() error {
 			ReadHeaderTimeout: 5 * time.Second,
 		}
 	}
+	if a.dnsSrv != nil {
+		ln, err := dnsgw.Listen(a.cfg.DNS.Listen)
+		if err != nil {
+			return err
+		}
+		a.dnsLn = ln
+	}
 	return nil
 }
 
@@ -169,7 +202,7 @@ func (a *App) Serve(ctx context.Context) error {
 		}()
 	}
 
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 	running := 0
 	if a.httpLn != nil {
 		running++
@@ -182,6 +215,10 @@ func (a *App) Serve(ctx context.Context) error {
 	if a.metricsSrv != nil {
 		running++
 		go func() { errCh <- a.serveMetrics(ctx) }()
+	}
+	if a.dnsSrv != nil && a.dnsLn != nil {
+		running++
+		go func() { errCh <- a.dnsSrv.Serve(ctx, a.dnsLn) }()
 	}
 
 	var firstErr error
@@ -199,6 +236,14 @@ func (a *App) HTTPAddr() string { return addrOf(a.httpLn) }
 
 // SOCKS5Addr 返回 SOCKS5 实际监听地址（未启用时为空）。
 func (a *App) SOCKS5Addr() string { return addrOf(a.socksLn) }
+
+// DNSAddr 返回 DNS 网关实际监听地址（未启用时为空）。
+func (a *App) DNSAddr() string {
+	if a.dnsLn == nil {
+		return ""
+	}
+	return a.dnsLn.Addr().String()
+}
 
 // MetricsAddr 返回指标端点实际监听地址（未启用时为空）。
 func (a *App) MetricsAddr() string { return addrOf(a.metricsLn) }

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"gopkg.in/yaml.v3"
 )
@@ -147,6 +148,40 @@ type Metrics struct {
 	Listen string `yaml:"listen"` // host:port，空 = 不启用
 }
 
+// DNS 是 proxy-client 可选的内置 DNS 网关配置（路线图 3.1）。
+//
+// listen 为空时网关关闭。开启后：分流为 proxy 的名字经出口节点远程解析
+// （DNS over TCP 走隧道），分流为 direct 的名字转发给本机解析器（local，
+// 缺省读取 /etc/resolv.conf）。仅允许监听环回地址，避免成为开放解析器。
+type DNS struct {
+	Listen  string   `yaml:"listen"`  // host:port，空 = 关闭；仅允许环回地址
+	Remote  string   `yaml:"remote"`  // 经出口节点访问的 DNS 服务器，缺省 1.1.1.1:53
+	Local   []string `yaml:"local"`   // 直连名字使用的本机解析器；空 = 读取 /etc/resolv.conf
+	Timeout Duration `yaml:"timeout"` // 单次查询超时，缺省 5s
+}
+
+// DNS 网关缺省值。
+const (
+	defaultDNSRemote  = "1.1.1.1:53"
+	defaultDNSTimeout = 5 * time.Second
+)
+
+// EffectiveRemote 返回生效的远程解析服务器（缺省 1.1.1.1:53）。
+func (d DNS) EffectiveRemote() string {
+	if strings.TrimSpace(d.Remote) == "" {
+		return defaultDNSRemote
+	}
+	return d.Remote
+}
+
+// EffectiveTimeout 返回生效的单次查询超时（缺省 5s）。
+func (d DNS) EffectiveTimeout() time.Duration {
+	if d.Timeout <= 0 {
+		return defaultDNSTimeout
+	}
+	return d.Timeout.Std()
+}
+
 // Log 是日志配置。
 type Log struct {
 	Level  string `yaml:"level"`  // debug | info | warn | error
@@ -161,6 +196,7 @@ type Client struct {
 	Limits   Limits    `yaml:"limits"`
 	TLS      ClientTLS `yaml:"tls"`
 	Routing  Routing   `yaml:"routing"`
+	DNS      DNS       `yaml:"dns"`
 	Timeouts Timeouts  `yaml:"timeouts"`
 	Metrics  Metrics   `yaml:"metrics"`
 	Log      Log       `yaml:"log"`
@@ -195,6 +231,10 @@ func LoadClient(path string) (*Client, error) {
 func ParseClient(data []byte) (*Client, error) {
 	var cfg Client
 	if err := decodeStrict(data, &cfg); err != nil {
+		return nil, err
+	}
+	// 在应用缺省值之前检查：dns 字段存在但 listen 为空说明用户意图被静默吞掉。
+	if err := cfg.DNS.validateBeforeDefaults(); err != nil {
 		return nil, err
 	}
 	cfg.applyDefaults()
@@ -258,6 +298,12 @@ func (c *Client) applyDefaults() {
 	}
 	if c.Routing.PrivateDirect == nil {
 		c.Routing.PrivateDirect = boolPtr(true)
+	}
+	if strings.TrimSpace(c.DNS.Remote) == "" {
+		c.DNS.Remote = defaultDNSRemote
+	}
+	if c.DNS.Timeout <= 0 {
+		c.DNS.Timeout = Duration(defaultDNSTimeout)
 	}
 	applyLogDefaults(&c.Log)
 }
@@ -334,6 +380,9 @@ func (c *Client) validate() error {
 		}
 	}
 	if err := validateUsers("inbound.auth", c.Inbound.Auth, false); err != nil {
+		return err
+	}
+	if err := validateDNS(c.DNS); err != nil {
 		return err
 	}
 
@@ -430,6 +479,41 @@ func validateMetrics(m Metrics) error {
 		return nil
 	}
 	return validateListenAddr("metrics.listen", m.Listen)
+}
+
+// validateBeforeDefaults 在应用缺省值之前检查 dns 段：字段存在但 listen 为空
+// 会让配置静默失效，按严格解析的原则直接报错。
+func (d DNS) validateBeforeDefaults() error {
+	if d.Listen == "" && (d.Remote != "" || len(d.Local) > 0 || d.Timeout != 0) {
+		return errors.New("dns.listen is empty (DNS gateway disabled): remove the dns section or set dns.listen")
+	}
+	return nil
+}
+
+// validateDNS 校验 DNS 网关配置（缺省值已应用）。
+func validateDNS(d DNS) error {
+	if d.Listen == "" {
+		return nil
+	}
+	if err := validateListenAddr("dns.listen", d.Listen); err != nil {
+		return err
+	}
+	if !isLoopbackListen(d.Listen) {
+		return fmt.Errorf("dns.listen: only loopback addresses are allowed (got %q): refusing to run as an open resolver", d.Listen)
+	}
+	if err := validateHostPort("dns.remote", d.Remote); err != nil {
+		return err
+	}
+	for i, addr := range d.Local {
+		what := fmt.Sprintf("dns.local[%d]", i)
+		if err := validateHostPort(what, addr); err != nil {
+			return err
+		}
+		if netutil.SameHostPort(addr, d.Listen) {
+			return fmt.Errorf("%s: %q points to the DNS gateway itself", what, addr)
+		}
+	}
+	return nil
 }
 
 func validateTimeouts(t Timeouts) error {

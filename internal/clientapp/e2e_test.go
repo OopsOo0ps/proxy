@@ -13,7 +13,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -1260,4 +1263,83 @@ func TestE2ELogLevelEndpointAndDynamicFiltering(t *testing.T) {
 	if lv.Level() != slog.LevelDebug {
 		t.Fatalf("level changed by invalid request: %v", lv.Level())
 	}
+}
+
+// TestE2EDNSGatewayRoutesRemoteAndDirect 端到端验证 DNS 网关（路线图 3.1）：
+// 代理名字的查询经出口节点远程解析（远端解析器应答，本地解析器零触达），
+// 直连名字走本地解析器；两条路径的指标分别可见。
+func TestE2EDNSGatewayRoutesRemoteAndDirect(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	// “出口侧”解析器：逻辑上位于出口，经隧道可达（测试中同机 127.0.0.1）。
+	remoteDNS, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("10.10.10.10")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(remoteDNS.Close)
+
+	// 本地解析器：只应服务直连名字；代理名字触达它即为 remote DNS 路径被破坏。
+	localDNS, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("192.168.1.10")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(localDNS.Close)
+
+	h := startServer(t, "node-secret", logger, false)
+
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	if err := os.WriteFile(rulesPath, []byte("rules:\n  - action: direct\n    match: [\"*.lan\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg.Routing = config.Routing{Default: "proxy", RulesFile: rulesPath, PrivateDirect: boolPtr(false)}
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.DNS = config.DNS{
+		Listen:  "127.0.0.1:0",
+		Remote:  remoteDNS.Addr,
+		Local:   []string{localDNS.Addr},
+		Timeout: config.Duration(3 * time.Second),
+	}
+	app := startClient(t, cfg, logger)
+
+	// 代理名字：经出口节点远程解析，答案为远端解析器的记录。
+	resp, err := testutil.QueryUDP(app.DNSAddr(), testutil.BuildAQuery("site.test", 0x0101), 5*time.Second)
+	if err != nil {
+		t.Fatalf("query site.test: %v", err)
+	}
+	if ips := testutil.DNSAnswerIPs(resp); len(ips) != 1 || ips[0].String() != "10.10.10.10" {
+		t.Fatalf("site.test answer = %v, want [10.10.10.10]（应来自远端解析器）", ips)
+	}
+	if remoteDNS.TCPHits() != 1 {
+		t.Fatalf("remote tcp hits = %d, want 1", remoteDNS.TCPHits())
+	}
+	if localDNS.UDPHits()+localDNS.TCPHits() != 0 {
+		t.Fatalf("代理名字触达了本地解析器（udp=%d tcp=%d）：remote DNS 路径被破坏",
+			localDNS.UDPHits(), localDNS.TCPHits())
+	}
+
+	// 直连名字：走本地解析器。
+	resp2, err := testutil.QueryUDP(app.DNSAddr(), testutil.BuildAQuery("printer.lan", 0x0202), 5*time.Second)
+	if err != nil {
+		t.Fatalf("query printer.lan: %v", err)
+	}
+	if ips := testutil.DNSAnswerIPs(resp2); len(ips) != 1 || ips[0].String() != "192.168.1.10" {
+		t.Fatalf("printer.lan answer = %v, want [192.168.1.10]（应来自本地解析器）", ips)
+	}
+	if localDNS.UDPHits() != 1 {
+		t.Fatalf("local udp hits = %d, want 1", localDNS.UDPHits())
+	}
+	if remoteDNS.TCPHits() != 1 {
+		t.Fatalf("remote tcp hits = %d, want 1（直连名字不得再走出口）", remoteDNS.TCPHits())
+	}
+
+	// 指标按路径可见。
+	waitForMetric(t, app.MetricsAddr(), `dns_queries_total{result="ok",route="proxy"} 1`)
+	waitForMetric(t, app.MetricsAddr(), `dns_queries_total{result="ok",route="direct"} 1`)
 }

@@ -277,6 +277,69 @@ routing:
 	}
 }
 
+func TestParseClientDNSGateway(t *testing.T) {
+	cfg, err := ParseClient([]byte(`
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+dns:
+  listen: "127.0.0.1:1053"
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if cfg.DNS.EffectiveRemote() != "1.1.1.1:53" {
+		t.Fatalf("default remote = %q, want 1.1.1.1:53", cfg.DNS.EffectiveRemote())
+	}
+	if cfg.DNS.EffectiveTimeout() != 5*time.Second {
+		t.Fatalf("default timeout = %v, want 5s", cfg.DNS.EffectiveTimeout())
+	}
+
+	cfg, err = ParseClient([]byte(`
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+dns:
+  listen: "127.0.0.1:1053"
+  remote: "223.5.5.5:53"
+  local: ["192.168.1.1:53", "[::1]:53"]
+  timeout: 2s
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if cfg.DNS.Remote != "223.5.5.5:53" || len(cfg.DNS.Local) != 2 || cfg.DNS.EffectiveTimeout() != 2*time.Second {
+		t.Fatalf("unexpected dns config: %+v", cfg.DNS)
+	}
+}
+
+func TestParseClientDNSRejects(t *testing.T) {
+	// 除 dns 段外均为合法配置，确保报错确实来自 dns 校验。
+	prefix := "inbound:\n  http: \"127.0.0.1:8080\"\nnodes:\n  - addr: \"n.example.com:443\"\n    password: t\n"
+	cases := map[string]string{
+		"stray dns field":         prefix + "dns:\n  remote: \"8.8.8.8:53\"\n",
+		"stray dns timeout":       prefix + "dns:\n  timeout: 3s\n",
+		"non-loopback dns listen": prefix + "dns:\n  listen: \"0.0.0.0:53\"\n",
+		"empty-host dns listen":   prefix + "dns:\n  listen: \":53\"\n",
+		"bad dns listen":          prefix + "dns:\n  listen: \"127.0.0.1\"\n",
+		"bad dns remote":          prefix + "dns:\n  listen: \"127.0.0.1:1053\"\n  remote: \"8.8.8.8\"\n",
+		"bad dns local":           prefix + "dns:\n  listen: \"127.0.0.1:1053\"\n  local: [\"8.8.8.8\"]\n",
+		"dns local is self":       prefix + "dns:\n  listen: \"127.0.0.1:1053\"\n  local: [\"127.0.0.1:1053\"]\n",
+		"dns unknown field":       prefix + "dns:\n  listen: \"127.0.0.1:1053\"\n  fake_ip: true\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseClient([]byte(yaml)); err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+		})
+	}
+}
+
 func TestParseServerValid(t *testing.T) {
 	cfg, err := ParseServer([]byte(`
 listen: "0.0.0.0:8443"
