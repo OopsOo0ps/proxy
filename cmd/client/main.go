@@ -41,14 +41,14 @@ func main() {
 	}
 
 	info := version.Get()
-	logger := logging.New(cfg.Log.Level, cfg.Log.Format)
+	logger, logLevelVar := logging.New(cfg.Log.Level, cfg.Log.Format)
 	logger.Info("starting proxy-client",
 		"version", info.Version,
 		"commit", info.Commit,
 		"platform", info.Platform,
 	)
 
-	app, err := clientapp.New(cfg, logger)
+	app, err := clientapp.New(cfg, logger, logLevelVar)
 	if err != nil {
 		fatal(err)
 	}

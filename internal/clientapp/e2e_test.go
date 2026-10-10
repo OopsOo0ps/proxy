@@ -76,7 +76,7 @@ func startServerWith(t *testing.T, password string, logger *slog.Logger, withMet
 	if mutate != nil {
 		mutate(cfg)
 	}
-	app, err := serverapp.New(cfg, logger)
+	app, err := serverapp.New(cfg, logger, nil)
 	if err != nil {
 		t.Fatalf("serverapp.New: %v", err)
 	}
@@ -108,7 +108,7 @@ func startServerWith(t *testing.T, password string, logger *slog.Logger, withMet
 // startClient 启动一个测试用 proxy-client。
 func startClient(t *testing.T, cfg *config.Client, logger *slog.Logger) *clientapp.App {
 	t.Helper()
-	app, err := clientapp.New(cfg, logger)
+	app, err := clientapp.New(cfg, logger, nil)
 	if err != nil {
 		t.Fatalf("clientapp.New: %v", err)
 	}
@@ -865,7 +865,7 @@ func TestE2EShutdownDrainsInflightRequest(t *testing.T) {
 	h := startServer(t, "node-secret", nil, false)
 
 	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	app, err := clientapp.New(cfg, nil)
+	app, err := clientapp.New(cfg, nil, nil)
 	if err != nil {
 		t.Fatalf("clientapp.New: %v", err)
 	}
@@ -1162,4 +1162,102 @@ func TestE2ETunnelOverloadRejectsAndRecovers(t *testing.T) {
 		t.Fatalf("tunnel did not recover after release: %v", err)
 	}
 	_ = conn3.Close()
+}
+
+func TestE2ELogLevelEndpointAndDynamicFiltering(t *testing.T) {
+	h := startServer(t, "node-secret", nil, false)
+	// 使用真实的 LevelVar + 可观察 logger 组装客户端，覆盖“运行时切换”全链路。
+	var logs lockedBuffer
+	lv := new(slog.LevelVar)
+	lv.Set(slog.LevelInfo)
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: lv}))
+
+	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	app, err := clientapp.New(cfg, logger, lv)
+	if err != nil {
+		t.Fatalf("clientapp.New: %v", err)
+	}
+	if err := app.Listen(); err != nil {
+		t.Fatalf("clientapp.Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErrCh := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		serveErrCh <- app.Serve(ctx)
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("client Serve did not stop")
+			return
+		}
+		if err := <-serveErrCh; err != nil {
+			t.Errorf("client Serve: %v", err)
+		}
+	})
+
+	// 触发一条 debug 级日志：SOCKS5 非法协议版本（info 级别下应被抑制）。
+	triggerDebugLog := func() {
+		t.Helper()
+		conn, err := net.Dial("tcp", app.SOCKS5Addr())
+		if err != nil {
+			t.Fatalf("dial socks5: %v", err)
+		}
+		_, _ = conn.Write([]byte{0x04, 0x01, 0x00}) // 非法版本，握手失败走 debug 日志
+		_ = conn.Close()
+	}
+
+	triggerDebugLog()
+	time.Sleep(150 * time.Millisecond)
+	if strings.Contains(logs.String(), "socks5 handshake failed") {
+		t.Fatal("debug log must be suppressed at info level")
+	}
+
+	// GET /log/level 返回当前级别。
+	var levelResp struct {
+		Level string `json:"level"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/log/level", &levelResp); code != http.StatusOK || levelResp.Level != "info" {
+		t.Fatalf("GET /log/level = %d %+v, want info", code, levelResp)
+	}
+
+	// PUT 切到 debug：切换成功且随后 debug 日志可见。
+	req, err := http.NewRequest(http.MethodPut, "http://"+app.MetricsAddr()+"/log/level?level=debug", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT /log/level: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"level":"debug"`) {
+		t.Fatalf("PUT /log/level = %d %q", resp.StatusCode, body)
+	}
+	waitForLog(t, &logs, "log level changed")
+	triggerDebugLog()
+	waitForLog(t, &logs, "socks5 handshake failed")
+
+	// 非法级别返回 400，级别保持不变。
+	req, err = http.NewRequest(http.MethodPut, "http://"+app.MetricsAddr()+"/log/level?level=verbose", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("invalid level = %d, want 400", resp.StatusCode)
+	}
+	if lv.Level() != slog.LevelDebug {
+		t.Fatalf("level changed by invalid request: %v", lv.Level())
+	}
 }

@@ -23,24 +23,27 @@ const (
 // requestIDKey 是 context 中请求 ID 的键类型（不导出，避免键冲突）。
 type requestIDKey struct{}
 
-// New 按级别与格式创建输出到标准错误的 slog.Logger。
+// New 按级别与格式创建输出到标准错误的 slog.Logger，并返回可动态调整的级别控制器。
 //
 // 合法级别：debug、info、warn、error，未知取值回退为 info；
 // 合法格式：json、text，未知取值回退为 json（结构化日志优先）。
-func New(level, format string) *slog.Logger {
+// 级别控制器可在运行时调整（见 LevelHandler），实现“日志级别动态调整”。
+func New(level, format string) (*slog.Logger, *slog.LevelVar) {
 	return newWithWriter(os.Stderr, level, format)
 }
 
 // newWithWriter 与 New 行为一致，但允许指定输出目标（便于测试）。
-func newWithWriter(w io.Writer, level, format string) *slog.Logger {
-	opts := &slog.HandlerOptions{Level: parseLevel(level)}
+func newWithWriter(w io.Writer, level, format string) (*slog.Logger, *slog.LevelVar) {
+	lv := new(slog.LevelVar)
+	lv.Set(parseLevel(level))
+	opts := &slog.HandlerOptions{Level: lv}
 	var handler slog.Handler
 	if strings.EqualFold(strings.TrimSpace(format), FormatText) {
 		handler = slog.NewTextHandler(w, opts)
 	} else {
 		handler = slog.NewJSONHandler(w, opts)
 	}
-	return slog.New(handler)
+	return slog.New(handler), lv
 }
 
 func parseLevel(level string) slog.Level {
