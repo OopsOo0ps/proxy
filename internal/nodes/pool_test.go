@@ -595,6 +595,63 @@ func TestHealthCheckDisabledWithoutInterval(t *testing.T) {
 	nilPool.Close() // 应安全
 }
 
+// TestCloseWaitsForInFlightProbe 钉住 Close 的排空语义：Close 返回前会等待
+// 在途探测退出，且取消后的探测结果不再落账。热加载替换运行时依赖这一保证
+// （新配置生效后，旧循环不会再有迟到的结果改变健康状态或计数）。
+func TestCloseWaitsForInFlightProbe(t *testing.T) {
+	probeStarted := make(chan struct{})
+	releaseProbe := make(chan struct{})
+	var once sync.Once
+	pool, err := New(testNodes()[:1], newRecorder().dial, Options{
+		Health: HealthOptions{Interval: time.Hour, Timeout: time.Minute, Failures: 1, Successes: 1},
+		Probe: func(context.Context, config.Node) error {
+			once.Do(func() { close(probeStarted) })
+			<-releaseProbe
+			return errors.New("probe failed")
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pool.StartHealthChecks(ctx)
+	select {
+	case <-probeStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("probe did not start")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		pool.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while a probe was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseProbe)
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close did not return after the in-flight probe finished")
+	}
+
+	// Close 返回后不得再落账：被取消的探测结果按非故障丢弃，状态保持初始。
+	before := pool.Snapshot()
+	if len(before) != 1 || before[0].ProbeFails != 0 || before[0].Removed {
+		t.Fatalf("probe result leaked past Close: %+v", before)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if after := pool.Snapshot(); after[0] != before[0] {
+		t.Fatalf("health state changed after Close: %+v -> %+v", before[0], after[0])
+	}
+}
+
 func TestNewRequiresProbeWhenHealthCheckEnabled(t *testing.T) {
 	_, err := New(testNodes(), newRecorder().dial, Options{Health: HealthOptions{Interval: time.Second}})
 	if err == nil {
