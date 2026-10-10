@@ -32,6 +32,21 @@ type TargetDialer interface {
 	DialTarget(ctx context.Context, host string, port uint16) (net.Conn, dialer.Route, error)
 }
 
+// LivePolicy 提供配置热加载后的动态策略。
+// 为 nil 时使用 Server 的静态字段（测试与直接构造场景）。
+type LivePolicy interface {
+	// Auth 返回当前凭据存储；nil 表示不要求认证。
+	Auth() *auth.Store
+	// Dialer 返回当前目标拨号器。
+	Dialer() TargetDialer
+	// HandshakeTimeout 返回握手超时。
+	HandshakeTimeout() time.Duration
+	// IdleTimeout 返回连接空闲回收超时。
+	IdleTimeout() time.Duration
+	// ShutdownTimeout 返回关停排空期限。
+	ShutdownTimeout() time.Duration
+}
+
 // WriteOverloadReply 对因连接上限被拒绝的 SOCKS5 连接回“无可用认证方式”
 // （0x05 0xFF）后关闭：RFC 1928 在认证前没有专门的过载回复码，
 // 这是客户端可感知且协议合法的明确失败。写操作带 2s 期限。
@@ -47,6 +62,8 @@ type Server struct {
 	Auth *auth.Store
 	// Dialer 建立到目标的连接。
 	Dialer TargetDialer
+	// Live 提供热加载后的动态策略；非 nil 时优先于上方静态字段。
+	Live LivePolicy
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
 	// Metrics 指标；可为 nil。
@@ -157,7 +174,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		return
 	}
 
-	conn, r, err := s.Dialer.DialTarget(ctx, host, port)
+	conn, r, err := s.dialerNow().DialTarget(ctx, host, port)
 	route = r.Action.String()
 	if err != nil {
 		result = metrics.ResultDialFail
@@ -210,7 +227,7 @@ func (s *Server) negotiate(br *bufio.Reader, w io.Writer) error {
 	}
 
 	want := byte(MethodNoAuth)
-	if s.Auth != nil {
+	if s.authNow() != nil {
 		want = MethodUserPass
 	}
 	for _, m := range methods {
@@ -251,7 +268,7 @@ func (s *Server) authenticate(br *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("socks5: read password: %w", err)
 	}
 
-	ok := s.Auth.Verify(string(username), string(password))
+	ok := s.authNow().Verify(string(username), string(password))
 	status := byte(UserPassStatusOK)
 	if !ok {
 		status = UserPassStatusFail
@@ -294,7 +311,26 @@ func (s *Server) logger() *slog.Logger {
 	return s.Logger
 }
 
+// authNow 返回当前生效的凭据存储：Live 存在时以热加载快照为准。
+func (s *Server) authNow() *auth.Store {
+	if s.Live != nil {
+		return s.Live.Auth()
+	}
+	return s.Auth
+}
+
+// dialerNow 返回当前生效的目标拨号器：Live 存在时以热加载快照为准。
+func (s *Server) dialerNow() TargetDialer {
+	if s.Live != nil {
+		return s.Live.Dialer()
+	}
+	return s.Dialer
+}
+
 func (s *Server) handshakeTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.HandshakeTimeout()
+	}
 	if s.HandshakeTimeout <= 0 {
 		return 10 * time.Second
 	}
@@ -302,6 +338,9 @@ func (s *Server) handshakeTimeout() time.Duration {
 }
 
 func (s *Server) idleTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.IdleTimeout()
+	}
 	if s.IdleTimeout <= 0 {
 		return 90 * time.Second
 	}
@@ -309,6 +348,9 @@ func (s *Server) idleTimeout() time.Duration {
 }
 
 func (s *Server) shutdownTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.ShutdownTimeout()
+	}
 	if s.ShutdownTimeout <= 0 {
 		return shutdown.DefaultTimeout
 	}

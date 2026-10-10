@@ -11,7 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
@@ -27,101 +29,113 @@ import (
 
 // App 是组装完成的 proxy-server 实例。
 // 生命周期：New → Listen（绑定端口）→ Serve（阻塞服务直到 ctx 取消）。
+// 配置热加载见 Reload：先完整构建新运行时，全部成功后再原子切换；
+// 任何失败都保持旧配置原样服务。
 type App struct {
-	cfg      *config.Server
-	logger   *slog.Logger
-	logLevel *slog.LevelVar
-	metrics  *metrics.Metrics
-	tunnel   *trojan.Server
-	tlsCfg   *tls.Config
-	status   *status.Status
-	limiter  *connlimit.Limiter
+	logger  *slog.Logger
+	logCtrl *logging.Control
+	metrics *metrics.Metrics
+	tunnel  *trojan.Server
+	tlsCfg  *tls.Config
+	status  *status.Status
+	limiter *connlimit.Limiter
 
-	certNotAfter time.Time
-	tunnelLn     net.Listener
-	metricsSrv   *http.Server
-	metricsLn    net.Listener
+	// policy 是运行期配置快照：各组件按连接读取，Reload 原子替换。
+	policy livePolicy
+
+	tunnelLn   net.Listener
+	metricsSrv *http.Server
+	metricsLn  net.Listener
+
+	reloadMu sync.Mutex
+	closing  atomic.Bool
 
 	rejectMu    sync.Mutex
 	rejectLogAt time.Time
 }
 
+// serverRuntime 是一次配置构建出的完整运行时（证书、凭据、伪装页与超时）。
+type serverRuntime struct {
+	cfg          *config.Server
+	cert         *tls.Certificate
+	certNotAfter time.Time
+	verifier     *auth.Store
+	decoy        []byte
+}
+
+// livePolicy 持有当前生效的运行时快照。
+type livePolicy struct {
+	snap atomic.Pointer[serverRuntime]
+}
+
+func (p *livePolicy) load() *serverRuntime { return p.snap.Load() }
+
+// trojanLive 把运行时快照适配为 trojan.Server 的动态策略接口。
+type trojanLive struct{ app *App }
+
+func (l trojanLive) Verifier() trojan.Verifier { return l.app.policy.load().verifier }
+func (l trojanLive) Decoy() []byte             { return l.app.policy.load().decoy }
+func (l trojanLive) HandshakeTimeout() time.Duration {
+	return l.app.policy.load().cfg.Timeouts.Handshake.Std()
+}
+func (l trojanLive) DialTimeout() time.Duration {
+	return l.app.policy.load().cfg.Timeouts.Dial.Std()
+}
+func (l trojanLive) IdleTimeout() time.Duration {
+	return l.app.policy.load().cfg.Timeouts.Idle.Std()
+}
+func (l trojanLive) ShutdownTimeout() time.Duration {
+	return l.app.policy.load().cfg.Timeouts.Shutdown.Std()
+}
+
 // New 加载证书与凭据并组装应用（不绑定端口）。
-// logLevel 是动态日志级别控制器（可为 nil，此时 /log/level 端点不可用）。
-func New(cfg *config.Server, logger *slog.Logger, logLevel *slog.LevelVar) (*App, error) {
+// logCtrl 是运行时可调整的日志控制器（可为 nil，此时 /log/level 端点不可用）。
+func New(cfg *config.Server, logger *slog.Logger, logCtrl *logging.Control) (*App, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
 
-	cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("serverapp: load tls key pair: %w", err)
+	app := &App{
+		logger:  logger,
+		logCtrl: logCtrl,
+		metrics: metrics.New(),
 	}
-	leaf, err := x509.ParseCertificate(cert.Certificate[0])
-	if err != nil {
-		return nil, fmt.Errorf("serverapp: parse tls certificate: %w", err)
-	}
-
-	users := make([]auth.User, 0, len(cfg.Users))
-	for _, u := range cfg.Users {
-		users = append(users, auth.User{Username: u.Username, Password: u.Password})
-	}
-	store, err := auth.NewStore(users)
+	app.limiter = connlimit.New(cfg.Limits.EffectiveMaxConnections())
+	rt, err := app.buildRuntime(cfg)
 	if err != nil {
 		return nil, err
 	}
-
-	decoy := trojan.DefaultDecoyPage
-	if cfg.DecoyFile != "" {
-		data, err := os.ReadFile(cfg.DecoyFile)
-		if err != nil {
-			return nil, fmt.Errorf("serverapp: read decoy file: %w", err)
-		}
-		if len(data) == 0 {
-			return nil, errors.New("serverapp: decoy file is empty")
-		}
-		decoy = data
-	}
-
-	netDialer := &net.Dialer{Timeout: cfg.Timeouts.Dial.Std()}
-	app := &App{
-		cfg:          cfg,
-		logger:       logger,
-		logLevel:     logLevel,
-		metrics:      metrics.New(),
-		certNotAfter: leaf.NotAfter,
-		tlsCfg: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
+	app.policy.snap.Store(rt)
+	app.tlsCfg = &tls.Config{
+		// GetCertificate 每次握手读取当前快照，证书文件热重载即刻生效。
+		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return app.policy.load().cert, nil
 		},
+		MinVersion: tls.VersionTLS12,
 	}
-	app.limiter = connlimit.New(cfg.Limits.EffectiveMaxConnections())
 	app.status = status.New(status.Options{
 		Version: version.Get().Version,
 		Checks:  app.healthChecks(),
 		Runtime: app.runtimeStats,
 	})
 	app.tunnel = &trojan.Server{
-		Verifier: store,
+		Live: trojanLive{app: app},
 		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
-			return netDialer.DialContext(ctx, "tcp", addr)
+			dialer := &net.Dialer{Timeout: app.policy.load().cfg.Timeouts.Dial.Std()}
+			return dialer.DialContext(ctx, "tcp", addr)
 		},
-		Decoy:            decoy,
-		HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
-		DialTimeout:      cfg.Timeouts.Dial.Std(),
-		IdleTimeout:      cfg.Timeouts.Idle.Std(),
-		ShutdownTimeout:  cfg.Timeouts.Shutdown.Std(),
-		Logger:           logger,
-		Metrics:          app.metrics,
+		Logger:  logger,
+		Metrics: app.metrics,
 	}
 	return app, nil
 }
 
 // Listen 绑定隧道与指标端口。
 func (a *App) Listen() error {
-	ln, err := net.Listen("tcp", a.cfg.Listen)
+	cfg := a.policy.load().cfg
+	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
-		return fmt.Errorf("serverapp: listen %s: %w", a.cfg.Listen, err)
+		return fmt.Errorf("serverapp: listen %s: %w", cfg.Listen, err)
 	}
 	ln = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
 		a.metrics.ConnRejected(metrics.ProtoTunnel)
@@ -130,7 +144,7 @@ func (a *App) Listen() error {
 	})
 	a.tunnelLn = tls.NewListener(ln, a.tlsCfg)
 
-	if addr := a.cfg.Metrics.Listen; addr != "" {
+	if addr := cfg.Metrics.Listen; addr != "" {
 		metricsLn, err := net.Listen("tcp", addr)
 		if err != nil {
 			return fmt.Errorf("serverapp: listen metrics %s: %w", addr, err)
@@ -148,6 +162,7 @@ func (a *App) Listen() error {
 func (a *App) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	defer a.closing.Store(true)
 
 	errCh := make(chan error, 2)
 	running := 1
@@ -207,18 +222,98 @@ func (a *App) metricsHandler() http.Handler {
 	mux.Handle("/metrics", a.metrics.Handler())
 	mux.Handle("/health", a.status.Health())
 	mux.Handle("/stats", a.status.Stats())
-	mux.Handle("/log/level", logging.LevelHandler(a.logger, a.logLevel))
+	mux.Handle("/log/level", logging.LevelHandler(a.logger, a.logCtrl.LevelVar()))
 	return mux
 }
 
 // healthChecks 返回依赖健康检查：TLS 证书在运行中过期时依赖不可用。
 func (a *App) healthChecks() []func() error {
 	return []func() error{func() error {
-		if time.Now().Before(a.certNotAfter) {
+		if time.Now().Before(a.policy.load().certNotAfter) {
 			return nil
 		}
 		return errors.New("tls certificate expired")
 	}}
+}
+
+// Reload 应用一份新配置：先完整构建新运行时（证书重载、凭据重建、
+// 伪装页重读），全部成功后再原子切换；任何失败都返回错误并保持旧配置
+// 原样服务。监听地址属于启动时绑定的资源，变更需要重启，会被明确拒绝。
+//
+// 生效边界为“新连接”：已在转发的隧道继续使用旧快照；新握手立即使用
+// 新凭据与新证书。
+func (a *App) Reload(next *config.Server) (err error) {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+	if a.closing.Load() {
+		return errors.New("serverapp: shutting down; reload ignored")
+	}
+
+	cur := a.policy.load()
+	result := metrics.ReloadError
+	defer func() { a.metrics.ConfigReload(result) }()
+
+	if changed := config.ServerRestartOnlyChanges(cur.cfg, next); len(changed) > 0 {
+		return fmt.Errorf("serverapp: %s changed: restart required (listen addresses cannot be rebound by hot reload)",
+			strings.Join(changed, ", "))
+	}
+	rt, err := a.buildRuntime(next)
+	if err != nil {
+		return fmt.Errorf("serverapp: build new configuration: %w", err)
+	}
+	a.policy.snap.Store(rt)
+	a.limiter.SetMax(next.Limits.EffectiveMaxConnections())
+	if a.logCtrl != nil {
+		a.logCtrl.SetLevel(next.Log.Level)
+		a.logCtrl.SetFormat(next.Log.Format)
+	}
+	result = metrics.ReloadSuccess
+	a.logger.Info("configuration reloaded",
+		"users", len(next.Users),
+		"max_connections", next.Limits.EffectiveMaxConnections(),
+		"tls_cert_not_after", rt.certNotAfter.UTC().Format(time.RFC3339),
+	)
+	return nil
+}
+
+// buildRuntime 依据配置构建完整运行时；任何失败都不产生外部副作用。
+func (a *App) buildRuntime(cfg *config.Server) (*serverRuntime, error) {
+	cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("serverapp: load tls key pair: %w", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("serverapp: parse tls certificate: %w", err)
+	}
+
+	users := make([]auth.User, 0, len(cfg.Users))
+	for _, u := range cfg.Users {
+		users = append(users, auth.User{Username: u.Username, Password: u.Password})
+	}
+	store, err := auth.NewStore(users)
+	if err != nil {
+		return nil, err
+	}
+
+	decoy := trojan.DefaultDecoyPage
+	if cfg.DecoyFile != "" {
+		data, err := os.ReadFile(cfg.DecoyFile)
+		if err != nil {
+			return nil, fmt.Errorf("serverapp: read decoy file: %w", err)
+		}
+		if len(data) == 0 {
+			return nil, errors.New("serverapp: decoy file is empty")
+		}
+		decoy = data
+	}
+	return &serverRuntime{
+		cfg:          cfg,
+		cert:         &cert,
+		certNotAfter: leaf.NotAfter,
+		verifier:     store,
+		decoy:        decoy,
+	}, nil
 }
 
 // runtimeStats 组装 /stats 快照：隧道活跃连接数。

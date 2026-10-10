@@ -33,6 +33,23 @@ type Verifier interface {
 	VerifyTunnel(hashHex string) (string, bool)
 }
 
+// LivePolicy 提供配置热加载后的动态策略。
+// 为 nil 时使用 Server 的静态字段（测试与直接构造场景）。
+type LivePolicy interface {
+	// Verifier 返回当前口令校验器。
+	Verifier() Verifier
+	// Decoy 返回当前伪装页面；为空时使用 DefaultDecoyPage。
+	Decoy() []byte
+	// HandshakeTimeout 返回握手超时。
+	HandshakeTimeout() time.Duration
+	// DialTimeout 返回目标连接超时。
+	DialTimeout() time.Duration
+	// IdleTimeout 返回连接空闲回收超时。
+	IdleTimeout() time.Duration
+	// ShutdownTimeout 返回关停排空期限。
+	ShutdownTimeout() time.Duration
+}
+
 // DialFunc 建立到目标地址的直连（服务端即出口）。
 type DialFunc func(ctx context.Context, addr string) (net.Conn, error)
 
@@ -44,6 +61,8 @@ type Server struct {
 	Dial DialFunc
 	// Decoy 伪装页面；为空时使用 DefaultDecoyPage。
 	Decoy []byte
+	// Live 提供热加载后的动态策略；非 nil 时优先于上方静态字段。
+	Live LivePolicy
 	// HandshakeTimeout 握手超时，默认 10s。
 	HandshakeTimeout time.Duration
 	// DialTimeout 目标连接超时，默认 10s。
@@ -149,7 +168,7 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	stopForce := context.AfterFunc(relayCtx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopForce()
 
-	user, ok := s.Verifier.VerifyTunnel(req.PasswordHash)
+	user, ok := s.verifierNow().VerifyTunnel(req.PasswordHash)
 	if !ok {
 		logger.Warn("tunnel authentication failed")
 		result = metrics.ResultAuthFail
@@ -199,7 +218,7 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 func (s *Server) serveDecoy(conn net.Conn) {
 	// 握手阶段可能已经触发超时，写入前先重置整体期限，保证响应完整送出。
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	page := s.Decoy
+	page := s.decoyNow()
 	if len(page) == 0 {
 		page = DefaultDecoyPage
 	}
@@ -224,7 +243,26 @@ func (s *Server) logger() *slog.Logger {
 	return s.Logger
 }
 
+// verifierNow 返回当前生效的口令校验器：Live 存在时以热加载快照为准。
+func (s *Server) verifierNow() Verifier {
+	if s.Live != nil {
+		return s.Live.Verifier()
+	}
+	return s.Verifier
+}
+
+// decoyNow 返回当前生效的伪装页面：Live 存在时以热加载快照为准。
+func (s *Server) decoyNow() []byte {
+	if s.Live != nil {
+		return s.Live.Decoy()
+	}
+	return s.Decoy
+}
+
 func (s *Server) handshakeTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.HandshakeTimeout()
+	}
 	if s.HandshakeTimeout <= 0 {
 		return 10 * time.Second
 	}
@@ -232,6 +270,9 @@ func (s *Server) handshakeTimeout() time.Duration {
 }
 
 func (s *Server) dialTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.DialTimeout()
+	}
 	if s.DialTimeout <= 0 {
 		return 10 * time.Second
 	}
@@ -239,6 +280,9 @@ func (s *Server) dialTimeout() time.Duration {
 }
 
 func (s *Server) idleTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.IdleTimeout()
+	}
 	if s.IdleTimeout <= 0 {
 		return 90 * time.Second
 	}
@@ -246,6 +290,9 @@ func (s *Server) idleTimeout() time.Duration {
 }
 
 func (s *Server) shutdownTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.ShutdownTimeout()
+	}
 	if s.ShutdownTimeout <= 0 {
 		return shutdown.DefaultTimeout
 	}

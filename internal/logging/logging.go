@@ -36,14 +36,16 @@ func New(level, format string) (*slog.Logger, *slog.LevelVar) {
 func newWithWriter(w io.Writer, level, format string) (*slog.Logger, *slog.LevelVar) {
 	lv := new(slog.LevelVar)
 	lv.Set(parseLevel(level))
+	return slog.New(newHandler(w, lv, format)), lv
+}
+
+// newHandler 依据格式返回底层 handler（未知格式回退 JSON，结构化日志优先）。
+func newHandler(w io.Writer, lv *slog.LevelVar, format string) slog.Handler {
 	opts := &slog.HandlerOptions{Level: lv}
-	var handler slog.Handler
 	if strings.EqualFold(strings.TrimSpace(format), FormatText) {
-		handler = slog.NewTextHandler(w, opts)
-	} else {
-		handler = slog.NewJSONHandler(w, opts)
+		return slog.NewTextHandler(w, opts)
 	}
-	return slog.New(handler), lv
+	return slog.NewJSONHandler(w, opts)
 }
 
 func parseLevel(level string) slog.Level {

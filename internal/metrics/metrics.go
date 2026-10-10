@@ -10,6 +10,7 @@
 //   - connections_rejected_total（counter，标签 proto）：超过连接上限被拒绝的连接
 //   - dns_queries_total（counter，标签 route/result）与 dns_query_duration_seconds
 //     （histogram，标签 route）：DNS 网关查询（路线图 3.1）
+//   - config_reloads_total（counter，标签 result）：配置热加载次数（路线图 3.2）
 package metrics
 
 import (
@@ -51,6 +52,12 @@ const (
 	PoolClaimStale = "stale"
 )
 
+// 配置热加载结果标签值。
+const (
+	ReloadSuccess = "success"
+	ReloadError   = "error"
+)
+
 // Metrics 聚合全部指标。请使用 New 构造；方法对 nil 接收者安全（no-op），
 // 便于在不需要指标的测试中省略构造。
 type Metrics struct {
@@ -64,6 +71,7 @@ type Metrics struct {
 	rejected      *prometheus.CounterVec
 	dnsQueries    *prometheus.CounterVec
 	dnsDuration   *prometheus.HistogramVec
+	configReloads *prometheus.CounterVec
 }
 
 // New 创建独立的指标集合（使用私有 registry，不污染全局默认值）。
@@ -108,8 +116,12 @@ func New() *Metrics {
 			Help:    "DNS gateway query duration in seconds.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route"}),
+		configReloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "config_reloads_total",
+			Help: "Total number of configuration reload attempts by result (success/error).",
+		}, []string{"result"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.rejected, m.dnsQueries, m.dnsDuration)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads)
 	m.preInitialize()
 	return m
 }
@@ -134,6 +146,9 @@ func (m *Metrics) preInitialize() {
 	}
 	for _, route := range []string{RouteDirect, RouteProxy} {
 		m.dnsDuration.WithLabelValues(route)
+	}
+	for _, result := range []string{ReloadSuccess, ReloadError} {
+		m.configReloads.WithLabelValues(result)
 	}
 }
 
@@ -238,4 +253,12 @@ func (m *Metrics) ObserveDNS(route, result string, d time.Duration) {
 	if route == RouteDirect || route == RouteProxy {
 		m.dnsDuration.WithLabelValues(route).Observe(d.Seconds())
 	}
+}
+
+// ConfigReload 记录一次配置热加载尝试（result 取值 success / error）。
+func (m *Metrics) ConfigReload(result string) {
+	if m == nil {
+		return
+	}
+	m.configReloads.WithLabelValues(result).Inc()
 }

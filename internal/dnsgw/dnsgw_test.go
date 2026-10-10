@@ -364,7 +364,7 @@ func TestLocalResolversFromResolvConf(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := localResolversFromResolvConf(path, "127.0.0.1:53")
+	got, err := LocalResolversFromResolvConf(path, "127.0.0.1:53")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestLocalResolversFromResolvConf(t *testing.T) {
 	}
 
 	// 端口不同则不算自环：网关监听 127.0.0.1:1053 时，127.0.0.1:53 仍可用。
-	got, err = localResolversFromResolvConf(path, "127.0.0.1:1053")
+	got, err = LocalResolversFromResolvConf(path, "127.0.0.1:1053")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestLocalResolversFromResolvConf(t *testing.T) {
 		t.Fatalf("resolvers = %v, want 含 127.0.0.1:53", got)
 	}
 
-	if _, err := localResolversFromResolvConf(filepath.Join(dir, "missing.conf"), ""); err == nil {
+	if _, err := LocalResolversFromResolvConf(filepath.Join(dir, "missing.conf"), ""); err == nil {
 		t.Fatal("不存在的文件应返回错误")
 	}
 }

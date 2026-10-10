@@ -2,7 +2,9 @@
 //
 // 设计要点：
 //   - Limiter 是计数信号量：TryAcquire 成功即占用一个名额，连接 Close 时释放；
-//   - 上限 <= 0 表示不限制（New 返回 nil；所有方法对 nil 接收者安全）；
+//   - 上限 <= 0 表示不限制；上限可在运行期通过 SetMax 调整（配置热加载），
+//     调整不会中断已有连接，只约束之后新的占用；
+//   - 所有方法对 nil 接收者安全（便于测试中省略构造）；
 //   - 超限后的协议层应答由调用方决定（HTTP 503 / SOCKS5 失败回复 / 隧道直接关闭），
 //     WrapListener 负责在 Accept 阶段执行拒绝动作，并在拒绝后继续接受后续连接。
 package connlimit
@@ -15,18 +17,16 @@ import (
 
 // Limiter 是并发连接计数上限；nil 表示不限制。
 type Limiter struct {
+	mu       sync.Mutex
 	max      int
-	sem      chan struct{}
-	active   atomic.Int64
+	active   int
 	rejected atomic.Uint64
 }
 
-// New 创建上限为 max 的连接限制器；max <= 0 时返回 nil（不限制）。
+// New 创建上限为 max 的连接限制器；max <= 0 表示不限制。
+// 返回的实例总是可用的，便于后续通过 SetMax 动态调整上限。
 func New(max int) *Limiter {
-	if max <= 0 {
-		return nil
-	}
-	return &Limiter{max: max, sem: make(chan struct{}, max)}
+	return &Limiter{max: max}
 }
 
 // TryAcquire 尝试占用一个连接名额；超限时返回 false 并累计拒绝计数。
@@ -34,14 +34,14 @@ func (l *Limiter) TryAcquire() bool {
 	if l == nil {
 		return true
 	}
-	select {
-	case l.sem <- struct{}{}:
-		l.active.Add(1)
-		return true
-	default:
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.max > 0 && l.active >= l.max {
 		l.rejected.Add(1)
 		return false
 	}
+	l.active++
+	return true
 }
 
 // Release 归还一个连接名额。
@@ -49,11 +49,23 @@ func (l *Limiter) Release() {
 	if l == nil {
 		return
 	}
-	select {
-	case <-l.sem:
-		l.active.Add(-1)
-	default:
+	l.mu.Lock()
+	if l.active > 0 {
+		l.active--
 	}
+	l.mu.Unlock()
+}
+
+// SetMax 调整运行期连接上限（0 或负值表示不限制）。
+// 调低上限不中断已有连接，只约束新的占用：活跃连接数回落到新上限
+// 以下之前，新连接会被拒绝；调高或解除上限立即生效。
+func (l *Limiter) SetMax(max int) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	l.max = max
+	l.mu.Unlock()
 }
 
 // Max 返回配置上限；0 表示不限制。
@@ -61,6 +73,8 @@ func (l *Limiter) Max() int {
 	if l == nil {
 		return 0
 	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.max
 }
 
@@ -69,7 +83,9 @@ func (l *Limiter) Active() int {
 	if l == nil {
 		return 0
 	}
-	return int(l.active.Load())
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.active
 }
 
 // Rejected 返回累计拒绝数。

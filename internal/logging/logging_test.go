@@ -59,6 +59,87 @@ func TestNewTextFormatEmitsPlainText(t *testing.T) {
 	}
 }
 
+func TestControlSwapsLevelAndFormat(t *testing.T) {
+	var buf bytes.Buffer
+	logger, ctrl := NewControlWithWriter(&buf, "info", FormatJSON)
+
+	logger.Info("first", "key", "value")
+	if !strings.HasPrefix(strings.TrimSpace(buf.String()), "{") {
+		t.Fatalf("initial format should be JSON: %q", buf.String())
+	}
+
+	// 切换格式：同一 logger 的后续输出立即使用新格式。
+	buf.Reset()
+	ctrl.SetFormat(FormatText)
+	logger.Info("second", "key", "value")
+	out := buf.String()
+	if strings.HasPrefix(strings.TrimSpace(out), "{") || !strings.Contains(out, "key=value") {
+		t.Fatalf("format swap did not take effect: %q", out)
+	}
+
+	// 切换级别：低于级别的日志被抑制，提高级别后恢复可见。
+	buf.Reset()
+	ctrl.SetLevel("error")
+	if logger.Enabled(context.Background(), slog.LevelInfo) {
+		t.Fatal("info should be disabled after switching to error")
+	}
+	logger.Info("suppressed")
+	logger.Error("visible")
+	if strings.Contains(buf.String(), "suppressed") || !strings.Contains(buf.String(), "visible") {
+		t.Fatalf("level swap did not take effect: %q", buf.String())
+	}
+
+	// 非法值回退：级别回退 info、格式回退 json。
+	buf.Reset()
+	ctrl.SetLevel("nonsense")
+	ctrl.SetFormat("nonsense")
+	logger.Info("fallback", "key", "value")
+	if !strings.HasPrefix(strings.TrimSpace(buf.String()), "{") {
+		t.Fatalf("unknown format should fall back to JSON: %q", buf.String())
+	}
+	if ctrl.LevelVar().Level() != slog.LevelInfo {
+		t.Fatalf("unknown level should fall back to info, got %v", ctrl.LevelVar().Level())
+	}
+}
+
+func TestControlSwapKeepsDerivedLoggerAttrsAndGroups(t *testing.T) {
+	var buf bytes.Buffer
+	logger, ctrl := NewControlWithWriter(&buf, "info", FormatJSON)
+	child := logger.With("component", "relay").WithGroup("outer")
+
+	child.Info("before", "k", "v")
+	ctrl.SetFormat(FormatJSON) // 触发一次底层 handler 替换
+	child.Info("after", "k", "v")
+
+	dec := json.NewDecoder(&buf)
+	for _, want := range []string{"before", "after"} {
+		var record map[string]any
+		if err := dec.Decode(&record); err != nil {
+			t.Fatalf("decode %s record: %v", want, err)
+		}
+		if record["component"] != "relay" {
+			t.Fatalf("%s record lost bound attrs: %v", want, record)
+		}
+		outer, ok := record["outer"].(map[string]any)
+		if !ok || outer["k"] != "v" {
+			t.Fatalf("%s record lost bound group: %v", want, record)
+		}
+	}
+}
+
+func TestControlNilSafety(t *testing.T) {
+	var nilCtrl *Control
+	nilCtrl.SetLevel("debug")
+	nilCtrl.SetFormat(FormatText)
+	if nilCtrl.LevelVar() != nil {
+		t.Fatal("nil control must return nil LevelVar")
+	}
+	// 与 nil 控制器组装的应用：/log/level 端点不可用（404），其它端点不受影响。
+	if h := LevelHandler(nil, nilCtrl.LevelVar()); h == nil {
+		t.Fatal("handler must not be nil")
+	}
+}
+
 func TestNewUnknownFormatFallsBackToJSON(t *testing.T) {
 	var buf bytes.Buffer
 	logger, _ := newWithWriter(&buf, "info", "nonsense")

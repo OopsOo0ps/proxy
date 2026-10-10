@@ -270,6 +270,40 @@ func ParseServer(data []byte) (*Server, error) {
 	return &cfg, nil
 }
 
+// ClientRestartOnlyChanges 返回两份已解析客户端配置之间、需要重启才能生效的字段。
+//
+// 这些字段对应进程启动时绑定的监听资源（socket），热加载无法在不打断
+// 存量连接的前提下原子替换；配置热加载遇到此类变更时拒绝整份新配置，
+// 保持旧配置继续服务，并提示需要重启。
+func ClientRestartOnlyChanges(old, next *Client) []string {
+	var changed []string
+	if old.Inbound.HTTP != next.Inbound.HTTP {
+		changed = append(changed, "inbound.http")
+	}
+	if old.Inbound.SOCKS5 != next.Inbound.SOCKS5 {
+		changed = append(changed, "inbound.socks5")
+	}
+	if old.Metrics.Listen != next.Metrics.Listen {
+		changed = append(changed, "metrics.listen")
+	}
+	if old.DNS.Listen != next.DNS.Listen {
+		changed = append(changed, "dns.listen")
+	}
+	return changed
+}
+
+// ServerRestartOnlyChanges 返回两份已解析服务端配置之间、需要重启才能生效的字段。
+func ServerRestartOnlyChanges(old, next *Server) []string {
+	var changed []string
+	if old.Listen != next.Listen {
+		changed = append(changed, "listen")
+	}
+	if old.Metrics.Listen != next.Metrics.Listen {
+		changed = append(changed, "metrics.listen")
+	}
+	return changed
+}
+
 func decodeStrict(data []byte, out any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)

@@ -38,6 +38,21 @@ type TargetDialer interface {
 	RouteFor(host string) routing.Action
 }
 
+// LivePolicy 提供配置热加载后的动态策略。
+// 为 nil 时使用 Server 的静态字段（测试与直接构造场景）。
+type LivePolicy interface {
+	// Auth 返回当前入站凭据存储；nil 表示不校验认证。
+	Auth() *auth.Store
+	// Dialer 返回当前目标拨号器。
+	Dialer() TargetDialer
+	// IdleTimeout 返回隧道空闲回收超时。
+	IdleTimeout() time.Duration
+	// ReadHeaderTimeout 返回请求头读取超时。
+	ReadHeaderTimeout() time.Duration
+	// ShutdownTimeout 返回关停排空期限。
+	ShutdownTimeout() time.Duration
+}
+
 // WriteOverloaded 对因连接上限被拒绝的连接写明确的 503 响应后关闭。
 // 响应文案固定，不包含任何内部信息；写操作带 2s 期限，慢客户端不会卡住拒绝路径。
 func WriteOverloaded(conn net.Conn) {
@@ -57,6 +72,8 @@ type Server struct {
 	Auth *auth.Store
 	// Dialer 建立到目标的连接（必填）。
 	Dialer TargetDialer
+	// Live 提供热加载后的动态策略；非 nil 时优先于上方静态字段。
+	Live LivePolicy
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
 	// Metrics 指标；可为 nil。
@@ -156,7 +173,7 @@ func (h *handler) dialContext(ctx context.Context, _, addr string) (net.Conn, er
 	if err != nil || port == 0 {
 		return nil, fmt.Errorf("httpproxy: invalid port %q", portString)
 	}
-	conn, route, err := h.srv.Dialer.DialTarget(ctx, host, uint16(port))
+	conn, route, err := h.srv.dialerNow().DialTarget(ctx, host, uint16(port))
 	if err != nil {
 		return nil, err
 	}
@@ -185,11 +202,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // authorize 校验代理认证；失败时返回 407（固定文案，不泄露内部信息）。
 func (h *handler) authorize(w http.ResponseWriter, r *http.Request, logger *slog.Logger) bool {
-	if h.srv.Auth == nil {
+	store := h.srv.authNow()
+	if store == nil {
 		return true
 	}
 	username, password, ok := parseBasicAuth(r.Header.Get("Proxy-Authorization"))
-	if !ok || !h.srv.Auth.Verify(username, password) {
+	if !ok || !store.Verify(username, password) {
 		logger.Warn("proxy authentication failed")
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
@@ -218,7 +236,7 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	h.srv.Metrics.ConnOpened(metrics.ProtoHTTP)
 	defer h.srv.Metrics.ConnClosed(metrics.ProtoHTTP)
 
-	conn, route, err := h.srv.Dialer.DialTarget(r.Context(), host, port)
+	conn, route, err := h.srv.dialerNow().DialTarget(r.Context(), host, port)
 	if err != nil {
 		// 错误细节只进日志，对客户端统一 502。
 		logger.Warn("dial target failed", "target", target, "error", err)
@@ -282,7 +300,7 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 		h.srv.Metrics.Observe(metrics.ProtoHTTP, metrics.RouteNone, metrics.ResultError, time.Since(start))
 		return
 	}
-	route := h.srv.Dialer.RouteFor(r.URL.Hostname())
+	route := h.srv.dialerNow().RouteFor(r.URL.Hostname())
 	rec := &dialRecord{}
 	ctx := logging.WithRequestID(context.WithValue(r.Context(), dialRecordKey{}, rec), reqID)
 
@@ -430,7 +448,26 @@ func (h *handler) logger() *slog.Logger {
 	return h.srv.Logger
 }
 
+// authNow 返回当前生效的凭据存储：Live 存在时以热加载快照为准。
+func (s *Server) authNow() *auth.Store {
+	if s.Live != nil {
+		return s.Live.Auth()
+	}
+	return s.Auth
+}
+
+// dialerNow 返回当前生效的目标拨号器：Live 存在时以热加载快照为准。
+func (s *Server) dialerNow() TargetDialer {
+	if s.Live != nil {
+		return s.Live.Dialer()
+	}
+	return s.Dialer
+}
+
 func (s *Server) readHeaderTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.ReadHeaderTimeout()
+	}
 	if s.ReadHeaderTimeout <= 0 {
 		return 10 * time.Second
 	}
@@ -438,6 +475,9 @@ func (s *Server) readHeaderTimeout() time.Duration {
 }
 
 func (s *Server) shutdownTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.ShutdownTimeout()
+	}
 	if s.ShutdownTimeout <= 0 {
 		return shutdown.DefaultTimeout
 	}
@@ -452,6 +492,9 @@ func (s *Server) logger() *slog.Logger {
 }
 
 func (s *Server) idleTimeout() time.Duration {
+	if s.Live != nil {
+		return s.Live.IdleTimeout()
+	}
 	if s.IdleTimeout <= 0 {
 		return 90 * time.Second
 	}

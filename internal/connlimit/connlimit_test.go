@@ -8,13 +8,73 @@ import (
 
 func TestLimiterDisabled(t *testing.T) {
 	l := New(0)
-	if l != nil {
-		t.Fatalf("New(0) = %v, want nil (unlimited)", l)
+	if l.Max() != 0 || l.Active() != 0 || l.Rejected() != 0 {
+		t.Fatalf("fresh limiter: max=%d active=%d rejected=%d, want 0/0/0", l.Max(), l.Active(), l.Rejected())
 	}
-	if !l.TryAcquire() || l.Max() != 0 || l.Active() != 0 || l.Rejected() != 0 {
+	if !l.TryAcquire() || l.Active() != 1 {
+		t.Fatal("limiter with max=0 must behave as unlimited")
+	}
+	if !l.TryAcquire() {
+		t.Fatal("unlimited limiter must always acquire")
+	}
+	l.Release()
+	l.Release()
+	if l.Active() != 0 {
+		t.Fatalf("active=%d, want 0", l.Active())
+	}
+	if l.Rejected() != 0 {
+		t.Fatalf("rejected=%d, want 0", l.Rejected())
+	}
+	// nil 接收者语义仍然安全（仅作为防御）。
+	var nilLimiter *Limiter
+	if !nilLimiter.TryAcquire() || nilLimiter.Max() != 0 {
 		t.Fatal("nil limiter must behave as unlimited")
 	}
-	l.Release() // 必须可安全调用
+	nilLimiter.Release()
+	nilLimiter.SetMax(10)
+}
+
+func TestLimiterSetMax(t *testing.T) {
+	l := New(0) // 初始不限制
+	if !l.TryAcquire() {
+		t.Fatal("acquire under unlimited must succeed")
+	}
+	if !l.TryAcquire() {
+		t.Fatal("second acquire under unlimited must succeed")
+	}
+
+	// 调低上限：不中断已占用名额，只拒绝新的占用。
+	l.SetMax(2)
+	if l.Max() != 2 || l.Active() != 2 {
+		t.Fatalf("max=%d active=%d, want 2/2", l.Max(), l.Active())
+	}
+	if l.TryAcquire() {
+		t.Fatal("acquire at limit must fail")
+	}
+	if l.Rejected() != 1 {
+		t.Fatalf("rejected=%d, want 1", l.Rejected())
+	}
+
+	// 活跃数回落到新上限以下后恢复接受。
+	l.Release()
+	if !l.TryAcquire() {
+		t.Fatal("acquire after release must succeed")
+	}
+
+	// 调高上限与解除上限（0）立即生效。
+	l.SetMax(10)
+	for i := l.Active(); i < 10; i++ {
+		if !l.TryAcquire() {
+			t.Fatalf("acquire #%d under raised limit must succeed", i+1)
+		}
+	}
+	if l.TryAcquire() {
+		t.Fatal("acquire at raised limit must fail")
+	}
+	l.SetMax(0)
+	if !l.TryAcquire() {
+		t.Fatal("acquire after removing limit must succeed")
+	}
 }
 
 func TestLimiterCountsAndRejects(t *testing.T) {
