@@ -7,6 +7,7 @@
 //   - upstream_pool_claims_total（counter，标签 node/result）
 //   - upstream_pool_idle_connections（gauge，标签 node）
 //   - upstream_pool_warm_failures_total（counter，标签 node）
+//   - connections_rejected_total（counter，标签 proto）：超过连接上限被拒绝的连接
 package metrics
 
 import (
@@ -56,6 +57,7 @@ type Metrics struct {
 	poolClaims    *prometheus.CounterVec
 	poolIdle      *prometheus.GaugeVec
 	poolWarmFails *prometheus.CounterVec
+	rejected      *prometheus.CounterVec
 }
 
 // New 创建独立的指标集合（使用私有 registry，不污染全局默认值）。
@@ -87,8 +89,12 @@ func New() *Metrics {
 			Name: "upstream_pool_warm_failures_total",
 			Help: "Total number of background warm-up dial failures per node.",
 		}, []string{"node"}),
+		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "connections_rejected_total",
+			Help: "Total number of connections rejected due to the configured connection limit.",
+		}, []string{"proto"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.rejected)
 	m.preInitialize()
 	return m
 }
@@ -98,6 +104,7 @@ func New() *Metrics {
 func (m *Metrics) preInitialize() {
 	for _, proto := range []string{ProtoHTTP, ProtoSOCKS5, ProtoTunnel} {
 		m.active.WithLabelValues(proto)
+		m.rejected.WithLabelValues(proto)
 		for _, route := range []string{RouteDirect, RouteProxy, RouteNone} {
 			m.duration.WithLabelValues(proto, route)
 			for _, result := range []string{ResultOK, ResultAuthFail, ResultDialFail, ResultError} {
@@ -188,4 +195,12 @@ func (m *Metrics) PoolWarmFailed(node string) {
 		return
 	}
 	m.poolWarmFails.WithLabelValues(node).Inc()
+}
+
+// ConnRejected 记录一次因超过连接上限被拒绝的连接。
+func (m *Metrics) ConnRejected(proto string) {
+	if m == nil {
+		return
+	}
+	m.rejected.WithLabelValues(proto).Inc()
 }

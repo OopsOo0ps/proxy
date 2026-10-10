@@ -27,6 +27,11 @@ pool:
   max_idle: 2   # 每个节点保留的最大空闲连接数；0 = 关闭
   idle_ttl: 5s  # 空闲连接最长保留时间；应小于服务端 timeouts.handshake（默认 10s）
 
+# 过载保护：进程级并发连接上限（HTTP + SOCKS5 合计）；0 = 不限制。
+# 超限时 HTTP 入站回 503、SOCKS5 回 0x05 0xFF；拒绝计入 connections_rejected_total。
+limits:
+  max_connections: 1024
+
 # 连接出口节点的 TLS 参数。
 tls:
   ca_file: ""                 # 使用自签证书时填写 CA 证书路径

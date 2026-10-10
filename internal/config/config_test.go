@@ -198,6 +198,39 @@ nodes:
 	}
 }
 
+func TestParseClientLimits(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	cfg, err := ParseClient([]byte(base))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Limits.EffectiveMaxConnections(); got != 1024 {
+		t.Fatalf("default max_connections = %d, want 1024", got)
+	}
+
+	cfg, err = ParseClient([]byte(base + "limits:\n  max_connections: 8\n"))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Limits.EffectiveMaxConnections(); got != 8 {
+		t.Fatalf("max_connections = %d, want 8", got)
+	}
+
+	cfg, err = ParseClient([]byte(base + "limits:\n  max_connections: 0\n"))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Limits.EffectiveMaxConnections(); got != 0 {
+		t.Fatalf("max_connections = %d, want 0（显式不限制）", got)
+	}
+}
+
 func TestParseClientRejects(t *testing.T) {
 	cases := map[string]string{
 		"empty config":         ``,
@@ -216,6 +249,7 @@ func TestParseClientRejects(t *testing.T) {
 		"bad duration":         "inbound:\n  http: \"127.0.0.1:8080\"\ntimeouts:\n  dial: fast\n",
 		"zero duration":        "inbound:\n  http: \"127.0.0.1:8080\"\ntimeouts:\n  dial: 0s\n",
 		"negative shutdown":    "inbound:\n  http: \"127.0.0.1:8080\"\ntimeouts:\n  shutdown: -1s\n",
+		"negative conn limit":  "inbound:\n  http: \"127.0.0.1:8080\"\nlimits:\n  max_connections: -1\n",
 		"duplicate user":       "inbound:\n  http: \"127.0.0.1:8080\"\n  auth:\n    - username: a\n      password: 1\n    - username: a\n      password: 2\n",
 		"metrics bad addr":     "inbound:\n  http: \"127.0.0.1:8080\"\nmetrics:\n  listen: \"127.0.0.1\"\n",
 	}
@@ -269,6 +303,9 @@ metrics:
 	}
 	if cfg.Timeouts.Shutdown.Std() != 15*time.Second {
 		t.Fatalf("default shutdown = %v, want 15s", cfg.Timeouts.Shutdown.Std())
+	}
+	if cfg.Limits.EffectiveMaxConnections() != 1024 {
+		t.Fatalf("default max_connections = %d, want 1024", cfg.Limits.EffectiveMaxConnections())
 	}
 	if cfg.Log.Format != "json" {
 		t.Fatalf("default log format = %q", cfg.Log.Format)

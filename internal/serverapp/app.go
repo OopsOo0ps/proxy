@@ -11,11 +11,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
+	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
 	"github.com/OopsOo0ps/proxy/pkg/version"
@@ -30,11 +33,15 @@ type App struct {
 	tunnel  *trojan.Server
 	tlsCfg  *tls.Config
 	status  *status.Status
+	limiter *connlimit.Limiter
 
 	certNotAfter time.Time
 	tunnelLn     net.Listener
 	metricsSrv   *http.Server
 	metricsLn    net.Listener
+
+	rejectMu    sync.Mutex
+	rejectLogAt time.Time
 }
 
 // New 加载证书与凭据并组装应用（不绑定端口）。
@@ -84,6 +91,7 @@ func New(cfg *config.Server, logger *slog.Logger) (*App, error) {
 			MinVersion:   tls.VersionTLS12,
 		},
 	}
+	app.limiter = connlimit.New(cfg.Limits.EffectiveMaxConnections())
 	app.status = status.New(status.Options{
 		Version: version.Get().Version,
 		Checks:  app.healthChecks(),
@@ -111,6 +119,11 @@ func (a *App) Listen() error {
 	if err != nil {
 		return fmt.Errorf("serverapp: listen %s: %w", a.cfg.Listen, err)
 	}
+	ln = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
+		a.metrics.ConnRejected(metrics.ProtoTunnel)
+		a.logTunnelReject(conn)
+		_ = conn.Close()
+	})
 	a.tunnelLn = tls.NewListener(ln, a.tlsCfg)
 
 	if addr := a.cfg.Metrics.Listen; addr != "" {
@@ -206,7 +219,30 @@ func (a *App) healthChecks() []func() error {
 // runtimeStats 组装 /stats 快照：隧道活跃连接数。
 func (a *App) runtimeStats() status.Runtime {
 	tunnel := a.metrics.ActiveByProto()[metrics.ProtoTunnel]
-	return status.Runtime{
+	rt := status.Runtime{
 		Connections: status.Connections{Tunnel: tunnel, Total: tunnel},
+	}
+	if a.limiter != nil {
+		rt.Limit = &status.Limit{
+			MaxConnections: a.limiter.Max(),
+			Current:        a.limiter.Active(),
+			Rejected:       a.limiter.Rejected(),
+		}
+	}
+	return rt
+}
+
+// logTunnelReject 记录一次隧道侧超限拒绝（每秒最多一条，避免过载时刷日志）。
+func (a *App) logTunnelReject(conn net.Conn) {
+	now := time.Now()
+	a.rejectMu.Lock()
+	logNow := now.Sub(a.rejectLogAt) >= time.Second
+	if logNow {
+		a.rejectLogAt = now
+	}
+	a.rejectMu.Unlock()
+	if logNow {
+		a.logger.Warn("connection limit reached; rejecting tunnel connection",
+			"remote", netutil.RemoteIP(conn.RemoteAddr()))
 	}
 }

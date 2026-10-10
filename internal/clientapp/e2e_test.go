@@ -26,6 +26,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
+	"github.com/OopsOo0ps/proxy/internal/trojan"
 )
 
 func testTimeouts() config.Timeouts {
@@ -51,6 +52,12 @@ type serverHandle struct {
 // startServer 启动一个测试用 proxy-server（自签证书）。
 func startServer(t *testing.T, password string, logger *slog.Logger, withMetrics bool) *serverHandle {
 	t.Helper()
+	return startServerWith(t, password, logger, withMetrics, nil)
+}
+
+// startServerWith 启动测试用 proxy-server；mutate 可在启动前调整配置（如连接上限）。
+func startServerWith(t *testing.T, password string, logger *slog.Logger, withMetrics bool, mutate func(*config.Server)) *serverHandle {
+	t.Helper()
 	dir := t.TempDir()
 	certFile, keyFile, err := testutil.WriteTLSCertFiles(dir)
 	if err != nil {
@@ -65,6 +72,9 @@ func startServer(t *testing.T, password string, logger *slog.Logger, withMetrics
 	}
 	if withMetrics {
 		cfg.Metrics.Listen = "127.0.0.1:0"
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 	app, err := serverapp.New(cfg, logger)
 	if err != nil {
@@ -945,4 +955,211 @@ func TestE2EShutdownDrainsInflightRequest(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("client Serve did not return after the in-flight tunnel closed")
 	}
+}
+
+// rawTunnelConnect 经代理建立 CONNECT 隧道并读完响应头；非 200 时返回错误。
+func rawTunnelConnect(proxyAddr, target string) (net.Conn, error) {
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if !strings.Contains(status, "200") {
+		_ = conn.Close()
+		return nil, fmt.Errorf("CONNECT status = %q", strings.TrimSpace(status))
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	_ = conn.SetDeadline(time.Time{})
+	return conn, nil
+}
+
+// waitTunnelConnect 轮询直到 CONNECT 成功（用于等待连接上限释放）。
+func waitTunnelConnect(t *testing.T, proxyAddr, target string, timeout time.Duration) net.Conn {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, err := rawTunnelConnect(proxyAddr, target)
+		if err == nil {
+			return conn
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("CONNECT did not recover within %v: %v", timeout, lastErr)
+	return nil
+}
+
+func TestE2EOverloadReturnsClearErrorAndRecovers(t *testing.T) {
+	echoAddr := startEcho(t)
+	h := startServer(t, "node-secret", nil, false)
+
+	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg.Limits = config.Limits{MaxConnections: intPtr(1)}
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	app := startClient(t, cfg, nil)
+
+	// 隧道 1 占满唯一名额，并确认隧道确实在工作。
+	conn1, err := rawTunnelConnect(app.HTTPAddr(), echoAddr)
+	if err != nil {
+		t.Fatalf("first tunnel: %v", err)
+	}
+	defer func() { _ = conn1.Close() }()
+	_ = conn1.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn1.Write([]byte("hold")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 4)
+	if _, err := io.ReadFull(conn1, got); err != nil {
+		t.Fatal(err)
+	}
+
+	// HTTP 入站第 2 个连接：连接级拒绝，直接回 503。
+	c2, err := net.Dial("tcp", app.HTTPAddr())
+	if err != nil {
+		t.Fatalf("dial client http: %v", err)
+	}
+	_ = c2.SetReadDeadline(time.Now().Add(2 * time.Second))
+	respLine, err := bufio.NewReader(c2).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read overload response: %v", err)
+	}
+	if !strings.Contains(respLine, "503") {
+		t.Fatalf("over-limit HTTP response = %q, want 503", strings.TrimSpace(respLine))
+	}
+	_ = c2.Close()
+
+	// SOCKS5 入站：认证前没有专用过载码，回 0x05 0xFF 后关闭。
+	c3, err := net.Dial("tcp", app.SOCKS5Addr())
+	if err != nil {
+		t.Fatalf("dial client socks5: %v", err)
+	}
+	_ = c3.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c3.Write([]byte{socks5.Version, 1, socks5.MethodNoAuth}); err != nil {
+		t.Fatal(err)
+	}
+	var sel [2]byte
+	if _, err := io.ReadFull(c3, sel[:]); err != nil {
+		t.Fatalf("read socks5 overload reply: %v", err)
+	}
+	if sel[0] != socks5.Version || sel[1] != socks5.MethodNoAcceptable {
+		t.Fatalf("socks5 overload reply = %v, want [0x05 0xFF]", sel)
+	}
+	_ = c3.Close()
+
+	waitForMetric(t, app.MetricsAddr(), `connections_rejected_total{proto="http"} 1`)
+	waitForMetric(t, app.MetricsAddr(), `connections_rejected_total{proto="socks5"} 1`)
+
+	var stats struct {
+		Limit struct {
+			MaxConnections int    `json:"max_connections"`
+			Current        int    `json:"current"`
+			Rejected       uint64 `json:"rejected"`
+		} `json:"limit"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/stats", &stats); code != http.StatusOK {
+		t.Fatalf("/stats status = %d, want 200", code)
+	}
+	if stats.Limit.MaxConnections != 1 || stats.Limit.Current != 1 || stats.Limit.Rejected != 2 {
+		t.Fatalf("limit = %+v, want max=1 current=1 rejected=2", stats.Limit)
+	}
+
+	// 释放名额后应恢复可用（超限不是熔断）。
+	_ = conn1.Close()
+	conn4 := waitTunnelConnect(t, app.HTTPAddr(), echoAddr, 3*time.Second)
+	_ = conn4.Close()
+}
+
+func TestE2ETunnelOverloadRejectsAndRecovers(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startServerWith(t, "node-secret", nil, true, func(cfg *config.Server) {
+		cfg.Limits = config.Limits{MaxConnections: intPtr(1)}
+	})
+	dial := func() (net.Conn, error) {
+		return trojan.Dial(context.Background(), trojan.ClientConfig{
+			ServerAddr: h.addr,
+			Password:   "node-secret",
+			TLSConfig:  &tls.Config{InsecureSkipVerify: true},
+		}, host, uint16(port))
+	}
+
+	// 隧道 1 占满唯一名额，并确认转发可用。
+	conn1, err := dial()
+	if err != nil {
+		t.Fatalf("first tunnel: %v", err)
+	}
+	defer func() { _ = conn1.Close() }()
+	_ = conn1.SetDeadline(time.Now().Add(5 * time.Second))
+	payload := []byte("overload-first")
+	if _, err := conn1.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn1, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+
+	// 第二条隧道：名额已满，服务端 accept 后立即关闭，客户端握手必须失败。
+	if conn2, err := dial(); err == nil {
+		_ = conn2.Close()
+		t.Fatal("second tunnel should be rejected while the limit is reached")
+	}
+
+	waitForMetric(t, h.metricsAddr, `connections_rejected_total{proto="tunnel"} 1`)
+	var stats struct {
+		Limit struct {
+			MaxConnections int    `json:"max_connections"`
+			Current        int    `json:"current"`
+			Rejected       uint64 `json:"rejected"`
+		} `json:"limit"`
+	}
+	if code := getJSON(t, "http://"+h.metricsAddr+"/stats", &stats); code != http.StatusOK {
+		t.Fatalf("/stats status = %d, want 200", code)
+	}
+	if stats.Limit.MaxConnections != 1 || stats.Limit.Current != 1 || stats.Limit.Rejected != 1 {
+		t.Fatalf("limit = %+v, want max=1 current=1 rejected=1", stats.Limit)
+	}
+
+	// 释放名额后新隧道应恢复可用。
+	_ = conn1.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	var conn3 net.Conn
+	for time.Now().Before(deadline) {
+		conn3, err = dial()
+		if err == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("tunnel did not recover after release: %v", err)
+	}
+	_ = conn3.Close()
 }

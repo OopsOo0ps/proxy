@@ -95,6 +95,24 @@ type Inbound struct {
 	Auth   []User `yaml:"auth"`   // 凭据列表；监听非环回地址时必填
 }
 
+// Limits 是进程级过载保护配置。
+type Limits struct {
+	// MaxConnections 是进程内并发连接上限；缺省 1024，0 = 不限制。
+	// proxy-client 统计 HTTP + SOCKS5 入站连接之和；proxy-server 统计隧道连接。
+	MaxConnections *int `yaml:"max_connections"`
+}
+
+// defaultMaxConnections 是连接上限缺省值。
+const defaultMaxConnections = 1024
+
+// EffectiveMaxConnections 返回生效的并发连接上限（缺省 1024，0 = 不限制）。
+func (l Limits) EffectiveMaxConnections() int {
+	if l.MaxConnections == nil {
+		return defaultMaxConnections
+	}
+	return *l.MaxConnections
+}
+
 // ClientTLS 是客户端连接出口节点的 TLS 参数。
 type ClientTLS struct {
 	CAFile             string `yaml:"ca_file"`              // 自定义 CA（自签证书场景）
@@ -140,6 +158,7 @@ type Client struct {
 	Inbound  Inbound   `yaml:"inbound"`
 	Nodes    []Node    `yaml:"nodes"`
 	Pool     Pool      `yaml:"pool"`
+	Limits   Limits    `yaml:"limits"`
 	TLS      ClientTLS `yaml:"tls"`
 	Routing  Routing   `yaml:"routing"`
 	Timeouts Timeouts  `yaml:"timeouts"`
@@ -153,6 +172,7 @@ type Server struct {
 	TLS       ServerTLS `yaml:"tls"`
 	Users     []User    `yaml:"users"`
 	DecoyFile string    `yaml:"decoy_file"` // 可选：认证失败时的伪装页面
+	Limits    Limits    `yaml:"limits"`
 	Timeouts  Timeouts  `yaml:"timeouts"`
 	Metrics   Metrics   `yaml:"metrics"`
 	Log       Log       `yaml:"log"`
@@ -230,6 +250,9 @@ func (c *Client) applyDefaults() {
 	if c.Pool.IdleTTL == 0 {
 		c.Pool.IdleTTL = Duration(defaultPoolIdleTTL)
 	}
+	if c.Limits.MaxConnections == nil {
+		c.Limits.MaxConnections = intPtr(defaultMaxConnections)
+	}
 	if strings.TrimSpace(c.Routing.Default) == "" {
 		c.Routing.Default = "proxy"
 	}
@@ -241,6 +264,9 @@ func (c *Client) applyDefaults() {
 
 func (s *Server) applyDefaults() {
 	applyTimeoutDefaults(&s.Timeouts)
+	if s.Limits.MaxConnections == nil {
+		s.Limits.MaxConnections = intPtr(defaultMaxConnections)
+	}
 	applyLogDefaults(&s.Log)
 }
 
@@ -283,6 +309,9 @@ func (c *Client) validate() error {
 	}
 	if c.Pool.IdleTTL < 0 {
 		return errors.New("pool.idle_ttl: must not be negative")
+	}
+	if c.Limits.EffectiveMaxConnections() < 0 {
+		return errors.New("limits.max_connections: must not be negative (0 disables the limit)")
 	}
 
 	if c.Inbound.HTTP == "" && c.Inbound.SOCKS5 == "" {
@@ -349,6 +378,9 @@ func (s *Server) validate() error {
 	}
 	if s.TLS.CertFile == "" || s.TLS.KeyFile == "" {
 		return errors.New("tls: cert_file and key_file are required")
+	}
+	if s.Limits.EffectiveMaxConnections() < 0 {
+		return errors.New("limits.max_connections: must not be negative (0 disables the limit)")
 	}
 	return validateUsers("users", s.Users, true)
 }

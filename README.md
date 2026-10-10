@@ -47,6 +47,7 @@ flowchart LR
 | 隧道出站 | Trojan over TLS；出口节点轮询、失败自动切换与冷却退避 |
 | 连接池 | 上游隧道预热池：启动预热、请求领取，省去一次完整握手；空闲数与 TTL 可配，失效自动回退新建 |
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超过 `timeouts.shutdown`（默认 15s）强制断开剩余连接 |
+| 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误：HTTP 503 / SOCKS5 失败回复 / 隧道直接关闭，并计入 `connections_rejected_total` |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
@@ -136,6 +137,9 @@ pool:                       # 上游空闲隧道连接池（预热复用）
   max_idle: 2               # 每节点最大空闲连接数；0 = 关闭
   idle_ttl: 5s              # 空闲连接最长保留时间；应小于服务端 handshake 超时
 
+limits:                     # 过载保护
+  max_connections: 1024     # 进程级并发连接上限（HTTP + SOCKS5 合计）；0 = 不限制
+
 tls:
   ca_file: ""                 # 自签证书时填写 CA 路径
   insecure_skip_verify: false # 仅调试：跳过证书校验
@@ -181,6 +185,19 @@ log:      { level: info, format: json }   # json | text
 排空完成后日志出现 `shutdown: all in-flight connections drained`；超时强制断开时
 出现 `shutdown: timeout exceeded, remaining connections closed`。
 
+### 过载保护（背压）
+
+- `limits.max_connections`（默认 1024，0 = 不限制）是**进程级**并发连接上限：
+  `proxy-client` 统计 HTTP + SOCKS5 入站连接之和；`proxy-server` 统计隧道连接。
+- 超限时的明确错误：
+  - HTTP 入站：回 `503 Service Unavailable`（固定文案 + `Retry-After: 1`）；
+  - SOCKS5 入站：回 `0x05 0xFF`（认证前协议没有专门的过载码，这是客户端可感知的失败）；
+  - 隧道侧：直接关闭连接（TLS 层无法携带错误语义），并按秒限频记录 warn 日志。
+- 读写超时：握手阶段由 `timeouts.handshake`、转发阶段由 `timeouts.idle` 约束
+  （读与写均设期限）；拒绝响应的写出也有 2s 期限，慢客户端不会长期占用上限名额。
+- 观测：`connections_rejected_total{proto}` 记录拒绝数；`/stats` 的 `limit` 字段
+  展示上限、当前占用与累计拒绝。指标与运维端点不受连接上限影响（过载时仍可观测）。
+
 ### 服务端 `proxy-server`
 
 ```yaml
@@ -189,6 +206,7 @@ tls: { cert_file: server.crt, key_file: server.key }
 users:                       # 每个客户端分配独立凭据
   - { username: alice, password: change-me-alice }
 decoy_file: ""               # 可选：认证失败时的伪装页面
+limits: { max_connections: 1024 }  # 进程级并发隧道上限；0 = 不限制
 timeouts: { dial: 10s, handshake: 10s, idle: 90s, shutdown: 15s }
 metrics:  { listen: "127.0.0.1:9200" } # 指标与运维端点（/metrics、/health、/stats）
 log:      { level: info, format: json }
@@ -224,6 +242,7 @@ rules:
 | `requests_total` | counter | `proto`、`route`、`result` | 代理请求总数（含失败分类） |
 | `request_duration_seconds` | histogram | `proto`、`route` | 请求耗时（秒） |
 | `active_connections` | gauge | `proto` | 当前活跃连接数 |
+| `connections_rejected_total` | counter | `proto` | 因超过连接上限被拒绝的连接数 |
 | `upstream_pool_claims_total` | counter | `node`、`result` | 空闲连接领取结果（`hit` / `miss` / `stale`） |
 | `upstream_pool_idle_connections` | gauge | `node` | 各节点当前空闲（已握手待用）连接数 |
 | `upstream_pool_warm_failures_total` | counter | `node` | 后台预热拨号失败次数 |
@@ -259,7 +278,8 @@ curl -s http://127.0.0.1:9100/stats
   - `proxy-server`：TLS 证书在运行中过期时不可用。
 - `GET /stats`：运行时快照，字段见上例。`upstreams` 仅 `proxy-client` 输出；
   `proxy-server` 的 `connections` 只统计隧道连接。`upstreams[].idle` 是当前空闲
-  预热连接数（未启用连接池时为 0）。
+  预热连接数（未启用连接池时为 0）。配置了连接上限时另有 `limit` 字段：
+  上限、当前占用与累计拒绝数（0 = 不限制时不输出）。
 - 两个端点均只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
   请仅在环回地址或防火墙之后暴露。
 - 节点健康状态来源于真实拨号的被动更新（失败后进入冷却），不发送主动探测；
@@ -309,6 +329,10 @@ curl -s http://127.0.0.1:9100/stats
 - 尚未提供 systemd 单元与发行包，请通过源码构建使用。
 - 关停期间不接受新连接；超过 `timeouts.shutdown` 仍未结束的连接会被强制断开
   （日志中有明确记录），这是有意的“有限期 drain”语义。
+- 连接上限语义：客户端统计 HTTP + SOCKS5 入站合计，服务端统计隧道连接。
+  隧道侧超限只能直接关闭连接（TLS / Trojan 都没有错误码通道），客户端表现为
+  拨号失败并可能触发节点切换；另外客户端连接池的预热连接同样占用服务端名额，
+  服务端上限应大于「客户端数 × `pool.max_idle` + 真实并发」。
 
 ## 项目结构
 
@@ -349,8 +373,8 @@ curl -s http://127.0.0.1:9100/stats
 
 端到端测试使用本机回环与自签证书，覆盖：CONNECT 转发成功率（100 次请求，
 验收线 ≥95%）、三节点轮询、节点故障转移、连接池预热与领取命中、私网直连、
-优雅关停排空（存量请求不被中断、新连接被拒绝）、SOCKS5 与入站认证、
-指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
+优雅关停排空（存量请求不被中断、新连接被拒绝）、过载保护（超限拒绝与恢复）、
+SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
 

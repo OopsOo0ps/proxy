@@ -32,6 +32,15 @@ type TargetDialer interface {
 	DialTarget(ctx context.Context, host string, port uint16) (net.Conn, dialer.Route, error)
 }
 
+// WriteOverloadReply 对因连接上限被拒绝的 SOCKS5 连接回“无可用认证方式”
+// （0x05 0xFF）后关闭：RFC 1928 在认证前没有专门的过载回复码，
+// 这是客户端可感知且协议合法的明确失败。写操作带 2s 期限。
+func WriteOverloadReply(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Write([]byte{Version, MethodNoAcceptable})
+}
+
 // Server 是 SOCKS5 入站代理，仅支持 TCP CONNECT（UDP ASSOCIATE 暂不支持）。
 type Server struct {
 	// Auth 为 nil 时不要求认证；否则要求用户名/密码（RFC 1929）。
