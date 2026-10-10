@@ -88,7 +88,7 @@ type Timeouts struct {
 	Idle      Duration `yaml:"idle"`      // 连接空闲回收
 }
 
-// Metrics 是指标监听配置。
+// Metrics 是运维端点（/metrics、/health、/stats）的监听配置。
 type Metrics struct {
 	Listen string `yaml:"listen"` // host:port，空 = 不启用
 }

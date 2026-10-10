@@ -24,6 +24,7 @@ timeouts:
   handshake: 10s
   idle: 90s
 
+# 指标与运维端点（/metrics、/health、/stats）；建议只监听本机或置于防火墙之后。
 metrics:
   listen: "127.0.0.1:9200"
 
