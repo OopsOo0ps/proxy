@@ -98,6 +98,7 @@ func New(cfg *config.Server, logger *slog.Logger) (*App, error) {
 		HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
 		DialTimeout:      cfg.Timeouts.Dial.Std(),
 		IdleTimeout:      cfg.Timeouts.Idle.Std(),
+		ShutdownTimeout:  cfg.Timeouts.Shutdown.Std(),
 		Logger:           logger,
 		Metrics:          app.metrics,
 	}

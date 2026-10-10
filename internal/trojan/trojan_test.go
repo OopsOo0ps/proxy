@@ -517,3 +517,173 @@ func TestServerShutdownInterruptsPendingHandshake(t *testing.T) {
 		t.Fatal("client should observe closed connection after shutdown")
 	}
 }
+
+// startTLSServerControlled 启动 Trojan 服务端并暴露关停触发与 Serve 结束信号。
+// Serve 的返回值由清理函数断言，测试正文只需等待 finished 关闭。
+func startTLSServerControlled(t *testing.T, srv *Server) (addr string, clientTLS *tls.Config, shutdown func(), finished <-chan struct{}) {
+	t.Helper()
+	cert, caPEM, err := testutil.NewTLSCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsCfg, err := testutil.ClientTLSConfig(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	finishedCh := make(chan struct{})
+	go func() {
+		errCh <- srv.Serve(ctx, tlsLn)
+		close(finishedCh)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finishedCh:
+		case <-time.After(5 * time.Second):
+			t.Error("Serve did not stop")
+			return
+		}
+		if err := <-errCh; err != nil {
+			t.Errorf("Serve returned %v", err)
+		}
+	})
+	return ln.Addr().String(), tlsCfg, cancel, finishedCh
+}
+
+// waitDialRefused 轮询直到监听地址拒绝新连接（关停已生效）。
+func waitDialRefused(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("listener still accepts new connections after shutdown")
+}
+
+// echoRoundTrip 在隧道上回显一次数据，验证转发仍然可用。
+func echoRoundTrip(t *testing.T, conn net.Conn, payload []byte) {
+	t.Helper()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+}
+
+func TestServerDrainsInflightTunnelOnShutdown(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(_ context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+		ShutdownTimeout: 3 * time.Second,
+	}
+	nodeAddr, clientTLS, shutdown, finished := startTLSServerControlled(t, srv)
+
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	}, host, uint16(port))
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// 先做一次往返，确保服务端已进入转发阶段（而非握手期）。
+	echoRoundTrip(t, conn, []byte("before shutdown"))
+
+	shutdown()
+	waitDialRefused(t, nodeAddr)
+
+	// 存量隧道在关停后必须继续可用（drain 不丢请求）。
+	echoRoundTrip(t, conn, []byte("drained tunnel payload"))
+
+	_ = conn.Close()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after the in-flight tunnel closed")
+	}
+}
+
+func TestServerForceClosesTunnelAfterShutdownTimeout(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(_ context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+		ShutdownTimeout: 200 * time.Millisecond,
+	}
+	nodeAddr, clientTLS, shutdown, finished := startTLSServerControlled(t, srv)
+
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	}, host, uint16(port))
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// 先做一次往返，确保服务端已进入转发阶段（而非握手期）。
+	echoRoundTrip(t, conn, []byte("before shutdown"))
+
+	start := time.Now()
+	shutdown()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not exit after the shutdown timeout")
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Fatalf("Serve returned after %v, want the drain timeout to elapse first", elapsed)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("tunnel should be closed after forced shutdown")
+	}
+}

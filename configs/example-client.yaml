@@ -43,6 +43,7 @@ timeouts:
   dial: 10s       # 建立目标 / 节点连接
   handshake: 10s  # 隧道握手（TLS + Trojan）
   idle: 90s       # 连接空闲回收
+  shutdown: 15s   # 优雅关停：停止接受新连接后，等待存量请求结束的最长时间
 
 # 指标与运维端点（/metrics、/health、/stats）；建议只监听本机或置于防火墙之后。
 metrics:

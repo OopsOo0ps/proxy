@@ -28,6 +28,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/shutdown"
 )
 
 // TargetDialer 建立到目标的连接（由路由与出口节点决定直连或经隧道）。
@@ -50,36 +51,54 @@ type Server struct {
 	IdleTimeout time.Duration
 	// ReadHeaderTimeout 请求头读取超时，默认 10s。
 	ReadHeaderTimeout time.Duration
+	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 15s。
+	ShutdownTimeout time.Duration
 }
 
-// Serve 在 ln 上提供代理服务；ctx 取消后优雅关停。
+// Serve 在 ln 上提供代理服务；ctx 取消后优雅关停：
+// 先停止接受新连接，让存量请求在关停期限内自然结束，超时后强制断开。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// handlerCtx 与关停信号解耦：收到关停后存量请求继续执行，
+	// 只有超过关停期限（forceCancel）才被打断。
+	handlerCtx, forceCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer forceCancel()
+
 	h := newHandler(s)
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: s.readHeaderTimeout(),
-		BaseContext:       func(net.Listener) context.Context { return ctx },
+		BaseContext:       func(net.Listener) context.Context { return handlerCtx },
 	}
 
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(shutdownCtx)
-		case <-done:
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- srv.Serve(ln) }()
+
+	var serveErr error
+	select {
+	case serveErr = <-serveErrCh:
+	case <-ctx.Done():
+		s.logger().Info("shutdown: stopped accepting new connections",
+			"drain_timeout", s.shutdownTimeout().String())
+		deadline := time.Now().Add(s.shutdownTimeout())
+		// 普通请求（非 CONNECT）由 net/http 排空；期限用尽时强制关闭。
+		shutdownCtx, cancel := context.WithDeadline(context.Background(), deadline)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			_ = srv.Close()
 		}
-	}()
-
-	err := srv.Serve(ln)
-	if errors.Is(err, http.ErrServerClosed) {
-		err = nil
+		cancel()
+		// CONNECT 隧道已被 Hijack，net/http 不再跟踪，需要自行等待排空。
+		if shutdown.Wait(&h.wg, time.Until(deadline), forceCancel) {
+			s.logger().Info("shutdown: all in-flight connections drained")
+		} else {
+			s.logger().Warn("shutdown: timeout exceeded, remaining connections closed")
+		}
+		serveErr = <-serveErrCh
 	}
-	h.wg.Wait()                        // 等待存量 CONNECT 隧道结束
+	if errors.Is(serveErr, http.ErrServerClosed) {
+		serveErr = nil
+	}
 	h.transport.CloseIdleConnections() // 释放池化的隧道连接
-	return err
+	return serveErr
 }
 
 type handler struct {
@@ -402,6 +421,20 @@ func (s *Server) readHeaderTimeout() time.Duration {
 		return 10 * time.Second
 	}
 	return s.ReadHeaderTimeout
+}
+
+func (s *Server) shutdownTimeout() time.Duration {
+	if s.ShutdownTimeout <= 0 {
+		return shutdown.DefaultTimeout
+	}
+	return s.ShutdownTimeout
+}
+
+func (s *Server) logger() *slog.Logger {
+	if s.Logger == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return s.Logger
 }
 
 func (s *Server) idleTimeout() time.Duration {

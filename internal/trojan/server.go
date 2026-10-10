@@ -15,6 +15,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
+	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
 )
 
@@ -49,24 +50,37 @@ type Server struct {
 	DialTimeout time.Duration
 	// IdleTimeout 连接空闲回收，默认 90s。
 	IdleTimeout time.Duration
+	// ShutdownTimeout 关停时等待存量隧道结束的最长时间，默认 15s。
+	ShutdownTimeout time.Duration
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
 	// Metrics 指标；可为 nil。
 	Metrics *metrics.Metrics
 }
 
-// Serve 在 ln 上接受并处理隧道连接，ctx 取消后关闭监听并等待存量连接退出。
+// Serve 在 ln 上接受并处理隧道连接；ctx 取消后优雅关停：
+// 先停止接受新连接，让已在转发的隧道在关停期限内自然结束，超时后强制断开。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// relayCtx 与关停信号解耦：收到关停后已在转发的隧道继续排空，
+	// 只有超过关停期限（forceCancel）才被打断。
+	relayCtx, forceCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer forceCancel()
+
 	var wg sync.WaitGroup
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
+		case <-done:
+		}
 	}()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				wg.Wait()
+				s.drain(&wg, forceCancel)
 				return nil
 			}
 			return err
@@ -74,12 +88,23 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.handle(ctx, conn)
+			s.handle(ctx, relayCtx, conn)
 		}()
 	}
 }
 
-func (s *Server) handle(ctx context.Context, conn net.Conn) {
+// drain 排空存量隧道；超过关停期限后强制中断仍在转发的连接。
+func (s *Server) drain(wg *sync.WaitGroup, forceCancel context.CancelFunc) {
+	s.logger().Info("shutdown: stopped accepting new connections",
+		"drain_timeout", s.shutdownTimeout().String())
+	if shutdown.Wait(wg, s.shutdownTimeout(), forceCancel) {
+		s.logger().Info("shutdown: all in-flight tunnels drained")
+		return
+	}
+	s.logger().Warn("shutdown: timeout exceeded, remaining connections closed")
+}
+
+func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	start := time.Now()
@@ -99,8 +124,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	// 客户端连接池会持有"已握手、待发送请求"的预热连接，等待它们
 	// 自然超时会让优雅退出拖满一个握手超时；这类连接没有在途请求，
 	// 直接关闭不丢任何数据。
-	stopWatch := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
-	defer stopWatch()
+	stopHandshakeWatch := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopHandshakeWatch()
 	br := bufio.NewReader(conn)
 
 	req, err := ReadRequest(br)
@@ -118,7 +143,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		s.serveDecoy(conn)
 		return
 	}
-	stopWatch()
+	stopHandshakeWatch()
+
+	// 超过关停期限（forceCancel）时打断尚未进入转发的连接（如拨号中）。
+	stopForce := context.AfterFunc(relayCtx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopForce()
 
 	user, ok := s.Verifier.VerifyTunnel(req.PasswordHash)
 	if !ok {
@@ -134,7 +163,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}
 
 	target := net.JoinHostPort(req.Host, strconv.Itoa(int(req.Port)))
-	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout())
+	dialCtx, cancel := context.WithTimeout(relayCtx, s.dialTimeout())
 	defer cancel()
 	upstream, err := s.Dial(dialCtx, target)
 	if err != nil {
@@ -147,7 +176,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 
 	_ = conn.SetDeadline(time.Time{})
 	clientConn := relay.PrefixConn(conn, br)
-	stats, relayErr := relay.BiCopy(ctx, clientConn, upstream, s.idleTimeout())
+	stats, relayErr := relay.BiCopy(relayCtx, clientConn, upstream, s.idleTimeout())
 	result = metrics.ResultOK
 	if !relay.IsExpected(relayErr) {
 		result = metrics.ResultError
@@ -214,4 +243,11 @@ func (s *Server) idleTimeout() time.Duration {
 		return 90 * time.Second
 	}
 	return s.IdleTimeout
+}
+
+func (s *Server) shutdownTimeout() time.Duration {
+	if s.ShutdownTimeout <= 0 {
+		return shutdown.DefaultTimeout
+	}
+	return s.ShutdownTimeout
 }
