@@ -56,6 +56,9 @@ func TestParseClientValid(t *testing.T) {
 	if cfg.Timeouts.Dial.Std() != 5*time.Second {
 		t.Fatalf("dial timeout = %v, want 5s", cfg.Timeouts.Dial.Std())
 	}
+	if cfg.Timeouts.Shutdown.Std() != 15*time.Second {
+		t.Fatalf("default shutdown timeout = %v, want 15s", cfg.Timeouts.Shutdown.Std())
+	}
 	if cfg.TLS.CAFile != "ca.pem" {
 		t.Fatalf("ca_file = %q", cfg.TLS.CAFile)
 	}
@@ -178,6 +181,23 @@ timeouts:
 	}
 }
 
+func TestParseClientShutdownTimeout(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	cfg, err := ParseClient([]byte(base + "timeouts:\n  shutdown: 3s\n"))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if cfg.Timeouts.Shutdown.Std() != 3*time.Second {
+		t.Fatalf("shutdown = %v, want 3s", cfg.Timeouts.Shutdown.Std())
+	}
+}
+
 func TestParseClientRejects(t *testing.T) {
 	cases := map[string]string{
 		"empty config":         ``,
@@ -195,6 +215,7 @@ func TestParseClientRejects(t *testing.T) {
 		"bad log format":       "inbound:\n  http: \"127.0.0.1:8080\"\nlog:\n  format: xml\n",
 		"bad duration":         "inbound:\n  http: \"127.0.0.1:8080\"\ntimeouts:\n  dial: fast\n",
 		"zero duration":        "inbound:\n  http: \"127.0.0.1:8080\"\ntimeouts:\n  dial: 0s\n",
+		"negative shutdown":    "inbound:\n  http: \"127.0.0.1:8080\"\ntimeouts:\n  shutdown: -1s\n",
 		"duplicate user":       "inbound:\n  http: \"127.0.0.1:8080\"\n  auth:\n    - username: a\n      password: 1\n    - username: a\n      password: 2\n",
 		"metrics bad addr":     "inbound:\n  http: \"127.0.0.1:8080\"\nmetrics:\n  listen: \"127.0.0.1\"\n",
 	}
@@ -245,6 +266,9 @@ metrics:
 	}
 	if cfg.Timeouts.Idle.Std() != 90*time.Second {
 		t.Fatalf("default idle = %v", cfg.Timeouts.Idle.Std())
+	}
+	if cfg.Timeouts.Shutdown.Std() != 15*time.Second {
+		t.Fatalf("default shutdown = %v, want 15s", cfg.Timeouts.Shutdown.Std())
 	}
 	if cfg.Log.Format != "json" {
 		t.Fatalf("default log format = %q", cfg.Log.Format)

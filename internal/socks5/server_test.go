@@ -345,3 +345,133 @@ func TestServerPassesTargetToDialer(t *testing.T) {
 		t.Fatalf("dialer got %s:%d, want %s:%d", gotHost, gotPort, host, port)
 	}
 }
+
+// startServerControlled 启动 SOCKS5 服务并暴露关停触发与 Serve 结束信号。
+// Serve 的返回值由清理函数断言，测试正文只需等待 finished 关闭。
+func startServerControlled(t *testing.T, srv *Server) (addr string, shutdown func(), finished <-chan struct{}) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen socks5: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	finishedCh := make(chan struct{})
+	go func() {
+		errCh <- srv.Serve(ctx, ln)
+		close(finishedCh)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finishedCh:
+		case <-time.After(5 * time.Second):
+			t.Error("Serve did not stop")
+			return
+		}
+		if err := <-errCh; err != nil {
+			t.Errorf("Serve returned %v", err)
+		}
+	})
+	return ln.Addr().String(), cancel, finishedCh
+}
+
+// waitDialRefused 轮询直到监听地址拒绝新连接（关停已生效）。
+func waitDialRefused(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("listener still accepts new connections after shutdown")
+}
+
+// echoRoundTrip 在连接上回显一次数据，验证隧道仍然可用。
+func echoRoundTrip(t *testing.T, conn net.Conn, payload string) {
+	t.Helper()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != payload {
+		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+}
+
+func TestServeDrainsInflightOnShutdown(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustPort(t, portStr)
+
+	stub := &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
+		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	}}
+	proxyAddr, shutdown, finished := startServerControlled(t, &Server{
+		Dialer:          stub,
+		ShutdownTimeout: 3 * time.Second,
+	})
+
+	conn, rep, err := socks5Connect(t, proxyAddr, "", "", host, port)
+	if err != nil || rep != ReplySuccess {
+		t.Fatalf("connect: rep=%#x err=%v", rep, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	shutdown()
+	waitDialRefused(t, proxyAddr)
+
+	// 存量连接在关停后必须继续可用（drain 不丢请求）。
+	echoRoundTrip(t, conn, "drained payload")
+
+	_ = conn.Close()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after the in-flight connection closed")
+	}
+}
+
+func TestServeForceClosesAfterShutdownTimeout(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustPort(t, portStr)
+
+	stub := &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
+		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	}}
+	proxyAddr, shutdown, finished := startServerControlled(t, &Server{
+		Dialer:          stub,
+		ShutdownTimeout: 200 * time.Millisecond,
+	})
+
+	conn, rep, err := socks5Connect(t, proxyAddr, "", "", host, port)
+	if err != nil || rep != ReplySuccess {
+		t.Fatalf("connect: rep=%#x err=%v", rep, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	start := time.Now()
+	shutdown()
+	select {
+	case <-finished:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not exit after the shutdown timeout")
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Fatalf("Serve returned after %v, want the drain timeout to elapse first", elapsed)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("connection should be closed after forced shutdown")
+	}
+}

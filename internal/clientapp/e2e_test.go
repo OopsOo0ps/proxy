@@ -1,6 +1,7 @@
 package clientapp_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -32,6 +33,7 @@ func testTimeouts() config.Timeouts {
 		Dial:      config.Duration(5 * time.Second),
 		Handshake: config.Duration(5 * time.Second),
 		Idle:      config.Duration(30 * time.Second),
+		Shutdown:  config.Duration(3 * time.Second),
 	}
 }
 
@@ -843,5 +845,104 @@ func TestE2EUpstreamPoolClaimHit(t *testing.T) {
 	}
 	if len(stats.Upstreams) != 1 || stats.Upstreams[0].Addr != h.addr || stats.Upstreams[0].Idle != 2 {
 		t.Fatalf("upstreams = %+v, want %s idle=2", stats.Upstreams, h.addr)
+	}
+}
+
+func TestE2EShutdownDrainsInflightRequest(t *testing.T) {
+	// 完整链路：client HTTP 入站 → 隧道 → server → echo 目标；
+	// 关停后存量隧道必须能继续完成往返，新连接立即被拒绝。
+	echoAddr := startEcho(t)
+	h := startServer(t, "node-secret", nil, false)
+
+	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	app, err := clientapp.New(cfg, nil)
+	if err != nil {
+		t.Fatalf("clientapp.New: %v", err)
+	}
+	if err := app.Listen(); err != nil {
+		t.Fatalf("clientapp.Listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErrCh := make(chan error, 1)
+	finished := make(chan struct{})
+	go func() {
+		serveErrCh <- app.Serve(ctx)
+		close(finished)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("client Serve did not stop")
+			return
+		}
+		if err := <-serveErrCh; err != nil {
+			t.Errorf("client Serve: %v", err)
+		}
+	})
+
+	conn, err := net.Dial("tcp", app.HTTPAddr())
+	if err != nil {
+		t.Fatalf("dial client: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echoAddr, echoAddr); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read CONNECT status: %v", err)
+	}
+	if !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT status = %q, want 200", status)
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read CONNECT header: %v", err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	// 发起关停：入站监听必须停止接受新连接。
+	cancel()
+	refused := false
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		c, err := net.DialTimeout("tcp", app.HTTPAddr(), 300*time.Millisecond)
+		if err != nil {
+			refused = true
+			break
+		}
+		_ = c.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !refused {
+		t.Fatal("client still accepts new connections after shutdown")
+	}
+
+	// 存量隧道在关停后必须继续可用（drain 不丢请求）。
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	payload := []byte("e2e drain payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write over draining tunnel: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read over draining tunnel: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+
+	_ = conn.Close()
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client Serve did not return after the in-flight tunnel closed")
 	}
 }

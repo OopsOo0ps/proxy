@@ -46,6 +46,7 @@ flowchart LR
 | SOCKS5 入站 | TCP `CONNECT`；用户名/密码认证可选（RFC 1928 / RFC 1929） |
 | 隧道出站 | Trojan over TLS；出口节点轮询、失败自动切换与冷却退避 |
 | 连接池 | 上游隧道预热池：启动预热、请求领取，省去一次完整握手；空闲数与 TTL 可配，失效自动回退新建 |
+| 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超过 `timeouts.shutdown`（默认 15s）强制断开剩余连接 |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
@@ -144,7 +145,7 @@ routing:
   rules_file: ""        # 例如 configs/example-rules.yaml
   private_direct: true  # 环回 / 私网 / 链路本地目标一律直连
 
-timeouts: { dial: 10s, handshake: 10s, idle: 90s }
+timeouts: { dial: 10s, handshake: 10s, idle: 90s, shutdown: 15s }
 metrics:  { listen: "127.0.0.1:9100" } # 指标与运维端点（/metrics、/health、/stats）
 log:      { level: info, format: json }   # json | text
 ```
@@ -163,6 +164,23 @@ log:      { level: info, format: json }   # json | text
 - 预热采用“启动预热 + 领取后按需补齐”，空闲期不产生周期性握手流量；
 - 预热拨号失败只计数与记录 debug 日志，节点健康仍由真实请求的被动拨号更新。
 
+### 优雅关闭（graceful shutdown）
+
+`proxy-client` 与 `proxy-server` 收到 `SIGTERM` / `SIGINT` 后按两阶段退出：
+
+1. **停止接受**：立即关闭入站监听，新连接被拒绝（不再有新请求进入）；
+2. **排空存量**：已在途的请求 / 隧道继续完成，不受关停影响，最长等待
+   `timeouts.shutdown`（默认 15s）；
+3. **超时退出**：期限用尽后强制断开仍未结束的连接，记录 warn 日志后退出（退出码 0）。
+
+两类“没有在途数据”的连接会在关停一开始就被立即关闭，避免拖满关停期限：
+
+- 客户端：上游连接池中的空闲（已握手、未发送请求）隧道；
+- 服务端：握手期、尚未读到完整请求的连接（主要是客户端连接池的预热连接）。
+
+排空完成后日志出现 `shutdown: all in-flight connections drained`；超时强制断开时
+出现 `shutdown: timeout exceeded, remaining connections closed`。
+
 ### 服务端 `proxy-server`
 
 ```yaml
@@ -171,7 +189,7 @@ tls: { cert_file: server.crt, key_file: server.key }
 users:                       # 每个客户端分配独立凭据
   - { username: alice, password: change-me-alice }
 decoy_file: ""               # 可选：认证失败时的伪装页面
-timeouts: { dial: 10s, handshake: 10s, idle: 90s }
+timeouts: { dial: 10s, handshake: 10s, idle: 90s, shutdown: 15s }
 metrics:  { listen: "127.0.0.1:9200" } # 指标与运维端点（/metrics、/health、/stats）
 log:      { level: info, format: json }
 ```
@@ -289,6 +307,8 @@ curl -s http://127.0.0.1:9100/stats
 - `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
 - 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
 - 尚未提供 systemd 单元与发行包，请通过源码构建使用。
+- 关停期间不接受新连接；超过 `timeouts.shutdown` 仍未结束的连接会被强制断开
+  （日志中有明确记录），这是有意的“有限期 drain”语义。
 
 ## 项目结构
 
@@ -329,7 +349,8 @@ curl -s http://127.0.0.1:9100/stats
 
 端到端测试使用本机回环与自签证书，覆盖：CONNECT 转发成功率（100 次请求，
 验收线 ≥95%）、三节点轮询、节点故障转移、连接池预热与领取命中、私网直连、
-SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
+优雅关停排空（存量请求不被中断、新连接被拒绝）、SOCKS5 与入站认证、
+指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
 

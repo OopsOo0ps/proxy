@@ -23,6 +23,7 @@ timeouts:
   dial: 10s
   handshake: 10s
   idle: 90s
+  shutdown: 15s   # 优雅关停：停止接受新连接后，等待存量隧道结束的最长时间
 
 # 指标与运维端点（/metrics、/health、/stats）；建议只监听本机或置于防火墙之后。
 metrics:

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"gopkg.in/yaml.v3"
 )
 
@@ -116,8 +117,11 @@ type Routing struct {
 // Timeouts 是各类超时。
 type Timeouts struct {
 	Dial      Duration `yaml:"dial"`      // 建立目标/节点连接
-	Handshake Duration `yaml:"handshake"` // 隧道握手（TLS + Trojan）
+	Handshake Duration `yaml:"handshake"` // 握手阶段（TLS + 协议协商）
 	Idle      Duration `yaml:"idle"`      // 连接空闲回收
+	// Shutdown 是优雅关停的排空期限：收到 SIGTERM 后先停止接受新连接，
+	// 允许存量请求在此期间自然结束，超时后强制断开剩余连接并退出。
+	Shutdown Duration `yaml:"shutdown"`
 }
 
 // Metrics 是运维端点（/metrics、/health、/stats）的监听配置。
@@ -249,6 +253,9 @@ func applyTimeoutDefaults(t *Timeouts) {
 	}
 	if t.Idle == 0 {
 		t.Idle = Duration(90 * time.Second)
+	}
+	if t.Shutdown == 0 {
+		t.Shutdown = Duration(shutdown.DefaultTimeout)
 	}
 }
 
@@ -402,6 +409,9 @@ func validateTimeouts(t Timeouts) error {
 	}
 	if t.Idle <= 0 {
 		return errors.New("timeouts.idle: must be positive")
+	}
+	if t.Shutdown <= 0 {
+		return errors.New("timeouts.shutdown: must be positive")
 	}
 	return nil
 }

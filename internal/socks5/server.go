@@ -19,6 +19,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
+	"github.com/OopsOo0ps/proxy/internal/shutdown"
 )
 
 var (
@@ -45,20 +46,33 @@ type Server struct {
 	HandshakeTimeout time.Duration
 	// IdleTimeout 连接空闲回收；<=0 时使用 90s。
 	IdleTimeout time.Duration
+	// ShutdownTimeout 关停时等待存量连接结束的最长时间；<=0 时使用默认值 15s。
+	ShutdownTimeout time.Duration
 }
 
-// Serve 在 ln 上接受并处理 SOCKS5 连接，ctx 取消后关闭监听并等待存量连接退出。
+// Serve 在 ln 上接受并处理 SOCKS5 连接；ctx 取消后优雅关停：
+// 先停止接受新连接，让存量连接在关停期限内自然结束，超时后强制断开。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	// handlerCtx 与关停信号解耦：收到关停后存量连接继续处理，
+	// 只有超过关停期限（forceCancel）才被打断。
+	handlerCtx, forceCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer forceCancel()
+
 	var wg sync.WaitGroup
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
+		case <-done:
+		}
 	}()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
-				wg.Wait()
+				s.drain(&wg, forceCancel)
 				return nil
 			}
 			return err
@@ -66,13 +80,28 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			s.handle(ctx, conn)
+			s.handle(handlerCtx, conn)
 		}()
 	}
 }
 
+// drain 排空存量连接；超过关停期限后强制中断仍阻塞的连接。
+func (s *Server) drain(wg *sync.WaitGroup, forceCancel context.CancelFunc) {
+	s.logger().Info("shutdown: stopped accepting new connections",
+		"drain_timeout", s.shutdownTimeout().String())
+	if shutdown.Wait(wg, s.shutdownTimeout(), forceCancel) {
+		s.logger().Info("shutdown: all in-flight connections drained")
+		return
+	}
+	s.logger().Warn("shutdown: timeout exceeded, remaining connections closed")
+}
+
 func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	defer func() { _ = raw.Close() }()
+
+	// 强制关停时打断握手期连接，保证进程按期退出。
+	stopForce := context.AfterFunc(ctx, func() { _ = raw.SetDeadline(time.Now()) })
+	defer stopForce()
 
 	start := time.Now()
 	reqID := logging.NewRequestID()
@@ -268,4 +297,11 @@ func (s *Server) idleTimeout() time.Duration {
 		return 90 * time.Second
 	}
 	return s.IdleTimeout
+}
+
+func (s *Server) shutdownTimeout() time.Duration {
+	if s.ShutdownTimeout <= 0 {
+		return shutdown.DefaultTimeout
+	}
+	return s.ShutdownTimeout
 }

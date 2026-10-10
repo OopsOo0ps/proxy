@@ -91,11 +91,13 @@ func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
 	})
 
 	app.httpSrv = &httpproxy.Server{
-		Auth:        store,
-		Dialer:      targetDialer,
-		Logger:      logger,
-		Metrics:     app.metrics,
-		IdleTimeout: cfg.Timeouts.Idle.Std(),
+		Auth:              store,
+		Dialer:            targetDialer,
+		Logger:            logger,
+		Metrics:           app.metrics,
+		IdleTimeout:       cfg.Timeouts.Idle.Std(),
+		ReadHeaderTimeout: cfg.Timeouts.Handshake.Std(),
+		ShutdownTimeout:   cfg.Timeouts.Shutdown.Std(),
 	}
 	app.socksSrv = &socks5.Server{
 		Auth:             store,
@@ -104,6 +106,7 @@ func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
 		Metrics:          app.metrics,
 		HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
 		IdleTimeout:      cfg.Timeouts.Idle.Std(),
+		ShutdownTimeout:  cfg.Timeouts.Shutdown.Std(),
 	}
 	return app, nil
 }
@@ -146,6 +149,12 @@ func (a *App) Serve(ctx context.Context) error {
 	if a.connPool != nil {
 		a.connPool.Start(ctx)
 		defer a.connPool.Close()
+		// 关停一开始就释放池内空闲连接：它们没有在途数据，
+		// 提前关闭既让服务端尽快回收，也避免排空期的新请求再领取。
+		go func() {
+			<-ctx.Done()
+			a.connPool.Close()
+		}()
 	}
 
 	errCh := make(chan error, 3)
