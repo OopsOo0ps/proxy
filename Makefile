@@ -3,8 +3,10 @@
 # 常用目标：
 #   make build   构建全部二进制到 bin/
 #   make test    运行全部单元测试
+#   make cover   运行测试并打印总覆盖率
 #   make lint    运行 golangci-lint（首次自动下载到 .bin/，带校验）
 #   make run     构建并前台启动 proxy-server
+#   make dev-cert 生成本地演示用自签证书（var/）
 # 完整目标列表见 make help。
 #
 # 提示：网络受限时可用镜像覆盖下载源，例如：
@@ -28,7 +30,7 @@ GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
-.PHONY: all build test lint fmt vet run run-server run-client run-controller clean help
+.PHONY: all build test cover lint fmt vet run run-server run-client run-controller dev-cert clean help
 
 all: build
 
@@ -40,6 +42,10 @@ build:
 
 test:
 	$(GO) test ./...
+
+cover:
+	$(GO) test -coverprofile=coverage.out ./...
+	@$(GO) tool cover -func=coverage.out | tail -1
 
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run
@@ -84,6 +90,14 @@ run-client: build
 run-controller: build
 	$(BIN_DIR)/proxy-controller
 
+dev-cert:
+	@mkdir -p var
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+		-keyout var/dev-key.pem -out var/dev-cert.pem \
+		-days 365 -nodes -subj "/CN=localhost" \
+		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+	@echo "已生成 var/dev-cert.pem 与 var/dev-key.pem"
+
 clean:
 	rm -rf $(BIN_DIR) $(TOOL_DIR)
 
@@ -92,10 +106,12 @@ help:
 		'可用目标：' \
 		'  build           构建全部二进制到 bin/' \
 		'  test            运行全部单元测试' \
+		'  cover           运行测试并打印总覆盖率' \
 		'  lint            运行 golangci-lint' \
 		'  fmt             格式化代码（go fmt）' \
 		'  vet             运行 go vet' \
 		'  run             构建并前台启动 proxy-server' \
 		'  run-client      构建并前台启动 proxy-client' \
 		'  run-controller  运行 proxy-controller' \
+		'  dev-cert        生成本地演示用自签证书到 var/' \
 		'  clean           清理 bin/ 与 .bin/'
