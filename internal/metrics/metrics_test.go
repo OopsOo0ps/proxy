@@ -105,3 +105,35 @@ func TestActiveByProtoSnapshot(t *testing.T) {
 		t.Fatalf("after close http = %d, want 1", got)
 	}
 }
+
+func TestPoolMetrics(t *testing.T) {
+	m := New()
+	m.PoolClaim(PoolClaimHit, "n1")
+	m.PoolClaim(PoolClaimHit, "n1")
+	m.PoolClaim(PoolClaimMiss, "n1")
+	m.PoolClaim(PoolClaimStale, "n2")
+	m.SetPoolIdle("n1", 2)
+	m.PoolWarmFailed("n2")
+
+	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n1", PoolClaimHit)); got != 2 {
+		t.Fatalf("claims{n1,hit} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n1", PoolClaimMiss)); got != 1 {
+		t.Fatalf("claims{n1,miss} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n2", PoolClaimStale)); got != 1 {
+		t.Fatalf("claims{n2,stale} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.poolIdle.WithLabelValues("n1")); got != 2 {
+		t.Fatalf("idle{n1} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.poolWarmFails.WithLabelValues("n2")); got != 1 {
+		t.Fatalf("warm_failures{n2} = %v, want 1", got)
+	}
+
+	// nil 接收者不应 panic。
+	var nilMetrics *Metrics
+	nilMetrics.PoolClaim(PoolClaimHit, "n1")
+	nilMetrics.SetPoolIdle("n1", 0)
+	nilMetrics.PoolWarmFailed("n1")
+}

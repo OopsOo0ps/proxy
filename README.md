@@ -45,6 +45,7 @@ flowchart LR
 | HTTP/HTTPS 入站 | 支持 `CONNECT` 隧道与绝对地址形式的 HTTP 请求转发 |
 | SOCKS5 入站 | TCP `CONNECT`；用户名/密码认证可选（RFC 1928 / RFC 1929） |
 | 隧道出站 | Trojan over TLS；出口节点轮询、失败自动切换与冷却退避 |
+| 连接池 | 上游隧道预热池：启动预热、请求领取，省去一次完整握手；空闲数与 TTL 可配，失效自动回退新建 |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
@@ -93,6 +94,8 @@ curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duratio
 - 直接访问节点 `https://127.0.0.1:18443` 会看到一张中性的伪装网页（不暴露代理存在）。
 - 客户端日志（`configs/local/client.yaml` 中 `format: json`）包含逐请求的
   `request_id`、`client_ip`、`upstream`、`duration` 字段。
+- 客户端默认会为每个节点预热空闲隧道（每节点 2 条），可在 `/metrics` 中通过
+  `upstream_pool_*` 指标观察预热与领取情况。
 
 ### 生产部署（示意）
 
@@ -128,6 +131,10 @@ nodes:                      # 出口节点（Trojan over TLS），建议 ≥3
   - addr: "node3.example.com:443"
     password: node3-token
 
+pool:                       # 上游空闲隧道连接池（预热复用）
+  max_idle: 2               # 每节点最大空闲连接数；0 = 关闭
+  idle_ttl: 5s              # 空闲连接最长保留时间；应小于服务端 handshake 超时
+
 tls:
   ca_file: ""                 # 自签证书时填写 CA 路径
   insecure_skip_verify: false # 仅调试：跳过证书校验
@@ -143,6 +150,18 @@ log:      { level: info, format: json }   # json | text
 ```
 
 入口校验：监听非环回地址时必须配置 `inbound.auth`，否则启动直接报错。
+
+#### 上游连接池（预热复用）
+
+`proxy-client` 会为每个出口节点预热 `pool.max_idle` 条“已完成 TLS 握手、尚未发送请求”
+的空闲隧道连接；请求到来时直接领取并补发 Trojan 请求，省去一次到节点的完整握手往返。
+
+- 领取时做存活探测：服务端已关闭、或已按握手超时回收的连接会被丢弃并回退新建，
+  失效领取不计入节点失败，不影响既有的冷却与故障切换；
+- 空闲超过 `pool.idle_ttl` 的连接会被回收；请保持该值小于服务端
+  `timeouts.handshake`（默认 10s），否则连接可能在池中已被服务端回收；
+- 预热采用“启动预热 + 领取后按需补齐”，空闲期不产生周期性握手流量；
+- 预热拨号失败只计数与记录 debug 日志，节点健康仍由真实请求的被动拨号更新。
 
 ### 服务端 `proxy-server`
 
@@ -187,9 +206,14 @@ rules:
 | `requests_total` | counter | `proto`、`route`、`result` | 代理请求总数（含失败分类） |
 | `request_duration_seconds` | histogram | `proto`、`route` | 请求耗时（秒） |
 | `active_connections` | gauge | `proto` | 当前活跃连接数 |
+| `upstream_pool_claims_total` | counter | `node`、`result` | 空闲连接领取结果（`hit` / `miss` / `stale`） |
+| `upstream_pool_idle_connections` | gauge | `node` | 各节点当前空闲（已握手待用）连接数 |
+| `upstream_pool_warm_failures_total` | counter | `node` | 后台预热拨号失败次数 |
 
 `proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
 `result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
+`upstream_pool_*` 系列仅 `proxy-client` 输出：连接池默认开启（`pool.max_idle: 2`），
+关闭后不产生这些序列。
 
 ```sh
 curl -s http://127.0.0.1:19100/metrics | grep requests_total
@@ -207,7 +231,7 @@ curl -s http://127.0.0.1:9100/health
 
 curl -s http://127.0.0.1:9100/stats
 # {"version":"...","uptime":12.34,"connections":{"http":1,"total":1},
-#  "upstreams":[{"addr":"node1:443","healthy":true,"fails":0,"cooldown_remaining":0}],
+#  "upstreams":[{"addr":"node1:443","healthy":true,"fails":0,"cooldown_remaining":0,"idle":2}],
 #  "memory":{"alloc_bytes":...,"sys_bytes":...,"num_gc":...,"goroutines":...}}
 ```
 
@@ -216,7 +240,8 @@ curl -s http://127.0.0.1:9100/stats
   - `proxy-client`：配置了出口节点且没有任何健康节点（全部处于冷却）时不可用；
   - `proxy-server`：TLS 证书在运行中过期时不可用。
 - `GET /stats`：运行时快照，字段见上例。`upstreams` 仅 `proxy-client` 输出；
-  `proxy-server` 的 `connections` 只统计隧道连接。
+  `proxy-server` 的 `connections` 只统计隧道连接。`upstreams[].idle` 是当前空闲
+  预热连接数（未启用连接池时为 0）。
 - 两个端点均只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
   请仅在环回地址或防火墙之后暴露。
 - 节点健康状态来源于真实拨号的被动更新（失败后进入冷却），不发送主动探测；
@@ -257,6 +282,10 @@ curl -s http://127.0.0.1:9100/stats
   当前仅代理 TCP（返回标准「命令不支持」响应并在日志中记录）。
 - **暂不支持 TUN**：没有全局透明代理/虚拟网卡模式，仅提供 HTTP/HTTPS 与 SOCKS5 入站，
   未配置代理的程序不会被自动接管。
+- **连接池的边界**：预热连接会在服务端占用同数量的“待用连接”，并非永远有效——
+  空闲超过服务端 `timeouts.handshake` 的连接会被服务端回收，客户端领取时通过
+  存活探测丢弃并回退新建。请保持 `pool.idle_ttl`（默认 5s）小于服务端握手超时
+  （默认 10s）；节点不可达时预热会失败并计入 `upstream_pool_warm_failures_total`。
 - `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
 - 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
 - 尚未提供 systemd 单元与发行包，请通过源码构建使用。
@@ -299,8 +328,8 @@ curl -s http://127.0.0.1:9100/stats
 - `make dev-cert`：生成本地演示用自签证书
 
 端到端测试使用本机回环与自签证书，覆盖：CONNECT 转发成功率（100 次请求，
-验收线 ≥95%）、三节点轮询、节点故障转移、私网直连、SOCKS5 与入站认证、
-指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
+验收线 ≥95%）、三节点轮询、节点故障转移、连接池预热与领取命中、私网直连、
+SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
 
@@ -310,6 +339,7 @@ curl -s http://127.0.0.1:9100/stats
 - [x] 客户端 ↔ 服务端隧道（Trojan over TLS，多节点）
 - [x] 基础域名分流与内网直连
 - [x] 认证、结构化日志、Prometheus 指标
+- [x] 连接池（上游隧道预热复用）与转发缓冲复用（`sync.Pool`）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式

@@ -16,6 +16,11 @@ nodes:
   - addr: "127.0.0.1:18445"
     password: local-node-3
 
+# 演示：每个节点预热 2 条空闲隧道（默认值，可在 /metrics 观察 upstream_pool_* 指标）。
+pool:
+  max_idle: 2
+  idle_ttl: 5s
+
 tls:
   insecure_skip_verify: true  # 本机自签证书演示
 

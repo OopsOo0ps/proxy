@@ -22,6 +22,11 @@ nodes:
   - addr: "node3.example.com:443"
     password: node3-token
 
+# 上游空闲隧道连接池（预热复用）：请求优先领取已握手的空闲连接，省去一次完整握手。
+pool:
+  max_idle: 2   # 每个节点保留的最大空闲连接数；0 = 关闭
+  idle_ttl: 5s  # 空闲连接最长保留时间；应小于服务端 timeouts.handshake（默认 10s）
+
 # 连接出口节点的 TLS 参数。
 tls:
   ca_file: ""                 # 使用自签证书时填写 CA 证书路径

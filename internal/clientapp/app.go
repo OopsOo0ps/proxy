@@ -15,6 +15,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/httpproxy"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
@@ -36,8 +37,9 @@ type App struct {
 	httpSrv  *httpproxy.Server
 	socksSrv *socks5.Server
 
-	pool   *nodes.Pool
-	status *status.Status
+	pool     *nodes.Pool    // 出口节点选择/冷却
+	connPool *connpool.Pool // 上游空闲隧道连接池（预热）
+	status   *status.Status
 
 	httpLn     net.Listener
 	socksLn    net.Listener
@@ -62,7 +64,17 @@ func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
 
 	app := &App{cfg: cfg, logger: logger, metrics: metrics.New()}
 
-	pool, err := buildPool(cfg)
+	baseTLS, err := buildClientTLS(cfg)
+	if err != nil {
+		return nil, err
+	}
+	connPool, err := buildConnPool(cfg, baseTLS, app.metrics, logger)
+	if err != nil {
+		return nil, err
+	}
+	app.connPool = connPool
+
+	pool, err := buildNodePool(cfg, baseTLS, connPool)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +142,11 @@ func (a *App) Listen() error {
 func (a *App) Serve(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	if a.connPool != nil {
+		a.connPool.Start(ctx)
+		defer a.connPool.Close()
+	}
 
 	errCh := make(chan error, 3)
 	running := 0
@@ -218,12 +235,14 @@ func (a *App) runtimeStats() status.Runtime {
 		},
 	}
 	if a.pool != nil {
+		idle := a.connPool.IdleCounts()
 		for _, n := range a.pool.Snapshot() {
 			rt.Upstreams = append(rt.Upstreams, status.Upstream{
 				Addr:              n.Addr,
 				Healthy:           n.Healthy,
 				Fails:             n.Fails,
 				CooldownRemaining: status.Seconds(n.CooldownRemaining),
+				Idle:              idle[n.Addr],
 			})
 		}
 	}
@@ -260,16 +279,16 @@ func buildAuth(cfg *config.Client) (*auth.Store, error) {
 	return auth.NewStore(users)
 }
 
-// buildPool 构建出口节点池；未配置节点时返回 nil（仅直连）。
-func buildPool(cfg *config.Client) (*nodes.Pool, error) {
+// buildNodePool 构建出口节点池；未配置节点时返回 nil（仅直连）。
+// 拨号优先从预热连接池领取空闲隧道；未命中或领取失效时新建隧道。
+func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.Pool) (*nodes.Pool, error) {
 	if len(cfg.Nodes) == 0 {
 		return nil, nil
 	}
-	baseTLS, err := buildClientTLS(cfg)
-	if err != nil {
-		return nil, err
-	}
 	dialFn := func(ctx context.Context, node config.Node, host string, port uint16) (net.Conn, error) {
+		if conn, ok := connPool.Claim(ctx, node.Addr, host, port); ok {
+			return conn, nil
+		}
 		nodeTLS := baseTLS.Clone()
 		if node.SNI != "" {
 			nodeTLS.ServerName = node.SNI
@@ -283,6 +302,52 @@ func buildPool(cfg *config.Client) (*nodes.Pool, error) {
 		}, host, port)
 	}
 	return nodes.New(cfg.Nodes, dialFn, nodes.Options{})
+}
+
+// buildConnPool 构建上游空闲隧道连接池；未启用（max_idle = 0）或未配置节点时返回 nil。
+func buildConnPool(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, logger *slog.Logger) (*connpool.Pool, error) {
+	maxIdle := cfg.Pool.EffectiveMaxIdle()
+	if maxIdle <= 0 || len(cfg.Nodes) == 0 {
+		return nil, nil
+	}
+	specs := make([]connpool.Node, 0, len(cfg.Nodes))
+	for _, node := range cfg.Nodes {
+		node := node
+		nodeTLS := baseTLS.Clone()
+		if node.SNI != "" {
+			nodeTLS.ServerName = node.SNI
+		}
+		hash := auth.SHA224Hex(node.Password)
+		specs = append(specs, connpool.Node{
+			Addr: node.Addr,
+			// 预热只完成 TCP+TLS 握手；Trojan 请求在领取时补发（Start）。
+			Dial: func(ctx context.Context) (net.Conn, error) {
+				return trojan.Connect(ctx, trojan.ClientConfig{
+					ServerAddr:       node.Addr,
+					Password:         node.Password,
+					TLSConfig:        nodeTLS,
+					DialTimeout:      cfg.Timeouts.Dial.Std(),
+					HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
+				})
+			},
+			Start: func(conn net.Conn, host string, port uint16) error {
+				if err := trojan.StartRequest(conn, hash, host, port, cfg.Timeouts.Handshake.Std()); err != nil {
+					return fmt.Errorf("trojan: write request to %s: %w", node.Addr, err)
+				}
+				return nil
+			},
+		})
+	}
+	connPool, err := connpool.New(specs, connpool.Options{
+		MaxIdle: maxIdle,
+		IdleTTL: cfg.Pool.EffectiveIdleTTL(),
+		Logger:  logger,
+		Metrics: m,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return connPool, nil
 }
 
 func buildClientTLS(cfg *config.Client) (*tls.Config, error) {

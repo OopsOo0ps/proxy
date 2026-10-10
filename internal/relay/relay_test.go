@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strings"
@@ -207,5 +208,72 @@ func TestIsExpected(t *testing.T) {
 	if IsExpected(context.DeadlineExceeded) {
 		// context.DeadlineExceeded 不在预期列表内（由调用方决定语义）。
 		t.Fatal("deadline exceeded should not be classified as expected by default")
+	}
+}
+
+// BenchmarkCopyLoopPooled 测量真实转发路径（缓冲来自 sync.Pool）：
+// 每次迭代搬运 1MiB，观察 allocs/op 以佐证缓冲复用效果。
+//
+// 用内存管道（net.Pipe）而非 TCP：基准关注的是缓冲分配而非网络性能，
+// 大量迭代下逐次建立 TCP 连接会耗尽本机临时端口；内存管道无此问题，
+// 且每次迭代建立管道的少量分配在两组对照中相同，不影响差值。
+func BenchmarkCopyLoopPooled(b *testing.B) { benchmarkCopyLoop(b, true) }
+
+// BenchmarkCopyLoopUnpooled 是对照组：每次连接新建 32KiB 缓冲，
+// 两组 allocs/op 的差值即为缓冲复用省下的分配。
+func BenchmarkCopyLoopUnpooled(b *testing.B) { benchmarkCopyLoop(b, false) }
+
+func benchmarkCopyLoop(b *testing.B, pooled bool) {
+	const payloadSize = 1 << 20 // 1MiB
+	payload := bytes.Repeat([]byte("0123456789abcdef"), payloadSize/16)
+	drainBuf := make([]byte, relayBufSize) // 循环外创建，避免污染分配统计
+
+	b.SetBytes(payloadSize)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		src, srcPeer := net.Pipe()
+		dst, dstPeer := net.Pipe()
+		drainDone := make(chan struct{})
+		go func() {
+			defer close(drainDone)
+			for {
+				if _, err := dstPeer.Read(drainBuf); err != nil {
+					return
+				}
+			}
+		}()
+		feederDone := make(chan struct{})
+		go func() {
+			defer close(feederDone)
+			_, _ = srcPeer.Write(payload)
+			_ = srcPeer.Close()
+		}()
+		b.StartTimer()
+
+		var (
+			n   int64
+			err error
+		)
+		if pooled {
+			n, err = copyLoop(dst, src, 0)
+		} else {
+			n, err = copyLoopWithBuffer(dst, src, 0, make([]byte, relayBufSize))
+		}
+
+		b.StopTimer()
+		if err != nil && !errors.Is(err, io.EOF) {
+			b.Fatalf("copyLoop: %v", err)
+		}
+		if n != payloadSize {
+			b.Fatalf("copied %d bytes, want %d", n, payloadSize)
+		}
+		<-feederDone
+		_ = dstPeer.Close()
+		<-drainDone
+		_ = src.Close()
+		_ = srcPeer.Close()
+		_ = dst.Close()
 	}
 }

@@ -64,6 +64,7 @@ type Upstream struct {
 	Healthy           bool    `json:"healthy"`
 	Fails             int     `json:"fails"`
 	CooldownRemaining float64 `json:"cooldown_remaining"` // 冷却剩余秒数
+	Idle              int     `json:"idle"`               // 空闲预热连接数；未启用连接池时为 0
 }
 
 // Memory 是进程内存与运行时统计。

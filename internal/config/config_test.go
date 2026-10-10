@@ -93,6 +93,71 @@ nodes:
 	if cfg.Log.Level != "info" || cfg.Log.Format != "json" {
 		t.Fatalf("default log = %+v, want info/json", cfg.Log)
 	}
+	if got := cfg.Pool.EffectiveMaxIdle(); got != 2 {
+		t.Fatalf("default pool.max_idle = %d, want 2", got)
+	}
+	if got := cfg.Pool.EffectiveIdleTTL(); got != 5*time.Second {
+		t.Fatalf("default pool.idle_ttl = %v, want 5s", got)
+	}
+}
+
+func TestParseClientPoolOverrides(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	// 显式配置生效。
+	cfg, err := ParseClient([]byte(base + `
+pool:
+  max_idle: 4
+  idle_ttl: 2s
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Pool.EffectiveMaxIdle(); got != 4 {
+		t.Fatalf("pool.max_idle = %d, want 4", got)
+	}
+	if got := cfg.Pool.EffectiveIdleTTL(); got != 2*time.Second {
+		t.Fatalf("pool.idle_ttl = %v, want 2s", got)
+	}
+
+	// 显式关闭：max_idle = 0 不会被默认值覆盖。
+	cfg, err = ParseClient([]byte(base + `
+pool:
+  max_idle: 0
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Pool.EffectiveMaxIdle(); got != 0 {
+		t.Fatalf("pool.max_idle = %d, want 0（显式关闭）", got)
+	}
+}
+
+func TestParseClientRejectsBadPool(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	cases := map[string]string{
+		"negative max_idle": base + "pool:\n  max_idle: -1\n",
+		"negative idle_ttl": base + "pool:\n  idle_ttl: -1s\n",
+		"unknown pool key":  base + "pool:\n  max_idle2: 1\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseClient([]byte(yaml)); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
 }
 
 func TestParseClientDurationSecondsFallback(t *testing.T) {

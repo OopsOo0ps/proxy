@@ -1,9 +1,12 @@
-// Package metrics 提供 Prometheus 指标：请求计数、耗时、活跃连接与节点拨号。
+// Package metrics 提供 Prometheus 指标：请求计数、耗时、活跃连接与上游连接池。
 //
-// 核心指标名与需求 1.7 一致：
+// 核心指标名与需求 1.7 / 2.3 一致：
 //   - requests_total（counter，标签 proto/route/result）
 //   - request_duration_seconds（histogram，标签 proto/route）
 //   - active_connections（gauge，标签 proto）
+//   - upstream_pool_claims_total（counter，标签 node/result）
+//   - upstream_pool_idle_connections（gauge，标签 node）
+//   - upstream_pool_warm_failures_total（counter，标签 node）
 package metrics
 
 import (
@@ -36,13 +39,23 @@ const (
 	ResultError    = "error"
 )
 
+// 连接池领取结果标签值：命中 / 池内无可用连接 / 池内连接已失效。
+const (
+	PoolClaimHit   = "hit"
+	PoolClaimMiss  = "miss"
+	PoolClaimStale = "stale"
+)
+
 // Metrics 聚合全部指标。请使用 New 构造；方法对 nil 接收者安全（no-op），
 // 便于在不需要指标的测试中省略构造。
 type Metrics struct {
-	registry *prometheus.Registry
-	requests *prometheus.CounterVec
-	duration *prometheus.HistogramVec
-	active   *prometheus.GaugeVec
+	registry      *prometheus.Registry
+	requests      *prometheus.CounterVec
+	duration      *prometheus.HistogramVec
+	active        *prometheus.GaugeVec
+	poolClaims    *prometheus.CounterVec
+	poolIdle      *prometheus.GaugeVec
+	poolWarmFails *prometheus.CounterVec
 }
 
 // New 创建独立的指标集合（使用私有 registry，不污染全局默认值）。
@@ -62,8 +75,20 @@ func New() *Metrics {
 			Name: "active_connections",
 			Help: "Number of currently active connections.",
 		}, []string{"proto"}),
+		poolClaims: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "upstream_pool_claims_total",
+			Help: "Total number of idle upstream connection claims by result (hit/miss/stale).",
+		}, []string{"node", "result"}),
+		poolIdle: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "upstream_pool_idle_connections",
+			Help: "Number of idle pre-warmed upstream connections per node.",
+		}, []string{"node"}),
+		poolWarmFails: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "upstream_pool_warm_failures_total",
+			Help: "Total number of background warm-up dial failures per node.",
+		}, []string{"node"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails)
 	m.preInitialize()
 	return m
 }
@@ -139,4 +164,28 @@ func (m *Metrics) ConnClosed(proto string) {
 		return
 	}
 	m.active.WithLabelValues(proto).Dec()
+}
+
+// PoolClaim 记录一次空闲连接领取结果（hit / miss / stale）。
+func (m *Metrics) PoolClaim(result, node string) {
+	if m == nil {
+		return
+	}
+	m.poolClaims.WithLabelValues(node, result).Inc()
+}
+
+// SetPoolIdle 记录某出口节点当前的预热空闲连接数。
+func (m *Metrics) SetPoolIdle(node string, n int) {
+	if m == nil {
+		return
+	}
+	m.poolIdle.WithLabelValues(node).Set(float64(n))
+}
+
+// PoolWarmFailed 记录一次后台预热拨号失败。
+func (m *Metrics) PoolWarmFailed(node string) {
+	if m == nil {
+		return
+	}
+	m.poolWarmFails.WithLabelValues(node).Inc()
 }

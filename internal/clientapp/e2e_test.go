@@ -37,6 +37,8 @@ func testTimeouts() config.Timeouts {
 
 func boolPtr(b bool) *bool { return &b }
 
+func intPtr(v int) *int { return &v }
+
 // serverHandle 封装一个测试用 proxy-server。
 type serverHandle struct {
 	addr        string
@@ -799,5 +801,47 @@ func TestE2EHealthReportsNodesCooling(t *testing.T) {
 	up := stats.Upstreams[0]
 	if up.Healthy || up.Fails != 1 || up.CooldownRemaining <= 0 {
 		t.Fatalf("upstream = %+v, want 冷却中（1 次失败）", up)
+	}
+}
+
+func TestE2EUpstreamPoolClaimHit(t *testing.T) {
+	h := startServer(t, "node-secret", nil, false)
+	target := startTLSTarget(t)
+
+	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg.Pool = config.Pool{MaxIdle: intPtr(2), IdleTTL: config.Duration(3 * time.Second)}
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	app := startClient(t, cfg, nil)
+
+	// 启动预热完成后应有 2 条空闲隧道。
+	idleMetric := `upstream_pool_idle_connections{node="` + h.addr + `"}`
+	waitForMetric(t, app.MetricsAddr(), idleMetric+" 2")
+
+	// 首次请求应命中预热连接（领取计数 hit），而非新建握手。
+	client := browser(t, "http://"+app.HTTPAddr(), 1)
+	resp, err := client.Get(target.URL)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	waitForMetric(t, app.MetricsAddr(), `upstream_pool_claims_total{node="`+h.addr+`",result="hit"} 1`)
+
+	// 领取后异步补齐，/stats 中应能看到空闲连接数恢复为 2。
+	waitForMetric(t, app.MetricsAddr(), idleMetric+" 2")
+	var stats struct {
+		Upstreams []struct {
+			Addr string `json:"addr"`
+			Idle int    `json:"idle"`
+		} `json:"upstreams"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/stats", &stats); code != http.StatusOK {
+		t.Fatalf("/stats status = %d, want 200", code)
+	}
+	if len(stats.Upstreams) != 1 || stats.Upstreams[0].Addr != h.addr || stats.Upstreams[0].Idle != 2 {
+		t.Fatalf("upstreams = %+v, want %s idle=2", stats.Upstreams, h.addr)
 	}
 }
