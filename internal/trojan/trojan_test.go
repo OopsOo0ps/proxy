@@ -1,0 +1,409 @@
+package trojan
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
+	"errors"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/OopsOo0ps/proxy/internal/auth"
+	"github.com/OopsOo0ps/proxy/internal/socks5"
+	"github.com/OopsOo0ps/proxy/internal/testutil"
+)
+
+func TestWriteReadRequestRoundTrip(t *testing.T) {
+	hash := auth.SHA224Hex("secret")
+	cases := []struct {
+		host string
+		port uint16
+	}{
+		{"example.com", 443},
+		{"1.2.3.4", 80},
+		{"::1", 8443},
+	}
+	for _, tc := range cases {
+		var buf bytes.Buffer
+		if err := WriteRequest(&buf, hash, tc.host, tc.port); err != nil {
+			t.Fatalf("WriteRequest: %v", err)
+		}
+		req, err := ReadRequest(bufio.NewReader(&buf))
+		if err != nil {
+			t.Fatalf("ReadRequest: %v", err)
+		}
+		if req.PasswordHash != hash {
+			t.Fatalf("hash = %q, want %q", req.PasswordHash, hash)
+		}
+		if req.Command != socks5.CmdConnect {
+			t.Fatalf("command = %#x, want connect", req.Command)
+		}
+		if req.Host != tc.host || req.Port != tc.port {
+			t.Fatalf("target = (%q, %d), want (%q, %d)", req.Host, req.Port, tc.host, tc.port)
+		}
+	}
+}
+
+func TestWriteRequestFormat(t *testing.T) {
+	hash := auth.SHA224Hex("pw")
+	var buf bytes.Buffer
+	if err := WriteRequest(&buf, hash, "example.com", 443); err != nil {
+		t.Fatal(err)
+	}
+	raw := buf.Bytes()
+	if !bytes.HasPrefix(raw, []byte(hash+"\r\n")) {
+		t.Fatalf("request should start with hash + CRLF, got %q", raw)
+	}
+	if !bytes.HasSuffix(raw, []byte("\r\n")) {
+		t.Fatalf("request should end with CRLF, got %q", raw)
+	}
+	if !bytes.Contains(raw, []byte{socks5.CmdConnect}) {
+		t.Fatal("request should contain connect command")
+	}
+}
+
+func TestReadRequestRejects(t *testing.T) {
+	cases := map[string]string{
+		"http probe":   "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+		"short hash":   "abc\r\n\x01\x01\x01\x01\x01\x00\x50\r\n",
+		"bad hash hex": strings.Repeat("g", 56) + "\r\n",
+		"no crlf":      strings.Repeat("a", 56) + "\n",
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ReadRequest(bufio.NewReader(strings.NewReader(payload)))
+			if err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+		})
+	}
+
+	// HTTP 探测流量应被识别为“非协议流量”。
+	_, err := ReadRequest(bufio.NewReader(strings.NewReader("GET / HTTP/1.1\r\n\r\n")))
+	if !IsNotProtocol(err) {
+		t.Fatalf("expected IsNotProtocol for HTTP probe, got %v", err)
+	}
+}
+
+func TestReadRequestRejectsOversizedLine(t *testing.T) {
+	long := strings.Repeat("a", MaxHandshakeLine+10) + "\r\n"
+	if _, err := ReadRequest(bufio.NewReader(strings.NewReader(long))); err == nil {
+		t.Fatal("oversized line should be rejected")
+	}
+}
+
+func TestIsPasswordLineValid(t *testing.T) {
+	if !IsPasswordLineValid(strings.Repeat("a1B2", 14)) {
+		t.Fatal("valid hex should pass")
+	}
+	for _, bad := range []string{"", "xyz", strings.Repeat("a", 55), strings.Repeat("a", 57), strings.Repeat("g", 56)} {
+		if IsPasswordLineValid(bad) {
+			t.Fatalf("%q should be invalid", bad)
+		}
+	}
+}
+
+// startEcho 启动回显 TCP 服务。
+func startEcho(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen echo: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				_, _ = io.Copy(conn, conn)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// startTLSServer 启动带自签证书的 Trojan 服务端，返回地址与客户端 TLS 配置。
+func startTLSServer(t *testing.T, srv *Server, handshakeTimeout time.Duration) (string, *tls.Config) {
+	t.Helper()
+	cert, caPEM, err := testutil.NewTLSCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsCfg, err := testutil.ClientTLSConfig(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+
+	if srv.HandshakeTimeout == 0 {
+		srv.HandshakeTimeout = handshakeTimeout
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, tlsLn) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Serve returned %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("Serve did not stop")
+		}
+	})
+	return ln.Addr().String(), tlsCfg
+}
+
+func TestServerHappyPath(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, _ := strconv.ParseUint(portStr, 10, 16)
+
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	}, host, uint16(port))
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	payload := []byte("trojan payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+}
+
+func TestServerAuthFailureServesDecoy(t *testing.T) {
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(context.Context, string) (net.Conn, error) {
+			t.Error("dial must not be called on auth failure")
+			return nil, errors.New("unreachable")
+		},
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	// 错误口令：应返回伪装网页而不是任何代理错误。
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "wrong-password",
+		TLSConfig:  clientTLS,
+	}, "example.com", 443)
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	data, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read decoy: %v", err)
+	}
+	page := string(data)
+	if !strings.HasPrefix(page, "HTTP/1.1 200 OK") {
+		t.Fatalf("decoy should look like an HTTP response, got %q", page)
+	}
+	if !strings.Contains(page, "It works!") {
+		t.Fatalf("decoy page missing expected content: %q", page)
+	}
+	for _, leak := range []string{"trojan", "proxy", "password", "node"} {
+		if strings.Contains(strings.ToLower(page), leak) {
+			t.Fatalf("decoy response leaks %q: %q", leak, page)
+		}
+	}
+}
+
+func TestServerHTTPProbeGetsDecoy(t *testing.T) {
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	// 模拟普通浏览器以 HTTPS 直接访问节点。
+	conn, err := tls.Dial("tcp", nodeAddr, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("GET / HTTP/1.1\r\nHost: node\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !strings.HasPrefix(string(data), "HTTP/1.1 200 OK") {
+		t.Fatalf("probe should receive decoy page, got %q", data)
+	}
+}
+
+func TestServerTargetDialFailureClosesSilently(t *testing.T) {
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("connection refused") },
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	}, "example.com", 443)
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// 官方行为：目标不可达时静默关闭（不发任何数据）。
+	buf := make([]byte, 1)
+	n, err := conn.Read(buf)
+	if err == nil && n > 0 {
+		t.Fatalf("expected silent close, got data %q", buf[:n])
+	}
+	if err == nil {
+		t.Fatal("expected close error")
+	}
+}
+
+func TestServerUnsupportedCommand(t *testing.T) {
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	conn, err := tls.Dial("tcp", nodeAddr, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	addr, _ := socks5.EncodeAddr("example.com", 53)
+	req := append([]byte(auth.SHA224Hex("secret")+"\r\n"), socks5.CmdUDPAssociate)
+	req = append(req, addr...)
+	req = append(req, '\r', '\n')
+	if _, err := conn.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("unsupported command should close the connection silently")
+	}
+}
+
+func TestServerHandshakeTimeout(t *testing.T) {
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 300*time.Millisecond)
+
+	conn, err := tls.Dial("tcp", nodeAddr, clientTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// 什么都不发：服务端应在握手超时后（尝试）返回伪装响应并关闭连接。
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	start := time.Now()
+	if _, err := io.ReadAll(conn); err != nil && !errors.Is(err, io.EOF) {
+		// 连接被对端关闭属于预期行为；仅当读取完全失败（如超时）时才算错误。
+		t.Fatalf("read: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("handshake timeout took %v", elapsed)
+	}
+}
+
+func TestClientDialErrors(t *testing.T) {
+	// 端口无人监听。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedAddr := ln.Addr().String()
+	_ = ln.Close()
+	if _, err := Dial(context.Background(), ClientConfig{ServerAddr: closedAddr, Password: "x"}, "example.com", 443); err == nil {
+		t.Fatal("expected dial error for closed port")
+	}
+
+	// 明文 TCP 服务：TLS 握手应失败。
+	plainLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = plainLn.Close() }()
+	go func() {
+		for {
+			conn, err := plainLn.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	if _, err := Dial(context.Background(), ClientConfig{ServerAddr: plainLn.Addr().String(), Password: "x"}, "example.com", 443); err == nil {
+		t.Fatal("expected TLS handshake error for plain TCP server")
+	}
+}
