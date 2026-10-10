@@ -407,3 +407,113 @@ func TestClientDialErrors(t *testing.T) {
 		t.Fatal("expected TLS handshake error for plain TCP server")
 	}
 }
+
+func TestConnectThenStartRequest(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, _ := strconv.ParseUint(portStr, 10, 16)
+
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	// 预热路径：先只完成 TLS 握手，模拟连接池中的空闲连接。
+	conn, err := Connect(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// 领取路径：停留一段时间后（小于服务端握手超时）再补发 Trojan 请求。
+	time.Sleep(50 * time.Millisecond)
+	if err := StartRequest(conn, auth.SHA224Hex("secret"), host, uint16(port), time.Second); err != nil {
+		t.Fatalf("StartRequest: %v", err)
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	payload := []byte("warm tunnel payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+}
+
+func TestServerShutdownInterruptsPendingHandshake(t *testing.T) {
+	// 客户端连接池会持有"已握手、待发送请求"的连接；服务端关停时
+	// 这类连接应立即被打断，而不是拖满整个握手超时。
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		Verifier: store,
+		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+	}
+	cert, caPEM, err := testutil.NewTLSCertificate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTLS, err := testutil.ClientTLSConfig(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	tlsLn := tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12})
+
+	srv.HandshakeTimeout = 30 * time.Second // 足够长，只有主动打断才能让 Serve 尽快返回
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, tlsLn) }()
+
+	conn, err := Connect(context.Background(), ClientConfig{
+		ServerAddr: ln.Addr().String(),
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not stop; pending handshake connection should be interrupted")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("shutdown took %v, want prompt interruption", elapsed)
+	}
+
+	// 客户端应感知连接已被服务端关闭。
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("client should observe closed connection after shutdown")
+	}
+}

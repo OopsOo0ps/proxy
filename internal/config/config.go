@@ -55,6 +55,38 @@ type Node struct {
 	SNI      string `yaml:"sni"`      // 可选：TLS SNI / 证书校验名，缺省取 addr 的主机名
 }
 
+// Pool 是上游隧道空闲连接池（预热）配置：请求优先复用已完成握手的空闲连接，
+// 减少到出口节点的握手开销；详见 internal/connpool。
+type Pool struct {
+	// MaxIdle 是每个出口节点保留的最大空闲连接数；缺省 2，0 = 关闭。
+	MaxIdle *int `yaml:"max_idle"`
+	// IdleTTL 是空闲连接的最长保留时间，缺省 5s；
+	// 应小于服务端 timeouts.handshake（缺省 10s），否则连接可能在池中已被服务端回收。
+	IdleTTL Duration `yaml:"idle_ttl"`
+}
+
+// 连接池缺省值。
+const (
+	defaultPoolMaxIdle = 2
+	defaultPoolIdleTTL = 5 * time.Second
+)
+
+// EffectiveMaxIdle 返回生效的每节点空闲连接上限（缺省 2，0 = 关闭）。
+func (p Pool) EffectiveMaxIdle() int {
+	if p.MaxIdle == nil {
+		return defaultPoolMaxIdle
+	}
+	return *p.MaxIdle
+}
+
+// EffectiveIdleTTL 返回生效的空闲连接保留时长（缺省 5s）。
+func (p Pool) EffectiveIdleTTL() time.Duration {
+	if p.IdleTTL <= 0 {
+		return defaultPoolIdleTTL
+	}
+	return p.IdleTTL.Std()
+}
+
 // Inbound 描述本机入站代理监听。
 type Inbound struct {
 	HTTP   string `yaml:"http"`   // host:port，空 = 不启用
@@ -103,6 +135,7 @@ type Log struct {
 type Client struct {
 	Inbound  Inbound   `yaml:"inbound"`
 	Nodes    []Node    `yaml:"nodes"`
+	Pool     Pool      `yaml:"pool"`
 	TLS      ClientTLS `yaml:"tls"`
 	Routing  Routing   `yaml:"routing"`
 	Timeouts Timeouts  `yaml:"timeouts"`
@@ -187,6 +220,12 @@ func decodeStrict(data []byte, out any) error {
 
 func (c *Client) applyDefaults() {
 	applyTimeoutDefaults(&c.Timeouts)
+	if c.Pool.MaxIdle == nil {
+		c.Pool.MaxIdle = intPtr(defaultPoolMaxIdle)
+	}
+	if c.Pool.IdleTTL == 0 {
+		c.Pool.IdleTTL = Duration(defaultPoolIdleTTL)
+	}
 	if strings.TrimSpace(c.Routing.Default) == "" {
 		c.Routing.Default = "proxy"
 	}
@@ -231,6 +270,12 @@ func (c *Client) validate() error {
 	}
 	if err := validateTimeouts(c.Timeouts); err != nil {
 		return err
+	}
+	if c.Pool.EffectiveMaxIdle() < 0 {
+		return errors.New("pool.max_idle: must not be negative (0 disables the pool)")
+	}
+	if c.Pool.IdleTTL < 0 {
+		return errors.New("pool.idle_ttl: must not be negative")
 	}
 
 	if c.Inbound.HTTP == "" && c.Inbound.SOCKS5 == "" {
@@ -420,3 +465,5 @@ func isLoopbackListen(addr string) bool {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+func intPtr(v int) *int { return &v }

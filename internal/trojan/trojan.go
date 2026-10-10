@@ -145,9 +145,9 @@ type ClientConfig struct {
 	HandshakeTimeout time.Duration
 }
 
-// Dial 建立到出口节点的 TLS 隧道，并向 target(host, port) 发起 Trojan 请求。
-// 返回的连接已就绪，可直接转发目标协议的原始字节。
-func Dial(ctx context.Context, cfg ClientConfig, host string, port uint16) (net.Conn, error) {
+// Connect 建立到出口节点的 TCP 连接并完成 TLS 握手，但不发送 Trojan 请求。
+// 预热的空闲连接池用它提前完成握手（见 internal/connpool）；常规拨号见 Dial。
+func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 10 * time.Second
 	}
@@ -179,12 +179,34 @@ func Dial(ctx context.Context, cfg ClientConfig, host string, port uint16) (net.
 		_ = raw.Close()
 		return nil, fmt.Errorf("trojan: tls handshake with %s: %w", cfg.ServerAddr, err)
 	}
+	return tconn, nil
+}
 
-	_ = tconn.SetWriteDeadline(time.Now().Add(cfg.HandshakeTimeout))
-	if err := WriteRequest(tconn, auth.SHA224Hex(cfg.Password), host, port); err != nil {
-		_ = tconn.Close()
+// StartRequest 在已完成握手的隧道连接上向 target(host, port) 写出 Trojan 请求。
+// timeout 是写超时（<=0 时默认 10s）；成功后清除写期限，连接可直接用于转发。
+func StartRequest(conn net.Conn, passwordHash, host string, port uint16, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("trojan: set write deadline: %w", err)
+	}
+	if err := WriteRequest(conn, passwordHash, host, port); err != nil {
+		return err
+	}
+	return conn.SetWriteDeadline(time.Time{})
+}
+
+// Dial 建立到出口节点的 TLS 隧道，并向 target(host, port) 发起 Trojan 请求。
+// 返回的连接已就绪，可直接转发目标协议的原始字节。
+func Dial(ctx context.Context, cfg ClientConfig, host string, port uint16) (net.Conn, error) {
+	conn, err := Connect(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := StartRequest(conn, auth.SHA224Hex(cfg.Password), host, port, cfg.HandshakeTimeout); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("trojan: write request to %s: %w", cfg.ServerAddr, err)
 	}
-	_ = tconn.SetDeadline(time.Time{})
-	return tconn, nil
+	return conn, nil
 }

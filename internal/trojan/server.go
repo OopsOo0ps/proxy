@@ -95,10 +95,20 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}()
 
 	_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout()))
+	// 握手阶段对 ctx 取消敏感：服务端关停时立即打断阻塞中的读取。
+	// 客户端连接池会持有"已握手、待发送请求"的预热连接，等待它们
+	// 自然超时会让优雅退出拖满一个握手超时；这类连接没有在途请求，
+	// 直接关闭不丢任何数据。
+	stopWatch := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stopWatch()
 	br := bufio.NewReader(conn)
 
 	req, err := ReadRequest(br)
 	if err != nil {
+		if ctx.Err() != nil {
+			// 关停中断：不再回放伪装页面，直接退出。
+			return
+		}
 		if IsNotProtocol(err) {
 			// 非 Trojan 流量（例如浏览器直接访问）：伪装成普通 Web 服务。
 			logger.Debug("non-protocol traffic, serving decoy", "error", err)
@@ -108,6 +118,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		s.serveDecoy(conn)
 		return
 	}
+	stopWatch()
 
 	user, ok := s.Verifier.VerifyTunnel(req.PasswordHash)
 	if !ok {
