@@ -51,6 +51,7 @@ flowchart LR
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
+| 动态日志级别 | 运维端点 `GET/PUT /log/level` 运行时切换 debug/info/warn/error，无需重启 |
 | 指标 | `/metrics` 暴露 `requests_total`、`request_duration_seconds`、`active_connections` |
 | 健康检查 | `/health` 存活与依赖检查；依赖不可用时返回 503（`proxy-client` 检查出口节点池，`proxy-server` 检查 TLS 证书有效期） |
 | 运行时状态 | `/stats` 运行时快照：活跃连接数、出口节点状态（健康 / 连续失败 / 冷却剩余）、内存占用 |
@@ -280,10 +281,29 @@ curl -s http://127.0.0.1:9100/stats
   `proxy-server` 的 `connections` 只统计隧道连接。`upstreams[].idle` 是当前空闲
   预热连接数（未启用连接池时为 0）。配置了连接上限时另有 `limit` 字段：
   上限、当前占用与累计拒绝数（0 = 不限制时不输出）。
-- 两个端点均只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
-  请仅在环回地址或防火墙之后暴露。
+- `/health`、`/stats` 只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
+  请仅在环回地址或防火墙之后暴露；运行时日志级别端点 `/log/level` 见下节。
 - 节点健康状态来源于真实拨号的被动更新（失败后进入冷却），不发送主动探测；
   主动健康检查见路线图「基础故障转移」。
+
+### 日志级别动态调整
+
+`/log/level` 与 `/metrics`、`/health`、`/stats` 共用 `metrics.listen`，可在运行时切换
+日志级别，无需重启（`-log-level` 与配置 `log.level` 仍决定启动级别）：
+
+```sh
+curl -s http://127.0.0.1:9100/log/level
+# {"level":"info"}
+
+curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
+# {"level":"debug","previous":"info"}
+```
+
+- 支持 `debug` / `info` / `warn` / `error` 四档（大小写不敏感）；非法级别返回 400。
+- 仅接受 `GET`（查询）与 `PUT`（切换），其它方法返回 405。
+- 每次切换会**先**以 info 记录一条 `log level changed` 再生效，因此即使切到 error
+  也留有变更凭证。
+- 与其它运维端点一样不做鉴权，请仅在环回地址或防火墙之后暴露。
 
 ### 日志
 
@@ -430,6 +450,7 @@ SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一�
 - [x] 连接池（上游隧道预热复用）与转发缓冲复用（`sync.Pool`）
 - [x] 优雅关闭（drain）与背压（连接上限 + 明确错误）
 - [x] 热路径基准测试（本机 + Ubuntu 22.04 对照）
+- [x] 动态日志级别（`/log/level` 运行时切换）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式

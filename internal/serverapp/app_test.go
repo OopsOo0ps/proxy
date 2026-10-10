@@ -38,7 +38,7 @@ func baseServerCfg(t *testing.T) *config.Server {
 func TestNewRejectsMissingCert(t *testing.T) {
 	cfg := baseServerCfg(t)
 	cfg.TLS.CertFile = filepath.Join(t.TempDir(), "missing.pem")
-	if _, err := serverapp.New(cfg, nil); err == nil {
+	if _, err := serverapp.New(cfg, nil, nil); err == nil {
 		t.Fatal("missing certificate should be rejected")
 	}
 }
@@ -46,7 +46,7 @@ func TestNewRejectsMissingCert(t *testing.T) {
 func TestNewRejectsMissingDecoyFile(t *testing.T) {
 	cfg := baseServerCfg(t)
 	cfg.DecoyFile = filepath.Join(t.TempDir(), "missing.html")
-	if _, err := serverapp.New(cfg, nil); err == nil {
+	if _, err := serverapp.New(cfg, nil, nil); err == nil {
 		t.Fatal("missing decoy file should be rejected")
 	}
 }
@@ -54,7 +54,7 @@ func TestNewRejectsMissingDecoyFile(t *testing.T) {
 func TestListenServeShutdown(t *testing.T) {
 	cfg := baseServerCfg(t)
 	cfg.Metrics.Listen = "127.0.0.1:0"
-	app, err := serverapp.New(cfg, nil)
+	app, err := serverapp.New(cfg, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestHealthReportsExpiredCertificate(t *testing.T) {
 	cfg.Metrics.Listen = "127.0.0.1:0"
 
 	// 过期证书不影响启动（TLS 握手时客户端自会拒绝），由 /health 暴露依赖状态。
-	app, err := serverapp.New(cfg, nil)
+	app, err := serverapp.New(cfg, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

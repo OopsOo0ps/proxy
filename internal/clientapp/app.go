@@ -19,6 +19,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/httpproxy"
+	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
 	"github.com/OopsOo0ps/proxy/internal/routing"
@@ -31,9 +32,10 @@ import (
 // App 是组装完成的 proxy-client 实例。
 // 生命周期：New → Listen（绑定端口）→ Serve（阻塞服务直到 ctx 取消）。
 type App struct {
-	cfg     *config.Client
-	logger  *slog.Logger
-	metrics *metrics.Metrics
+	cfg      *config.Client
+	logger   *slog.Logger
+	logLevel *slog.LevelVar
+	metrics  *metrics.Metrics
 
 	httpSrv  *httpproxy.Server
 	socksSrv *socks5.Server
@@ -50,7 +52,8 @@ type App struct {
 }
 
 // New 校验依赖并组装应用（不绑定端口）。
-func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
+// logLevel 是动态日志级别控制器（可为 nil，此时 /log/level 端点不可用）。
+func New(cfg *config.Client, logger *slog.Logger, logLevel *slog.LevelVar) (*App, error) {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
@@ -64,7 +67,7 @@ func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 
-	app := &App{cfg: cfg, logger: logger, metrics: metrics.New()}
+	app := &App{cfg: cfg, logger: logger, logLevel: logLevel, metrics: metrics.New()}
 	app.limiter = connlimit.New(cfg.Limits.EffectiveMaxConnections())
 
 	baseTLS, err := buildClientTLS(cfg)
@@ -224,6 +227,7 @@ func (a *App) metricsHandler() http.Handler {
 	mux.Handle("/metrics", a.metrics.Handler())
 	mux.Handle("/health", a.status.Health())
 	mux.Handle("/stats", a.status.Stats())
+	mux.Handle("/log/level", logging.LevelHandler(a.logger, a.logLevel))
 	return mux
 }
 
