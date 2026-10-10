@@ -55,13 +55,17 @@ func main() {
 	if err := app.Listen(); err != nil {
 		fatal(err)
 	}
-	logger.Info("listening",
+	fields := []any{
 		"http", app.HTTPAddr(),
 		"socks5", app.SOCKS5Addr(),
 		"metrics", app.MetricsAddr(),
 		"nodes", len(cfg.Nodes),
 		"routing_default", cfg.Routing.Default,
-	)
+	}
+	if addr := app.DNSAddr(); addr != "" {
+		fields = append(fields, "dns", addr, "dns_remote", cfg.DNS.EffectiveRemote())
+	}
+	logger.Info("listening", fields...)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

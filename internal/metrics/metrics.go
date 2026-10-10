@@ -8,6 +8,8 @@
 //   - upstream_pool_idle_connections（gauge，标签 node）
 //   - upstream_pool_warm_failures_total（counter，标签 node）
 //   - connections_rejected_total（counter，标签 proto）：超过连接上限被拒绝的连接
+//   - dns_queries_total（counter，标签 route/result）与 dns_query_duration_seconds
+//     （histogram，标签 route）：DNS 网关查询（路线图 3.1）
 package metrics
 
 import (
@@ -38,6 +40,8 @@ const (
 	ResultAuthFail = "auth_fail"
 	ResultDialFail = "dial_fail"
 	ResultError    = "error"
+	// ResultInvalid：DNS 网关拒绝/丢弃的非法查询（未转发给任何上游）。
+	ResultInvalid = "invalid"
 )
 
 // 连接池领取结果标签值：命中 / 池内无可用连接 / 池内连接已失效。
@@ -58,6 +62,8 @@ type Metrics struct {
 	poolIdle      *prometheus.GaugeVec
 	poolWarmFails *prometheus.CounterVec
 	rejected      *prometheus.CounterVec
+	dnsQueries    *prometheus.CounterVec
+	dnsDuration   *prometheus.HistogramVec
 }
 
 // New 创建独立的指标集合（使用私有 registry，不污染全局默认值）。
@@ -93,8 +99,17 @@ func New() *Metrics {
 			Name: "connections_rejected_total",
 			Help: "Total number of connections rejected due to the configured connection limit.",
 		}, []string{"proto"}),
+		dnsQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "dns_queries_total",
+			Help: "Total number of DNS gateway queries by route and result.",
+		}, []string{"route", "result"}),
+		dnsDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "dns_query_duration_seconds",
+			Help:    "DNS gateway query duration in seconds.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"route"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.rejected)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.rejected, m.dnsQueries, m.dnsDuration)
 	m.preInitialize()
 	return m
 }
@@ -111,6 +126,14 @@ func (m *Metrics) preInitialize() {
 				m.requests.WithLabelValues(proto, route, result)
 			}
 		}
+	}
+	for _, route := range []string{RouteDirect, RouteProxy, RouteNone} {
+		for _, result := range []string{ResultOK, ResultError, ResultInvalid} {
+			m.dnsQueries.WithLabelValues(route, result)
+		}
+	}
+	for _, route := range []string{RouteDirect, RouteProxy} {
+		m.dnsDuration.WithLabelValues(route)
 	}
 }
 
@@ -203,4 +226,16 @@ func (m *Metrics) ConnRejected(proto string) {
 		return
 	}
 	m.rejected.WithLabelValues(proto).Inc()
+}
+
+// ObserveDNS 记录一次 DNS 网关查询（含失败与被拒绝的非法查询）。
+// route 取值 direct / proxy / none；耗时直方图只按实际转发路径统计。
+func (m *Metrics) ObserveDNS(route, result string, d time.Duration) {
+	if m == nil {
+		return
+	}
+	m.dnsQueries.WithLabelValues(route, result).Inc()
+	if route == RouteDirect || route == RouteProxy {
+		m.dnsDuration.WithLabelValues(route).Observe(d.Seconds())
+	}
 }

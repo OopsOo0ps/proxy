@@ -6,7 +6,7 @@
 
 Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
 
-当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点自动切换）、域名分流、认证、结构化日志、Prometheus 指标与健康/状态端点。
+当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点自动切换）、域名分流、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
 
 ## 架构
 
@@ -14,7 +14,7 @@ Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具
 flowchart LR
     subgraph LOCAL["本机"]
         APP["应用 / 浏览器"]
-        CLIENT["proxy-client<br/>HTTP(S)/SOCKS5 入站<br/>规则分流 + 节点池"]
+        CLIENT["proxy-client<br/>HTTP(S)/SOCKS5 入站<br/>DNS 网关（可选）<br/>规则分流 + 节点池"]
     end
 
     subgraph REMOTE["远端服务器（Ubuntu 22.04）"]
@@ -49,6 +49,7 @@ flowchart LR
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超过 `timeouts.shutdown`（默认 15s）强制断开剩余连接 |
 | 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误：HTTP 503 / SOCKS5 失败回复 / 隧道直接关闭，并计入 `connections_rejected_total` |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
+| DNS 处理 | **remote DNS（默认）**：代理名字不在本机解析，域名随隧道到出口解析（防污染 / 防泄漏 / CDN 按出口就近）；**可选 DNS 网关**：本机环回 UDP/TCP 监听，把“先查 DNS”的应用查询按同一分流规则转发（代理名字经出口远程解析，直连名字走本机解析器）。详见「DNS 处理策略」 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
 | 动态日志级别 | 运维端点 `GET/PUT /log/level` 运行时切换 debug/info/warn/error，无需重启 |
@@ -87,6 +88,10 @@ curl -x http://127.0.0.1:18080 -U alice:change-me https://example.com
 # SOCKS5 入站
 curl --socks5-hostname 127.0.0.1:11080 -U alice:change-me https://example.com
 
+# DNS 网关（演示配置已启用；代理名字经出口节点远程解析）
+dig @127.0.0.1 -p 1053 +short example.com
+dig @127.0.0.1 -p 1053 +tcp +short example.com   # 同一网关的 TCP 路径
+
 # Prometheus 指标
 curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duration_seconds|active_connections'
 ```
@@ -99,6 +104,8 @@ curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duratio
   `request_id`、`client_ip`、`upstream`、`duration` 字段。
 - 客户端默认会为每个节点预热空闲隧道（每节点 2 条），可在 `/metrics` 中通过
   `upstream_pool_*` 指标观察预热与领取情况。
+- DNS 查询走哪个节点、解析耗时多少，见客户端日志的 `dns query completed`
+  记录；`/metrics` 的 `dns_queries_total` 按 `route`（direct / proxy）统计。
 
 ### 生产部署（示意）
 
@@ -149,6 +156,12 @@ routing:
   default: proxy        # direct | proxy
   rules_file: ""        # 例如 configs/example-rules.yaml
   private_direct: true  # 环回 / 私网 / 链路本地目标一律直连
+
+dns:                    # 可选 DNS 网关；listen 为空 = 关闭（见「DNS 处理策略」）
+  listen: ""            # 例如 "127.0.0.1:53"；仅允许环回地址
+  remote: "1.1.1.1:53"  # 代理名字的远程解析器（经出口节点，DNS over TCP）
+  local: []             # 直连名字的解析器；留空 = 启动时读取 /etc/resolv.conf
+  timeout: 5s           # 单次查询超时
 
 timeouts: { dial: 10s, handshake: 10s, idle: 90s, shutdown: 15s }
 metrics:  { listen: "127.0.0.1:9100" } # 指标与运维端点（/metrics、/health、/stats）
@@ -232,6 +245,78 @@ rules:
 - 内置安全行为：环回、私网（RFC 1918 / ULA）、链路本地、组播地址与 `localhost`
   在 `private_direct: true`（默认）时一律直连，避免把内网流量误发到远端。
 
+### DNS 处理策略
+
+代理的 DNS 问题决定了“域名在哪里被解析”。本项目的策略是 **remote DNS 优先**：
+
+**1）默认（零配置）：域名随隧道到出口解析。** 应用把域名交给代理——浏览器与
+大多数客户端经 HTTP `CONNECT`，`curl --socks5-hostname` / `socks5h://` 经
+SOCKS5 域名模式——`proxy-client` 不解析域名，而是把域名原样写入 Trojan 请求，
+由 `proxy-server` 在出口解析并连接。由此同时得到：
+
+- **防污染**：本机网络中的 DNS 劫持不参与代理路径；
+- **防泄漏**：代理目标域名不出现在本机的 DNS 查询里；
+- **CDN 按出口就近**：解析结果来自出口侧网络。
+
+反面提示：`curl --socks5`（本地先解析、再把 IP 交给代理）或任何“应用自行解析后
+连 IP”的流程，会让代理只看到 IP——域名分流与远程解析都会失效。请使用
+`socks5h` / `--socks5-hostname`，或把解析交给下面的 DNS 网关。
+
+**2）可选：本机 DNS 网关（`dns.listen`）。** 面向“先查 DNS 再连接”的应用与
+系统级解析：把它们的解析器指向本网关后，查询按**与流量一致的同一套分流规则**
+分派：
+
+- 命中 `proxy` 的名字：经出口节点远程解析（DNS over TCP 走 Trojan 隧道，
+  由出口侧访问 `dns.remote` 指定的解析器）；
+- 命中 `direct` 的名字（含 `localhost` 与私网规则等）：转发给 `dns.local`
+  配置的本机解析器（缺省读取 `/etc/resolv.conf`，自动排除网关自身）。
+
+```yaml
+dns:
+  listen: "127.0.0.1:53"   # 仅允许环回地址；53 端口需要 root 或 CAP_NET_BIND_SERVICE
+  remote: "1.1.1.1:53"     # 应选择从出口可达、支持 TCP 的解析器（例：223.5.5.5:53、
+                           # 或出口本机 stub，如 127.0.0.53:53 / 100.100.2.136:53）
+  local: []                # 直连名字的解析器；留空 = 读取 /etc/resolv.conf
+  timeout: 5s              # 单次查询（含隧道往返）超时
+```
+
+在 Ubuntu 22.04 上把系统解析器指向网关（二选一）：
+
+```sh
+# 方式一：systemd-resolved 将 DNS 请求转发给网关
+sudo resolvectl dns <iface> 127.0.0.1:53
+
+# 方式二：直接改写 /etc/resolv.conf（绕过 systemd-resolved）
+printf 'nameserver 127.0.0.1\n' | sudo tee /etc/resolv.conf
+```
+
+注意：若把 `resolv.conf` 直接指向网关（端口 53），网关启动时读到的系统解析器
+可能包含它自己（会被自动排除，并打 warn 日志）；此时请在 `dns.local` 里显式
+配置直连用的解析器（如路由器的 `192.168.1.1:53`），否则直连名字将解析失败。
+
+#### remote DNS 与 fake-IP 的取舍
+
+| | 本地解析（direct 路径） | remote DNS（本项目默认） | fake-IP（暂未实现） |
+| --- | --- | --- | --- |
+| 解析位置 | 本机 | 出口侧 | 不解析，域名语义保留到出口 |
+| 防 DNS 污染 / 泄漏 | 否 | 是（代理名字零本地查询） | 是 |
+| CDN 就近 | 按本机位置 | 按出口位置 | 按出口位置 |
+| 应用配合 | 无需 | 把域名交给代理（CONNECT / socks5h）或用 DNS 网关 | 连“先解析再连 IP”的应用也无感 |
+| 兼容性 | 最好 | 好 | 差：IP 语义应用（SNI 取自 IP、IP 白名单、地理判断）会异常 |
+| 实现前提 | — | 本仓库已具备 | 需要 fake IP 分配 + 反向映射，最佳体验依赖 TUN |
+
+**为什么本期不做 fake-IP（路线图 3.1 中标记为可选）**：
+
+- 它的核心收益是让“先解析再连 IP”的应用也获得域名语义；这部分应用改指向
+  DNS 网关后可达到近似效果（查询经隧道远程解析，连接仍按域名/规则走）；
+- fake-IP 会引入第二套地址语义：假地址（如 198.18.0.0/15）出现在目标、分流
+  判断与日志里，都要反查回域名；以 IP 为前提的应用会出现难以解释的故障；
+- 其最佳形态是配合 TUN / 透明代理（自动接管“连到假地址”的连接）；本项目
+  暂不支持 TUN（见「限制说明」），在当前显式代理形态下收益有限。
+
+**下一步条件**：引入 TUN 模式时，把 fake-IP 作为 `dns.mode` 的可选策略实现
+（网关分配假地址，代理入站按假地址反查域名），并复用本节同一套分流语义。
+
 ## 观测
 
 ### 指标（Prometheus）
@@ -247,11 +332,14 @@ rules:
 | `upstream_pool_claims_total` | counter | `node`、`result` | 空闲连接领取结果（`hit` / `miss` / `stale`） |
 | `upstream_pool_idle_connections` | gauge | `node` | 各节点当前空闲（已握手待用）连接数 |
 | `upstream_pool_warm_failures_total` | counter | `node` | 后台预热拨号失败次数 |
+| `dns_queries_total` | counter | `route`、`result` | DNS 网关查询数（`route`：`direct` / `proxy` / `none`，`result`：`ok` / `error` / `invalid`） |
+| `dns_query_duration_seconds` | histogram | `route` | DNS 网关查询耗时（秒），含隧道往返 |
 
 `proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
 `result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
 `upstream_pool_*` 系列仅 `proxy-client` 输出：连接池默认开启（`pool.max_idle: 2`），
-关闭后不产生这些序列。
+关闭后不产生这些序列。`dns_*` 系列仅 `proxy-client` 启用 DNS 网关后输出
+（`route=none` 表示被拒绝 / 丢弃的非法查询，只计入 counter）。
 
 ```sh
 curl -s http://127.0.0.1:19100/metrics | grep requests_total
@@ -340,6 +428,16 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   当前仅代理 TCP（返回标准「命令不支持」响应并在日志中记录）。
 - **暂不支持 TUN**：没有全局透明代理/虚拟网卡模式，仅提供 HTTP/HTTPS 与 SOCKS5 入站，
   未配置代理的程序不会被自动接管。
+- **DNS 网关的边界**：仅监听环回地址（避免成为开放解析器，非环回配置直接拒绝启动）；
+  只处理标准单问题查询，其余回 FORMERR / REFUSED；无缓存，每次查询独立经隧道
+  往返（受益于上游连接池预热但无查询级复用）；UDP 客户端查询在网关内转为
+  TCP DNS（要求 `dns.remote` 支持 TCP——公共解析器均支持）。
+- **remote DNS 的前提**：仅在应用把域名交给代理（CONNECT / `socks5h`）或经
+  DNS 网关解析时成立；应用若自行解析后连接 IP，代理只能看到 IP，域名分流与
+  防污染均不适用。
+- **出口侧解析器**：由 `proxy-server` 的系统 `resolv.conf` 决定；如需指定出口
+  解析器，属于后续迭代（当前可把 `dns.remote` 指向任意从出口可达的解析器，
+  从客户端侧达成目的）。
 - **连接池的边界**：预热连接会在服务端占用同数量的“待用连接”，并非永远有效——
   空闲超过服务端 `timeouts.handshake` 的连接会被服务端回收，客户端领取时通过
   存活探测丢弃并回退新建。请保持 `pool.idle_ttl`（默认 5s）小于服务端握手超时
@@ -410,6 +508,7 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 │   ├── clientapp/        #   proxy-client 组装与端到端测试
 │   ├── config/           #   配置解析、默认值与校验
 │   ├── dialer/           #   路由感知的出站拨号
+│   ├── dnsgw/            #   可选 DNS 网关（分流感知的 DNS 转发）
 │   ├── httpproxy/        #   HTTP/HTTPS 入站（CONNECT + 转发）
 │   ├── logging/          #   slog 初始化与 request_id
 │   ├── metrics/          #   Prometheus 指标
@@ -437,7 +536,9 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 端到端测试使用本机回环与自签证书，覆盖：CONNECT 转发成功率（100 次请求，
 验收线 ≥95%）、三节点轮询、节点故障转移、连接池预热与领取命中、私网直连、
 优雅关停排空（存量请求不被中断、新连接被拒绝）、过载保护（超限拒绝与恢复）、
-SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
+SOCKS5 与入站认证、DNS 网关（代理名字经出口远程解析且本地解析器零触达、
+直连名字走本机解析器、TC 截断回退 TCP、非法查询拒绝）、指标暴露与日志字段。
+CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
 
@@ -451,6 +552,7 @@ SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一�
 - [x] 优雅关闭（drain）与背压（连接上限 + 明确错误）
 - [x] 热路径基准测试（本机 + Ubuntu 22.04 对照）
 - [x] 动态日志级别（`/log/level` 运行时切换）
+- [x] DNS 处理策略（remote DNS 默认 + 可选 DNS 网关；fake-IP 权衡与下一步条件记录）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式

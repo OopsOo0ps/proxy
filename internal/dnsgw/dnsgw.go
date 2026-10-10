@@ -1,0 +1,571 @@
+// Package dnsgw 实现 proxy-client 可选的内置 DNS 网关（本机环回监听 UDP/TCP）。
+//
+// 设计目标（路线图 3.1：DNS 处理策略）：让 DNS 查询与流量走同一条路径——
+//   - 分流决策为 proxy 的名字：查询经出口节点远程解析（DNS over TCP 走
+//     Trojan 隧道），由出口侧发起解析，本机不解析、不泄漏；
+//   - 分流决策为 direct 的名字：转发给本机配置的解析器（缺省读取
+//     /etc/resolv.conf），保持内网 / 直连语义。
+//
+// 该网关是“显式代理入站”的补充而非替代：应用直接把域名交给代理
+// （HTTP CONNECT 、socks5h）时，域名本就随隧道到出口解析，无需经过这里；
+// 网关面向的是“先做 DNS、再连 IP”的应用与系统级解析（resolv.conf /
+// systemd-resolved 指向本网关）。
+package dnsgw
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/OopsOo0ps/proxy/internal/logging"
+	"github.com/OopsOo0ps/proxy/internal/metrics"
+	"github.com/OopsOo0ps/proxy/internal/netutil"
+	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/shutdown"
+)
+
+const (
+	// DefaultRemote 是缺省的远程解析服务器（经出口节点，DNS over TCP）。
+	// 应选择从出口可达、支持 TCP 的解析器；必要时在配置中覆盖。
+	DefaultRemote = "1.1.1.1:53"
+
+	// DefaultResolvConfPath 是缺省的系统解析器配置文件路径。
+	DefaultResolvConfPath = "/etc/resolv.conf"
+
+	// DefaultTimeout 是单次查询（含上游往返）的缺省超时。
+	DefaultTimeout = 5 * time.Second
+
+	// maxUDPPayload 是收发的 UDP 报文上限（覆盖 EDNS0 常用缓冲 4096）。
+	maxUDPPayload = 4096
+)
+
+// RouteDecider 返回名字的分流动作（与流量分流共用同一引擎，保证
+// “DNS 走哪条路 = 流量走哪条路”）。
+type RouteDecider interface {
+	Decide(host string) routing.Action
+}
+
+// ProxyDialFunc 强制经出口节点建立 TCP 连接，返回连接与命中的节点标签
+// （用于日志的 upstream 字段）。
+type ProxyDialFunc func(ctx context.Context, host string, port uint16) (net.Conn, string, error)
+
+// Options 是 Server 构造参数。
+type Options struct {
+	// ListenAddr 是网关监听地址，仅用于日志与自环排除（实际 bind 见 Listen）。
+	ListenAddr string
+	// Remote 是经出口节点访问的 DNS 服务器（host:port），缺省 DefaultRemote。
+	Remote string
+	// Local 是直连名字使用的本机解析器列表；为空时读取 ResolvConfPath。
+	Local []string
+	// Timeout 是单次查询超时，缺省 DefaultTimeout。
+	Timeout time.Duration
+	// ResolvConfPath 是系统解析器配置路径，缺省 DefaultResolvConfPath。
+	ResolvConfPath string
+	// Router 分流引擎（必填）。
+	Router RouteDecider
+	// ProxyDial 经出口节点的拨号函数（必填）。
+	ProxyDial ProxyDialFunc
+	// Logger 日志；为 nil 时静默。
+	Logger *slog.Logger
+	// Metrics 指标；可为 nil。
+	Metrics *metrics.Metrics
+	// ShutdownTimeout 关停时等待存量查询结束的最长时间，缺省 15s。
+	ShutdownTimeout time.Duration
+}
+
+// Server 是 DNS 网关。
+type Server struct {
+	remote          string
+	local           []string
+	timeout         time.Duration
+	router          RouteDecider
+	proxyDial       ProxyDialFunc
+	logger          *slog.Logger
+	metrics         *metrics.Metrics
+	shutdownTimeout time.Duration
+	direct          *net.Dialer // 直连本机解析器
+}
+
+// New 校验参数、补齐缺省值并构造网关。
+func New(opts Options) (*Server, error) {
+	if opts.Router == nil {
+		return nil, errors.New("dnsgw: router is required")
+	}
+	if opts.ProxyDial == nil {
+		return nil, errors.New("dnsgw: proxy dial func is required")
+	}
+	s := &Server{
+		remote:          opts.Remote,
+		timeout:         opts.Timeout,
+		router:          opts.Router,
+		proxyDial:       opts.ProxyDial,
+		logger:          opts.Logger,
+		metrics:         opts.Metrics,
+		shutdownTimeout: opts.ShutdownTimeout,
+	}
+	if s.remote == "" {
+		s.remote = DefaultRemote
+	}
+	if _, _, err := net.SplitHostPort(s.remote); err != nil {
+		return nil, fmt.Errorf("dnsgw: invalid remote resolver %q: %w", s.remote, err)
+	}
+	if s.timeout <= 0 {
+		s.timeout = DefaultTimeout
+	}
+	s.direct = &net.Dialer{Timeout: s.timeout}
+
+	local := opts.Local
+	for _, addr := range local {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			return nil, fmt.Errorf("dnsgw: invalid local resolver %q: %w", addr, err)
+		}
+	}
+	if len(local) == 0 {
+		path := opts.ResolvConfPath
+		if path == "" {
+			path = DefaultResolvConfPath
+		}
+		resolved, err := localResolversFromResolvConf(path, opts.ListenAddr)
+		switch {
+		case err != nil:
+			s.log().Warn("dns gateway: cannot read system resolvers, direct-routed names will fail",
+				"path", path, "error", err)
+		case len(resolved) == 0:
+			s.log().Warn("dns gateway: no usable system resolvers found, direct-routed names will fail",
+				"path", path, "hint", "set dns.local explicitly")
+		default:
+			s.log().Info("dns gateway: using system resolvers for direct-routed names",
+				"path", path, "resolvers", resolved)
+			local = resolved
+		}
+	}
+	s.local = local
+	return s, nil
+}
+
+// Listener 是同一地址上的 UDP 与 TCP 双协议监听。
+type Listener struct {
+	UDP *net.UDPConn
+	TCP net.Listener
+}
+
+// Addr 返回监听地址（以 TCP 侧为准）。
+func (l *Listener) Addr() net.Addr { return l.TCP.Addr() }
+
+// Close 关闭两个监听。
+func (l *Listener) Close() error {
+	err := l.TCP.Close()
+	if uerr := l.UDP.Close(); err == nil {
+		err = uerr
+	}
+	return err
+}
+
+// Listen 绑定 addr 的 UDP 与 TCP 监听（DNS 标准的双协议入口）。
+// 端口为 0 时用 TCP 实际选中的端口绑定 UDP，保证两侧同端口。
+func Listen(addr string) (*Listener, error) {
+	tcpLn, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("dnsgw: listen tcp %s: %w", addr, err)
+	}
+	udpAddr, err := net.ResolveUDPAddr("udp", tcpLn.Addr().String())
+	if err != nil {
+		_ = tcpLn.Close()
+		return nil, fmt.Errorf("dnsgw: resolve udp %s: %w", tcpLn.Addr(), err)
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		_ = tcpLn.Close()
+		return nil, fmt.Errorf("dnsgw: listen udp %s: %w", tcpLn.Addr(), err)
+	}
+	return &Listener{UDP: udpConn, TCP: tcpLn}, nil
+}
+
+// Serve 在 l 上提供 DNS 服务；ctx 取消后按与其它组件一致的语义优雅关停：
+// 先停止接受新查询，让存量查询在关停期限内自然结束，超时后强制中断。
+func (s *Server) Serve(ctx context.Context, l *Listener) error {
+	// queryCtx 与关停信号解耦：收到关停后存量查询继续完成，
+	// 只有超过关停期限（forceCancel）才被打断。
+	queryCtx, forceCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer forceCancel()
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = l.Close()
+		case <-done:
+		}
+	}()
+
+	tcpErrCh := make(chan error, 1)
+	go func() { tcpErrCh <- s.serveTCP(queryCtx, l.TCP, &wg) }()
+
+	udpErr := s.serveUDP(queryCtx, l.UDP, &wg)
+	// UDP 循环退出（正常关停或致命错误）后一并停止 TCP 侧。
+	_ = l.Close()
+	tcpErr := <-tcpErrCh
+
+	if ctx.Err() != nil {
+		s.log().Info("shutdown: stopped accepting new DNS queries",
+			"drain_timeout", s.shutdownTimeoutOrDefault().String())
+		if shutdown.Wait(&wg, s.shutdownTimeoutOrDefault(), forceCancel) {
+			s.log().Info("shutdown: all in-flight DNS queries drained")
+		} else {
+			s.log().Warn("shutdown: timeout exceeded, remaining DNS queries closed")
+		}
+		return nil
+	}
+	forceCancel()
+	wg.Wait()
+	if udpErr != nil {
+		return udpErr
+	}
+	return tcpErr
+}
+
+// serveUDP 读取 UDP 查询并分发处理。
+func (s *Server) serveUDP(ctx context.Context, pc *net.UDPConn, wg *sync.WaitGroup) error {
+	buf := make([]byte, maxUDPPayload)
+	for {
+		n, from, err := pc.ReadFromUDPAddrPort(buf)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("dnsgw: read udp: %w", err)
+		}
+		payload := make([]byte, n)
+		copy(payload, buf[:n])
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp := s.handleQuery(ctx, payload, net.UDPAddrFromAddrPort(from))
+			if resp == nil {
+				return
+			}
+			_ = pc.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			_, _ = pc.WriteToUDPAddrPort(resp, from)
+		}()
+	}
+}
+
+// serveTCP 接受 TCP 连接；每条连接可顺序承载多条查询（RFC 1035 长度前缀）。
+func (s *Server) serveTCP(ctx context.Context, ln net.Listener, wg *sync.WaitGroup) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			return fmt.Errorf("dnsgw: accept tcp: %w", err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.handleTCPConn(ctx, conn)
+		}()
+	}
+}
+
+func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	br := bufio.NewReader(conn)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(s.timeout))
+		payload, err := readFrame(br)
+		if err != nil {
+			return
+		}
+		resp := s.handleQuery(ctx, payload, conn.RemoteAddr())
+		if resp == nil {
+			// 非查询报文：不再等待同连接上的后续查询。
+			return
+		}
+		_ = conn.SetWriteDeadline(time.Now().Add(s.timeout))
+		if err := writeFrame(conn, resp); err != nil {
+			if !errors.Is(err, io.ErrClosedPipe) {
+				s.log().Debug("dns gateway: write tcp response failed", "error", err)
+			}
+			return
+		}
+	}
+}
+
+// handleQuery 处理一条查询并返回响应报文；resp 为 nil 表示不响应（静默丢弃）。
+func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr) []byte {
+	start := time.Now()
+	logger := s.log().With(
+		"request_id", logging.NewRequestID(),
+		"proto", "dns",
+		"client_ip", netutil.RemoteIP(from),
+	)
+
+	q, err := parseQuery(payload)
+	if err != nil {
+		return s.handleInvalid(logger, payload, err, start)
+	}
+
+	route := metrics.RouteProxy
+	var (
+		resp     []byte
+		upstream string
+	)
+	if s.router.Decide(q.name) == routing.Direct {
+		route = metrics.RouteDirect
+		resp, upstream, err = s.queryLocal(ctx, q)
+	} else {
+		resp, upstream, err = s.queryRemote(ctx, q)
+	}
+
+	result := metrics.ResultOK
+	if err != nil {
+		result = metrics.ResultError
+		logger.Warn("dns query failed",
+			"name", q.name, "qtype", typeName(q.qtype), "route", route, "error", err)
+		resp = errorResponseEcho(q, rcodeServerFail)
+	}
+	elapsed := time.Since(start)
+	s.metrics.ObserveDNS(route, result, elapsed)
+	logger.Info("dns query completed",
+		"name", q.name,
+		"qtype", typeName(q.qtype),
+		"route", route,
+		"upstream", upstream,
+		"answer_bytes", len(resp),
+		"duration", elapsed.Round(time.Microsecond).String(),
+		"duration_ms", elapsed.Milliseconds(),
+		"result", result,
+	)
+	return resp
+}
+
+// handleInvalid 处理无法转发的报文：响应报文静默丢弃；其它按错误分类回
+// FORMERR / REFUSED，不计入解析器往返（routes=none）。
+func (s *Server) handleInvalid(logger *slog.Logger, payload []byte, err error, start time.Time) []byte {
+	result := metrics.ResultInvalid
+	defer func() { s.metrics.ObserveDNS(metrics.RouteNone, result, time.Since(start)) }()
+
+	switch {
+	case errors.Is(err, errNotQuery):
+		// 收到响应报文（例如误配置成的转发环）：丢弃，避免打环。
+		logger.Debug("dns gateway: dropping response message")
+		return nil
+	case errors.Is(err, errBadOpcode), errors.Is(err, errNoSingleQuestion):
+		logger.Debug("dns gateway: refusing unsupported query", "error", err)
+		return errorResponse(payload, rcodeRefused)
+	default:
+		logger.Debug("dns gateway: dropping malformed message", "error", err)
+		return errorResponse(payload, rcodeFormatErr)
+	}
+}
+
+// queryLocal 依次尝试本机解析器（UDP 优先；截断时按 RFC 1035 改走 TCP）。
+func (s *Server) queryLocal(ctx context.Context, q query) ([]byte, string, error) {
+	if len(s.local) == 0 {
+		return nil, "", errors.New("no local resolvers available")
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	var errs []error
+	for _, upstream := range s.local {
+		resp, err := s.exchangeUDP(ctx, upstream, q)
+		if err == nil && !isTruncated(resp) {
+			return resp, upstream, nil
+		}
+		if err == nil {
+			tcpResp, tcpErr := s.exchangeLocalTCP(ctx, upstream, q)
+			if tcpErr == nil {
+				return tcpResp, upstream, nil
+			}
+			err = fmt.Errorf("tcp retry after truncation: %w", tcpErr)
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", upstream, err))
+	}
+	return nil, "", fmt.Errorf("all local resolvers failed: %w", errors.Join(errs...))
+}
+
+// queryRemote 经出口节点访问远程解析器（DNS over TCP，走 Trojan 隧道）。
+func (s *Server) queryRemote(ctx context.Context, q query) ([]byte, string, error) {
+	host, portString, err := net.SplitHostPort(s.remote)
+	if err != nil {
+		return nil, "", fmt.Errorf("remote resolver %q: %w", s.remote, err)
+	}
+	port, err := strconv.ParseUint(portString, 10, 16)
+	if err != nil || port == 0 {
+		return nil, "", fmt.Errorf("remote resolver %q: invalid port", s.remote)
+	}
+	ctx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+
+	conn, label, err := s.proxyDial(ctx, host, uint16(port))
+	if err != nil {
+		return nil, "", fmt.Errorf("dial remote resolver %s via exit node: %w", s.remote, err)
+	}
+	defer func() { _ = conn.Close() }()
+	setDeadlineFromCtx(conn, ctx, s.timeout)
+
+	if err := writeFrame(conn, q.payload); err != nil {
+		return nil, label, fmt.Errorf("write to remote resolver: %w", err)
+	}
+	resp, err := readFrame(conn)
+	if err != nil {
+		return nil, label, fmt.Errorf("read from remote resolver: %w", err)
+	}
+	if !validResponse(q.id, resp) {
+		return nil, label, errors.New("invalid response from remote resolver")
+	}
+	return resp, label, nil
+}
+
+// exchangeUDP 通过一次性的本地 UDP 套接字与上游交换报文。
+func (s *Server) exchangeUDP(ctx context.Context, upstream string, q query) ([]byte, error) {
+	conn, err := s.direct.DialContext(ctx, "udp", upstream)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	setDeadlineFromCtx(conn, ctx, s.timeout)
+
+	if _, err := conn.Write(q.payload); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, maxUDPPayload)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	resp := buf[:n]
+	if !validResponse(q.id, resp) {
+		return nil, errors.New("invalid response from local resolver")
+	}
+	return resp, nil
+}
+
+// exchangeLocalTCP 经 TCP 与本机解析器交换报文（UDP 截断后的重试路径）。
+func (s *Server) exchangeLocalTCP(ctx context.Context, upstream string, q query) ([]byte, error) {
+	conn, err := s.direct.DialContext(ctx, "tcp", upstream)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+	setDeadlineFromCtx(conn, ctx, s.timeout)
+
+	if err := writeFrame(conn, q.payload); err != nil {
+		return nil, err
+	}
+	resp, err := readFrame(conn)
+	if err != nil {
+		return nil, err
+	}
+	if !validResponse(q.id, resp) {
+		return nil, errors.New("invalid response from local resolver")
+	}
+	return resp, nil
+}
+
+// setDeadlineFromCtx 依据 ctx 的期限设置连接截止时间；无期限时回退到 timeout。
+func setDeadlineFromCtx(conn net.Conn, ctx context.Context, timeout time.Duration) {
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+		return
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+}
+
+// readFrame 读取一个 DNS over TCP 长度前缀帧（RFC 1035 4.2.2）。
+func readFrame(r io.Reader) ([]byte, error) {
+	var head [2]byte
+	if _, err := io.ReadFull(r, head[:]); err != nil {
+		return nil, err
+	}
+	n := int(binary.BigEndian.Uint16(head[:]))
+	if n == 0 {
+		return nil, errors.New("dnsgw: empty frame")
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// writeFrame 写出一个 DNS over TCP 长度前缀帧。
+//
+// 必须单次写出（前缀与载荷同一次 Write）：分两次写时，2 字节的前缀会立即
+// 成段，而载荷受 Nagle 算法影响要等前缀的 ACK（约一个 RTT）才发出；部分
+// 解析器/中间设备对“只收到长度前缀”的连接会直接重置，导致 DNS over TCP
+// 偶发失败（本仓库在阿里云 VPS 实测到该现象）。
+func writeFrame(w io.Writer, payload []byte) error {
+	if len(payload) > 0xFFFF {
+		return errors.New("dnsgw: message exceeds 65535 bytes")
+	}
+	buf := make([]byte, 2+len(payload))
+	binary.BigEndian.PutUint16(buf[:2], uint16(len(payload)))
+	copy(buf[2:], payload)
+	_, err := w.Write(buf)
+	return err
+}
+
+// localResolversFromResolvConf 解析 nameserver 行返回 host:port 列表，
+// 排除 exclude（网关自身监听地址，防止把查询转发给自己形成自环）。
+func localResolversFromResolvConf(path, exclude string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		ip, err := netip.ParseAddr(fields[1])
+		if err != nil {
+			continue
+		}
+		addr := net.JoinHostPort(ip.String(), "53")
+		if exclude != "" && netutil.SameHostPort(addr, exclude) {
+			continue
+		}
+		if seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, addr)
+	}
+	return out, nil
+}
+
+func (s *Server) log() *slog.Logger {
+	if s.logger == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return s.logger
+}
+
+func (s *Server) shutdownTimeoutOrDefault() time.Duration {
+	if s.shutdownTimeout <= 0 {
+		return shutdown.DefaultTimeout
+	}
+	return s.shutdownTimeout
+}

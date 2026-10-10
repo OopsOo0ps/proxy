@@ -80,7 +80,13 @@ func (d *Dialer) DialTarget(ctx context.Context, host string, port uint16) (net.
 		}
 		return conn, Route{Action: routing.Direct}, nil
 	}
+	return d.DialProxy(ctx, host, port)
+}
 
+// DialProxy 强制经出口节点建立到 host:port 的隧道连接（不做分流决策）。
+// DNS 网关用它把解析请求固定送往出口（remote DNS）——出口是否可直连
+// 公共 DNS 服务器不应受本地分流规则影响。
+func (d *Dialer) DialProxy(ctx context.Context, host string, port uint16) (net.Conn, Route, error) {
 	if d.pool == nil {
 		return nil, Route{Action: routing.Proxy}, ErrNoNodes
 	}
