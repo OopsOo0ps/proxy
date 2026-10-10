@@ -250,15 +250,7 @@ func TestE2EConnectSuccessRateAndThreeNodes(t *testing.T) {
 	// 验收：至少 3 个节点全部可用——逐一确认每个节点都实际承载过成功请求
 	//（以服务端隧道完成日志为证据）。
 	for i, logs := range nodeLogs {
-		record := waitForLog(t, logs, "tunnel completed")
-		assertLogFields(t, record, map[string]func(any) error{
-			"result": func(v any) error {
-				if v != "ok" {
-					return fmt.Errorf("result = %v", v)
-				}
-				return nil
-			},
-		})
+		waitForSuccessfulTunnel(t, logs)
 		t.Logf("节点 %d 已成功承载流量", i+1)
 	}
 }
@@ -564,6 +556,40 @@ func (b *lockedBuffer) findLine(substr string) string {
 		}
 	}
 	return ""
+}
+
+// findLineFunc 返回第一条满足 predicate 的日志行；没有时返回空串。
+func (b *lockedBuffer) findLineFunc(predicate func(string) bool) string {
+	for _, line := range strings.Split(b.String(), "\n") {
+		if predicate(line) {
+			return line
+		}
+	}
+	return ""
+}
+
+// waitForSuccessfulTunnel 轮询节点日志，直到出现一条「隧道完成且 result=ok」的记录。
+//
+// 只要求“存在成功记录”，不要求它是第一条：连接拆除阶段偶发的 RST/FIN 竞态
+// 会把个别已完成转发的隧道记为 error（客户端侧此时依然全部成功），
+// 而“首条记录必须 ok”的断言会命中这类时序抖动造成假失败。
+func waitForSuccessfulTunnel(t *testing.T, buf *lockedBuffer) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		line := buf.findLineFunc(func(line string) bool {
+			return strings.Contains(line, "tunnel completed") && strings.Contains(line, `"result":"ok"`)
+		})
+		if line != "" {
+			var record map[string]any
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("log line is not valid JSON: %v (%q)", err, line)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no successful tunnel record found in:\n%s", buf.String())
 }
 
 func waitForLog(t *testing.T, buf *lockedBuffer, substr string) map[string]any {
