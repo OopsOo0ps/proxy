@@ -12,7 +12,6 @@ package trojan
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -82,7 +81,12 @@ func WriteRequest(w io.Writer, passwordHash, host string, port uint16) error {
 	return err
 }
 
-// ReadRequest 从 r 解析客户端握手（两行，均以 CRLF 结束）。
+// ReadRequest 从 r 解析客户端握手。
+//
+// 线格式：password line CRLF CMD ATYP ADDR PORT CRLF。
+// 口令行是文本（以 CRLF 结束）；CMD 与目标地址是二进制字段，按 ATYP
+// 定长读取——不能按文本行扫描 CRLF，否则地址/端口字节中的 0x0A
+// （如 IPv4 首字节 0x0A 的 10.x.x.x、端口低字节 0x0A）会被当作行结束。
 func ReadRequest(r *bufio.Reader) (Request, error) {
 	req := Request{}
 	passwordLine, err := readCRLFLine(r, MaxHandshakeLine)
@@ -94,18 +98,22 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	}
 	req.PasswordHash = strings.ToLower(passwordLine)
 
-	requestLine, err := readCRLFLine(r, MaxHandshakeLine)
+	cmd, err := r.ReadByte()
 	if err != nil {
-		return req, fmt.Errorf("trojan: read request line: %w", err)
+		return req, fmt.Errorf("trojan: read command: %w", err)
 	}
-	if len(requestLine) < 2 {
-		return req, errors.New("trojan: request line too short")
-	}
-	req.Command = requestLine[0]
-	host, port, err := socks5.DecodeAddr(bytes.NewReader([]byte(requestLine[1:])))
+	host, port, err := socks5.DecodeAddr(r)
 	if err != nil {
 		return req, fmt.Errorf("trojan: decode target: %w", err)
 	}
+	var terminator [2]byte
+	if _, err := io.ReadFull(r, terminator[:]); err != nil {
+		return req, fmt.Errorf("trojan: read request terminator: %w", err)
+	}
+	if terminator != [2]byte{'\r', '\n'} {
+		return req, errors.New("trojan: request line must end with CRLF")
+	}
+	req.Command = cmd
 	req.Host, req.Port = host, port
 	return req, nil
 }
