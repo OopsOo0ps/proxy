@@ -334,6 +334,49 @@ curl -s http://127.0.0.1:9100/stats
   拨号失败并可能触发节点切换；另外客户端连接池的预热连接同样占用服务端名额，
   服务端上限应大于「客户端数 × `pool.max_idle` + 真实并发」。
 
+## 基准测试
+
+性能相关数字均有 `go test -bench` 实测依据。基准只在**本机回环 / 内存管道**上运行，
+用于追踪热路径固定开销与回归，**不代表公网吞吐**，也不做跨软件对比。
+
+测试条件（2026-10-10，Go 1.25.0）：
+
+- 本机：Apple M4 / darwin arm64；
+- 目标平台对照：Ubuntu 22.04.5 / Intel Xeon Platinum 2 vCPU（阿里云 VPS，测试二进制
+  交叉编译后在该机执行）。
+
+命令（本机；VPS 用 `go test -c` 交叉编译后以 `-test.bench=. -test.benchmem -test.count=3` 执行）：
+
+```sh
+go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
+```
+
+以下为 `-count=3` 的中位数（B/op、allocs/op 与平台无关，取共同值）：
+
+| 基准 | 度量对象 | 本机 M4 | VPS（Ubuntu 22.04） |
+| --- | --- | --- | --- |
+| `BenchmarkConnectHandshake` | CONNECT 入站握手（建连 → 200，上游为内存管道） | 72.5µs，18.7KB，96 allocs | 226µs，18.4KB，96 allocs |
+| `BenchmarkCopyLoopPooled` | 转发循环搬运 1MiB（`sync.Pool` 缓冲） | 71µs（≈14.7GB/s），0 allocs | 258µs（≈4.05GB/s），0 allocs |
+| `BenchmarkCopyLoopUnpooled` | 对照：每次新建 32KiB 缓冲 | 72µs，32.8KB，1 alloc | 280µs，32.8KB，1 alloc |
+| `BenchmarkClaimHit` | 空闲隧道领取（含 1ms 存活探测窗口） | 1.15ms，6 allocs | 1.11ms，6 allocs |
+| `BenchmarkDecide/direct-rule` | 命中直连规则（域名 / 通配 / 网段） | 41ns，48B，1 alloc | 164ns，48B，1 alloc |
+| `BenchmarkDecide/private-direct` | 私网目标内建直连 | 26ns，0 allocs | 92ns，0 allocs |
+| `BenchmarkDecide/proxy-rule` | 命中通配代理规则 | 77ns，144B，3 allocs | 384ns，144B，3 allocs |
+| `BenchmarkDecide/default` | 未命中回落默认动作 | 79ns，144B，3 allocs | 367ns，144B，3 allocs |
+| `BenchmarkStoreVerify/hit` | 入站凭据校验（16 用户，常量时间比较） | 69.8ns，0 allocs | 400ns，0 allocs |
+| `BenchmarkStoreVerify/miss` | 未知用户（同样走常量时间路径） | 61.1ns，0 allocs | 396ns，0 allocs |
+
+解读与边界：
+
+- `ConnectHandshake` 的上游是内存管道，度量代理自身处理（解析、拨号调用、200 写出），
+  不含真实网络往返；每次迭代会新建一条本机 TCP 连接。
+- 转发循环用内存管道而非 TCP：度量代码路径与分配，不测内核网络栈；`Pooled` 与
+  `Unpooled` 的分配差异即缓冲复用的效果（与 2.4 记录一致）。
+- `ClaimHit` 的固定开销主要是 1ms 存活探测窗口，两台机器基本一致（与 2.3 记录一致），
+  说明该路径受计时窗口而非 CPU 限制。
+- 分流与凭据校验是纯 CPU 路径：小核 VPS 约为 M4 的 3–5 倍耗时，分配次数与平台无关。
+- 数字为小样本中位数，随机器与负载波动，不构成 SLA。
+
 ## 项目结构
 
 ```text
@@ -385,6 +428,8 @@ SOCKS5 与入站认证、指标暴露与日志字段。CI 与本地使用同一�
 - [x] 基础域名分流与内网直连
 - [x] 认证、结构化日志、Prometheus 指标
 - [x] 连接池（上游隧道预热复用）与转发缓冲复用（`sync.Pool`）
+- [x] 优雅关闭（drain）与背压（连接上限 + 明确错误）
+- [x] 热路径基准测试（本机 + Ubuntu 22.04 对照）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
