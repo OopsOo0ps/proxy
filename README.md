@@ -6,7 +6,7 @@
 
 Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
 
-当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点自动切换）、域名分流、认证、结构化日志与 Prometheus 指标。
+当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点自动切换）、域名分流、认证、结构化日志、Prometheus 指标与健康/状态端点。
 
 ## 架构
 
@@ -49,6 +49,8 @@ flowchart LR
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
 | 指标 | `/metrics` 暴露 `requests_total`、`request_duration_seconds`、`active_connections` |
+| 健康检查 | `/health` 存活与依赖检查；依赖不可用时返回 503（`proxy-client` 检查出口节点池，`proxy-server` 检查 TLS 证书有效期） |
+| 运行时状态 | `/stats` 运行时快照：活跃连接数、出口节点状态（健康 / 连续失败 / 冷却剩余）、内存占用 |
 
 规划中：控制端动态配置、systemd / 发行包、UDP 与 TUN 支持（见「限制说明」与「路线图」）。
 
@@ -136,7 +138,7 @@ routing:
   private_direct: true  # 环回 / 私网 / 链路本地目标一律直连
 
 timeouts: { dial: 10s, handshake: 10s, idle: 90s }
-metrics:  { listen: "127.0.0.1:9100" }
+metrics:  { listen: "127.0.0.1:9100" } # 指标与运维端点（/metrics、/health、/stats）
 log:      { level: info, format: json }   # json | text
 ```
 
@@ -151,7 +153,7 @@ users:                       # 每个客户端分配独立凭据
   - { username: alice, password: change-me-alice }
 decoy_file: ""               # 可选：认证失败时的伪装页面
 timeouts: { dial: 10s, handshake: 10s, idle: 90s }
-metrics:  { listen: "127.0.0.1:9200" }
+metrics:  { listen: "127.0.0.1:9200" } # 指标与运维端点（/metrics、/health、/stats）
 log:      { level: info, format: json }
 ```
 
@@ -193,7 +195,32 @@ rules:
 curl -s http://127.0.0.1:19100/metrics | grep requests_total
 ```
 
-生产环境请将 `metrics.listen` 绑定到环回地址或置于防火墙之后。
+生产环境请将 `metrics.listen` 绑定到环回地址或置于防火墙之后（`/health`、`/stats` 与 `/metrics` 同址暴露）。
+
+### 健康检查与运行时状态
+
+`/health`、`/stats` 与 `/metrics` 共用 `metrics.listen` 监听（未配置则同样不启用）：
+
+```sh
+curl -s http://127.0.0.1:9100/health
+# {"status":"ok","uptime":12.34}
+
+curl -s http://127.0.0.1:9100/stats
+# {"version":"...","uptime":12.34,"connections":{"http":1,"total":1},
+#  "upstreams":[{"addr":"node1:443","healthy":true,"fails":0,"cooldown_remaining":0}],
+#  "memory":{"alloc_bytes":...,"sys_bytes":...,"num_gc":...,"goroutines":...}}
+```
+
+- `GET /health`：进程存活时返回 `{"status":"ok","uptime":<秒>}`；依赖不可用时返回
+  `503` 与 `{"status":"unavailable","reason":"..."}`。依赖定义：
+  - `proxy-client`：配置了出口节点且没有任何健康节点（全部处于冷却）时不可用；
+  - `proxy-server`：TLS 证书在运行中过期时不可用。
+- `GET /stats`：运行时快照，字段见上例。`upstreams` 仅 `proxy-client` 输出；
+  `proxy-server` 的 `connections` 只统计隧道连接。
+- 两个端点均只接受 `GET`（其它方法返回 405），与 `/metrics` 一样不做鉴权，
+  请仅在环回地址或防火墙之后暴露。
+- 节点健康状态来源于真实拨号的被动更新（失败后进入冷却），不发送主动探测；
+  主动健康检查见路线图「基础故障转移」。
 
 ### 日志
 

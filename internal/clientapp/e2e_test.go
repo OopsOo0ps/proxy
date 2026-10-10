@@ -675,3 +675,129 @@ func assertLogFields(t *testing.T, record map[string]any, checks map[string]func
 		}
 	}
 }
+
+// getJSON 请求端点并把 JSON 响应解码到 out，返回状态码。
+func getJSON(t *testing.T, url string, out any) int {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		t.Fatalf("decode %s: %v", url, err)
+	}
+	return resp.StatusCode
+}
+
+func TestE2EHealthAndStatsEndpoints(t *testing.T) {
+	h := startServer(t, "node-secret", nil, false)
+	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	app := startClient(t, cfg, nil)
+
+	// 健康：200 + status ok + uptime。
+	var health struct {
+		Status string  `json:"status"`
+		Uptime float64 `json:"uptime"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/health", &health); code != http.StatusOK {
+		t.Fatalf("/health status = %d, want 200", code)
+	}
+	if health.Status != "ok" || health.Uptime < 0 {
+		t.Fatalf("/health = %+v", health)
+	}
+
+	// 状态：连接数、上游节点状态与内存占用。
+	var stats struct {
+		Version     string  `json:"version"`
+		Uptime      float64 `json:"uptime"`
+		Connections struct {
+			Total int64 `json:"total"`
+		} `json:"connections"`
+		Upstreams []struct {
+			Addr    string `json:"addr"`
+			Healthy bool   `json:"healthy"`
+			Fails   int    `json:"fails"`
+		} `json:"upstreams"`
+		Memory struct {
+			AllocBytes uint64 `json:"alloc_bytes"`
+			SysBytes   uint64 `json:"sys_bytes"`
+			NumGC      uint32 `json:"num_gc"`
+			Goroutines int    `json:"goroutines"`
+		} `json:"memory"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/stats", &stats); code != http.StatusOK {
+		t.Fatalf("/stats status = %d, want 200", code)
+	}
+	if stats.Version == "" {
+		t.Fatal("/stats version 为空")
+	}
+	if len(stats.Upstreams) != 1 {
+		t.Fatalf("upstreams = %+v, want 1 个节点", stats.Upstreams)
+	}
+	up := stats.Upstreams[0]
+	if up.Addr != h.addr || !up.Healthy || up.Fails != 0 {
+		t.Fatalf("upstream = %+v, want 健康节点 %s", up, h.addr)
+	}
+	if stats.Connections.Total != 0 {
+		t.Fatalf("无流量时 connections.total = %d, want 0", stats.Connections.Total)
+	}
+	if stats.Memory.SysBytes == 0 || stats.Memory.Goroutines <= 0 {
+		t.Fatalf("memory = %+v", stats.Memory)
+	}
+}
+
+func TestE2EHealthReportsNodesCooling(t *testing.T) {
+	// 节点指向一个刚关闭的端口：请求失败后节点进入冷却，/health 应转为 503。
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := ln.Addr().String()
+	_ = ln.Close()
+
+	cfg := baseClientCfg([]config.Node{{Addr: deadAddr, Password: "pw"}})
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	app := startClient(t, cfg, nil)
+
+	// 触发一次失败的拨号（失败在响应前已计入节点状态）。
+	target := startTLSTarget(t)
+	client := browser(t, "http://"+app.HTTPAddr(), 1)
+	if resp, err := client.Get(target.URL); err == nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode < 500 {
+			t.Fatalf("expected proxy failure, got %d", resp.StatusCode)
+		}
+	}
+
+	var health struct {
+		Status string `json:"status"`
+		Reason string `json:"reason"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/health", &health); code != http.StatusServiceUnavailable {
+		t.Fatalf("/health status = %d, want 503", code)
+	}
+	if health.Status != "unavailable" || !strings.Contains(health.Reason, "no healthy exit nodes") {
+		t.Fatalf("/health = %+v", health)
+	}
+
+	var stats struct {
+		Upstreams []struct {
+			Addr              string  `json:"addr"`
+			Healthy           bool    `json:"healthy"`
+			Fails             int     `json:"fails"`
+			CooldownRemaining float64 `json:"cooldown_remaining"`
+		} `json:"upstreams"`
+	}
+	if code := getJSON(t, "http://"+app.MetricsAddr()+"/stats", &stats); code != http.StatusOK {
+		t.Fatalf("/stats status = %d, want 200", code)
+	}
+	if len(stats.Upstreams) != 1 {
+		t.Fatalf("upstreams = %+v", stats.Upstreams)
+	}
+	up := stats.Upstreams[0]
+	if up.Healthy || up.Fails != 1 || up.CooldownRemaining <= 0 {
+		t.Fatalf("upstream = %+v, want 冷却中（1 次失败）", up)
+	}
+}

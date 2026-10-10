@@ -4,6 +4,7 @@ package serverapp
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,7 +16,9 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
+	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
+	"github.com/OopsOo0ps/proxy/pkg/version"
 )
 
 // App 是组装完成的 proxy-server 实例。
@@ -26,10 +29,12 @@ type App struct {
 	metrics *metrics.Metrics
 	tunnel  *trojan.Server
 	tlsCfg  *tls.Config
+	status  *status.Status
 
-	tunnelLn   net.Listener
-	metricsSrv *http.Server
-	metricsLn  net.Listener
+	certNotAfter time.Time
+	tunnelLn     net.Listener
+	metricsSrv   *http.Server
+	metricsLn    net.Listener
 }
 
 // New 加载证书与凭据并组装应用（不绑定端口）。
@@ -41,6 +46,10 @@ func New(cfg *config.Server, logger *slog.Logger) (*App, error) {
 	cert, err := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("serverapp: load tls key pair: %w", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("serverapp: parse tls certificate: %w", err)
 	}
 
 	users := make([]auth.User, 0, len(cfg.Users))
@@ -66,14 +75,20 @@ func New(cfg *config.Server, logger *slog.Logger) (*App, error) {
 
 	netDialer := &net.Dialer{Timeout: cfg.Timeouts.Dial.Std()}
 	app := &App{
-		cfg:     cfg,
-		logger:  logger,
-		metrics: metrics.New(),
+		cfg:          cfg,
+		logger:       logger,
+		metrics:      metrics.New(),
+		certNotAfter: leaf.NotAfter,
 		tlsCfg: &tls.Config{
 			Certificates: []tls.Certificate{cert},
 			MinVersion:   tls.VersionTLS12,
 		},
 	}
+	app.status = status.New(status.Options{
+		Version: version.Get().Version,
+		Checks:  app.healthChecks(),
+		Runtime: app.runtimeStats,
+	})
 	app.tunnel = &trojan.Server{
 		Verifier: store,
 		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
@@ -172,5 +187,25 @@ func (a *App) serveMetrics(ctx context.Context) error {
 func (a *App) metricsHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", a.metrics.Handler())
+	mux.Handle("/health", a.status.Health())
+	mux.Handle("/stats", a.status.Stats())
 	return mux
+}
+
+// healthChecks 返回依赖健康检查：TLS 证书在运行中过期时依赖不可用。
+func (a *App) healthChecks() []func() error {
+	return []func() error{func() error {
+		if time.Now().Before(a.certNotAfter) {
+			return nil
+		}
+		return errors.New("tls certificate expired")
+	}}
+}
+
+// runtimeStats 组装 /stats 快照：隧道活跃连接数。
+func (a *App) runtimeStats() status.Runtime {
+	tunnel := a.metrics.ActiveByProto()[metrics.ProtoTunnel]
+	return status.Runtime{
+		Connections: status.Connections{Tunnel: tunnel, Total: tunnel},
+	}
 }

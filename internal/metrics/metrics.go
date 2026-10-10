@@ -90,6 +90,32 @@ func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
 }
 
+// ActiveByProto 返回按协议统计的活跃连接数快照；nil 接收者返回 nil。
+// 数据直接取自注册表，保证与 /metrics 暴露的值一致。
+func (m *Metrics) ActiveByProto() map[string]int64 {
+	if m == nil {
+		return nil
+	}
+	families, err := m.registry.Gather()
+	if err != nil {
+		return nil
+	}
+	out := make(map[string]int64)
+	for _, family := range families {
+		if family.GetName() != "active_connections" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if label.GetName() == "proto" {
+					out[label.GetValue()] = int64(metric.GetGauge().GetValue())
+				}
+			}
+		}
+	}
+	return out
+}
+
 // Observe 记录一次完成的请求（含失败），并观察其耗时。
 func (m *Metrics) Observe(proto, route, result string, d time.Duration) {
 	if m == nil {
