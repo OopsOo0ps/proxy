@@ -84,6 +84,24 @@ type Server struct {
 	ReadHeaderTimeout time.Duration
 	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 15s。
 	ShutdownTimeout time.Duration
+
+	handlerMu sync.Mutex
+	handler   *handler // Serve 启动后写入；CloseIdleConnections 读取
+}
+
+// CloseIdleConnections 丢弃转发路径（绝对地址请求）的空闲上游连接。
+// 用途：分流规则变化后，避免后续请求复用到旧路由建立的连接（生效边界=新连接，
+// 在途请求不受影响）。未调用 Serve 或 Serve 尚未启动 handler 时为空操作。
+func (s *Server) CloseIdleConnections() {
+	if s == nil {
+		return
+	}
+	s.handlerMu.Lock()
+	h := s.handler
+	s.handlerMu.Unlock()
+	if h != nil {
+		h.transport.CloseIdleConnections()
+	}
 }
 
 // Serve 在 ln 上提供代理服务；ctx 取消后优雅关停：
@@ -95,6 +113,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer forceCancel()
 
 	h := newHandler(s)
+	s.handlerMu.Lock()
+	s.handler = h
+	s.handlerMu.Unlock()
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: s.readHeaderTimeout(),

@@ -624,3 +624,11 @@ func BenchmarkConnectHandshake(b *testing.B) {
 		_ = conn.Close()
 	}
 }
+
+// TestCloseIdleConnectionsNilSafe 验证 CloseIdleConnections 在未启动 Serve
+// 或 nil 接收者时为空操作（规则变化回调可能在 Serve 之前触发）。
+func TestCloseIdleConnectionsNilSafe(t *testing.T) {
+	var s *Server
+	s.CloseIdleConnections()
+	(&Server{}).CloseIdleConnections()
+}

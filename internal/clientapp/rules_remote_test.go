@@ -28,6 +28,23 @@ func startRulesServer(t *testing.T, body *atomic.Value) *httptest.Server {
 	return srv
 }
 
+// startStickyTarget 启动目标站点：首个响应保持 keep-alive（在代理转发路径上留下
+// 一条可被复用的空闲连接，暴露“规则变化后仍复用旧路由连接”的问题）；之后的
+// 响应带 Connection: close——经隧道的请求在响应结束时立即关闭隧道，使节点侧
+// 的隧道完成日志可以即时作为“确实经过出口”的证据。
+func startStickyTarget(t *testing.T) *httptest.Server {
+	t.Helper()
+	var n atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if n.Add(1) > 1 {
+			w.Header().Set("Connection", "close")
+		}
+		_, _ = w.Write([]byte("target-ok"))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // countLog 统计日志缓冲中出现子串的行数（每行一条 JSON 记录）。
 func countLog(buf *lockedBuffer, substr string) int {
 	n := 0
@@ -51,6 +68,21 @@ func waitLogCount(t *testing.T, buf *lockedBuffer, substr string, want int, msg 
 	t.Fatalf("%s: log %q count = %d, want >= %d in:\n%s", msg, substr, countLog(buf, substr), want, buf.String())
 }
 
+// waitNodeTunnels 等待出口节点完成指定数量的隧道转发（nodeLogs 为服务端日志）。
+// 它是“请求确实走了出口”的硬证据：仅当客户端重新建连并经隧道才会出现。
+func waitNodeTunnels(t *testing.T, nodeLogs *lockedBuffer, want int, msg string) {
+	t.Helper()
+	const tunnel = `"msg":"tunnel completed"`
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if countLog(nodeLogs, tunnel) >= want {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s: node tunnel count = %d, want >= %d in:\n%s", msg, countLog(nodeLogs, tunnel), want, nodeLogs.String())
+}
+
 // TestE2ERulesRemoteRefreshFlipsRoute 验证远程规则按周期刷新并原子生效：
 // 初始规则让回环目标直连；远程内容改成走代理后，一个新刷新周期内
 // 后续请求改用出口节点，全程请求成功。
@@ -59,8 +91,10 @@ func TestE2ERulesRemoteRefreshFlipsRoute(t *testing.T) {
 	body.Store(remoteRulesDirectLoopback)
 	rulesSrv := startRulesServer(t, &body)
 
-	node := startServer(t, "node-secret", nil, false)
-	target := startPlainTarget(t)
+	nodeLogs := &lockedBuffer{}
+	nodeLogger := slog.New(slog.NewJSONHandler(nodeLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	node := startServer(t, "node-secret", nodeLogger, false)
+	target := startStickyTarget(t)
 
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -85,7 +119,9 @@ func TestE2ERulesRemoteRefreshFlipsRoute(t *testing.T) {
 	if got := readBody(t, resp); resp.StatusCode != http.StatusOK || got != "target-ok" {
 		t.Fatalf("request after refresh: status=%d body=%q", resp.StatusCode, got)
 	}
-	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 1, "proxy route not observed after refresh")
+	waitLogCount(t, clientLogs, `"route":"proxy"`, 1, "proxy route not observed after refresh")
+	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 1, "flipped request reused the old-route connection")
+	waitNodeTunnels(t, nodeLogs, 1, "flipped request served over a stale direct connection")
 
 	// /stats 暴露规则源状态。
 	var stats struct {
@@ -113,8 +149,10 @@ func TestE2ERulesRemoteFailureKeepsRules(t *testing.T) {
 	body.Store(remoteRulesDirectLoopback)
 	rulesSrv := startRulesServer(t, &body)
 
-	node := startServer(t, "node-secret", nil, false)
-	target := startPlainTarget(t)
+	nodeLogs := &lockedBuffer{}
+	nodeLogger := slog.New(slog.NewJSONHandler(nodeLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	node := startServer(t, "node-secret", nodeLogger, false)
+	target := startStickyTarget(t)
 
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -147,7 +185,9 @@ func TestE2ERulesRemoteFailureKeepsRules(t *testing.T) {
 	if got := readBody(t, resp); resp.StatusCode != http.StatusOK || got != "target-ok" {
 		t.Fatalf("request after recovery: status=%d body=%q", resp.StatusCode, got)
 	}
-	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 1, "proxy route not observed after recovery")
+	waitLogCount(t, clientLogs, `"route":"proxy"`, 1, "proxy route not observed after recovery")
+	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 1, "recovered request reused the old-route connection")
+	waitNodeTunnels(t, nodeLogs, 1, "recovered request served over a stale direct connection")
 }
 
 // TestE2ERulesSighupRechecksURL 验证 SIGHUP 热加载会让 URL 规则源立即重拉：
@@ -157,8 +197,10 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	body.Store(remoteRulesDirectLoopback)
 	rulesSrv := startRulesServer(t, &body)
 
-	node := startServer(t, "node-secret", nil, false)
-	target := startPlainTarget(t)
+	nodeLogs := &lockedBuffer{}
+	nodeLogger := slog.New(slog.NewJSONHandler(nodeLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	node := startServer(t, "node-secret", nodeLogger, false)
+	target := startStickyTarget(t)
 
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -184,7 +226,9 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	if got := readBody(t, resp); resp.StatusCode != http.StatusOK || got != "target-ok" {
 		t.Fatalf("request after sighup: status=%d body=%q", resp.StatusCode, got)
 	}
-	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 1, "new rules not applied on sighup")
+	waitLogCount(t, clientLogs, `"route":"proxy"`, 1, "new rules not applied on sighup")
+	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 1, "sighup request reused the old-route connection")
+	waitNodeTunnels(t, nodeLogs, 1, "sighup request served over a stale direct connection")
 
 	// 规则服务不可用 + SIGHUP：重载成功但保持现有规则（容错语义）。
 	rulesSrv.Close()
@@ -196,5 +240,7 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	if got := readBody(t, resp); resp.StatusCode != http.StatusOK || got != "target-ok" {
 		t.Fatalf("request after failed recheck: status=%d body=%q", resp.StatusCode, got)
 	}
-	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 2, "rules lost after failed recheck")
+	waitLogCount(t, clientLogs, `"route":"proxy"`, 2, "rules lost after failed recheck")
+	waitLogCount(t, clientLogs, `"upstream":"`+node.addr+`"`, 2, "second proxied request did not go through the node")
+	waitNodeTunnels(t, nodeLogs, 2, "second proxied request did not complete through the node")
 }

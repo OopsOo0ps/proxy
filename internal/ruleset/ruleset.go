@@ -98,6 +98,10 @@ type Options struct {
 	Metrics *metrics.Metrics
 	// Now 注入时钟（测试用），默认 time.Now。
 	Now func() time.Time
+	// OnChange 在生效引擎发生切换后调用（规则内容变化或 UpdateOptions 变更参数，
+	// 初始加载成功也会调用一次）：用于失效与路由相关的缓存（例如转发路径的
+	// 空闲连接池）。回调在锁外执行，必须并发安全。
+	OnChange func()
 
 	// fetchClient 允许包内测试注入自定义 HTTP 客户端（nil = 内置客户端）。
 	fetchClient *http.Client
@@ -137,6 +141,8 @@ type Provider struct {
 	m     *metrics.Metrics
 	now   func() time.Time
 
+	onChange func()
+
 	loopMu  sync.Mutex
 	cancel  context.CancelFunc
 	done    chan struct{}
@@ -162,12 +168,13 @@ func New(opts Options) (*Provider, error) {
 		now = time.Now
 	}
 	p := &Provider{
-		spec:  SpecOf(opts.FilePath, opts.URL, opts.RefreshInterval),
-		opts:  routing.Options{Default: opts.Default, PrivateDirect: opts.PrivateDirect},
-		log:   logger,
-		m:     opts.Metrics,
-		now:   now,
-		fetch: resolveFetchConfig(opts),
+		spec:     SpecOf(opts.FilePath, opts.URL, opts.RefreshInterval),
+		opts:     routing.Options{Default: opts.Default, PrivateDirect: opts.PrivateDirect},
+		log:      logger,
+		m:        opts.Metrics,
+		now:      now,
+		onChange: opts.OnChange,
+		fetch:    resolveFetchConfig(opts),
 	}
 
 	empty, err := routing.NewEngine(nil, p.opts)
@@ -225,6 +232,7 @@ func (p *Provider) UpdateOptions(def routing.Action, privateDirect bool) {
 		return
 	}
 	p.engine.Store(engine)
+	p.notifyChange()
 }
 
 // Recheck 立即重新检查一次规则源，供配置热加载（SIGHUP）调用：
@@ -337,17 +345,19 @@ func (p *Provider) attempt(ctx context.Context) error {
 	hash := hashOf(data)
 
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.loaded && hash == p.hash {
 		p.lastSuccess = p.now()
 		p.lastErr = ""
+		successAt := p.lastSuccess
+		p.mu.Unlock()
 		p.m.RulesetRefresh(metrics.RulesetUnchanged)
-		p.m.SetRulesetLastSuccess(p.lastSuccess)
+		p.m.SetRulesetLastSuccess(successAt)
 		return nil
 	}
 	engine, err := routing.NewEngine(rules, p.opts)
 	if err != nil {
 		p.lastErr = err.Error()
+		p.mu.Unlock()
 		p.m.RulesetRefresh(metrics.RulesetError)
 		return err
 	}
@@ -356,11 +366,24 @@ func (p *Provider) attempt(ctx context.Context) error {
 	p.loaded = true
 	p.lastSuccess = p.now()
 	p.lastErr = ""
+	successAt := p.lastSuccess
+	count := len(rules.Rules)
 	p.engine.Store(engine)
+	p.mu.Unlock()
+	// 先让调用方失效路由相关缓存（如转发路径空闲连接），再记录指标：
+	// 外部观察到 success 计数时，缓存失效已完成。
+	p.notifyChange()
 	p.m.RulesetRefresh(metrics.RulesetSuccess)
-	p.m.SetRulesetLastSuccess(p.lastSuccess)
-	p.m.SetRulesetRules(len(rules.Rules))
+	p.m.SetRulesetLastSuccess(successAt)
+	p.m.SetRulesetRules(count)
 	return nil
+}
+
+// notifyChange 调用变化回调（锁外执行，nil 时为空操作）。
+func (p *Provider) notifyChange() {
+	if p.onChange != nil {
+		p.onChange()
+	}
 }
 
 // recordError 记录一次失败的读取 / 拉取（状态 + 指标）。

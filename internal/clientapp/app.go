@@ -441,6 +441,9 @@ func (a *App) Reload(next *config.Client) (err error) {
 		rt.pool.StartHealthChecks(a.poolCtx())
 	}
 	if rt.rules != cur.rules {
+		// 规则源整体替换时兜底失效转发路径空闲连接：新源首次拉取失败等
+		// 场景不会触发 OnChange，但后续请求的决策已按新运行时生效。
+		a.dropForwardIdleConns()
 		rt.rules.Start(a.poolCtx())
 	}
 	a.policy.snap.Store(rt)
@@ -611,11 +614,21 @@ func (a *App) buildRuleset(cfg *config.Client, reuse *clientRuntime) (*ruleset.P
 		PrivateDirect:   privateDirect,
 		Logger:          a.logger,
 		Metrics:         a.metrics,
+		OnChange:        a.dropForwardIdleConns,
 	})
 	if err != nil {
 		return nil, err
 	}
 	return prov, nil
+}
+
+// dropForwardIdleConns 在分流规则变化后丢弃转发路径（绝对地址请求）的空闲
+// 上游连接，避免后续请求复用到旧路由建立的连接；在途请求不受影响，
+// 新请求按新规则重新建连。httpSrv 在 App 生命周期内只创建一次，读安全。
+func (a *App) dropForwardIdleConns() {
+	if a.httpSrv != nil {
+		a.httpSrv.CloseIdleConnections()
+	}
 }
 
 // buildAuth 构建入站凭据存储；未配置认证时返回 nil。

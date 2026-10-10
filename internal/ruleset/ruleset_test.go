@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -324,6 +325,50 @@ func TestUpdateOptionsRecompilesWithoutFetch(t *testing.T) {
 	}
 	if got := tr.requests(); got != before {
 		t.Fatalf("options update triggered a fetch: %d -> %d", before, got)
+	}
+}
+
+func TestOnChangeFiresOnEngineSwap(t *testing.T) {
+	tr := &fakeTransport{status: 200, body: rulesV1}
+	var changes atomic.Int64
+	p, err := New(Options{
+		URL:             "http://rules.test/rules.yaml",
+		RefreshInterval: 10 * time.Millisecond,
+		Default:         routing.Proxy,
+		Logger:          discardLogger(),
+		OnChange:        func() { changes.Add(1) },
+		fetchClient:     &http.Client{Transport: tr},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := changes.Load(); got != 1 {
+		t.Fatalf("changes after initial load = %d, want 1", got)
+	}
+
+	// 未变化的周期刷新不触发回调。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+	defer p.Close()
+	waitFor(t, 3*time.Second, "unchanged refresh ran", func() bool { return tr.requests() >= 2 })
+	if got := changes.Load(); got != 1 {
+		t.Fatalf("changes after unchanged refresh = %d, want 1", got)
+	}
+
+	// 内容变化触发一次。
+	tr.set(200, rulesV2)
+	waitFor(t, 3*time.Second, "changed content applied", func() bool {
+		return p.Decide("a.example.net") == routing.Direct && changes.Load() == 2
+	})
+	if got := changes.Load(); got != 2 {
+		t.Fatalf("changes after content change = %d, want 2", got)
+	}
+
+	// 引擎参数变化触发一次。
+	p.UpdateOptions(routing.Direct, true)
+	if got := changes.Load(); got != 3 {
+		t.Fatalf("changes after options update = %d, want 3", got)
 	}
 }
 
