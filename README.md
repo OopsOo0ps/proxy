@@ -53,6 +53,7 @@ flowchart LR
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
 | 动态日志级别 | 运维端点 `GET/PUT /log/level` 运行时切换 debug/info/warn/error，无需重启 |
+| 配置热加载 | `SIGHUP` 重新加载配置文件：先校验、后原子切换；失败保持旧配置继续服务（见「配置热加载」） |
 | 指标 | `/metrics` 暴露 `requests_total`、`request_duration_seconds`、`active_connections` |
 | 健康检查 | `/health` 存活与依赖检查；依赖不可用时返回 503（`proxy-client` 检查出口节点池，`proxy-server` 检查 TLS 证书有效期） |
 | 运行时状态 | `/stats` 运行时快照：活跃连接数、出口节点状态（健康 / 连续失败 / 冷却剩余）、内存占用 |
@@ -317,6 +318,54 @@ printf 'nameserver 127.0.0.1\n' | sudo tee /etc/resolv.conf
 **下一步条件**：引入 TUN 模式时，把 fake-IP 作为 `dns.mode` 的可选策略实现
 （网关分配假地址，代理入站按假地址反查域名），并复用本节同一套分流语义。
 
+### 配置热加载（SIGHUP）
+
+`proxy-client` 与 `proxy-server` 支持不重启进程重新加载同一份配置文件：
+
+```sh
+kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
+# systemd 单元中配置：ExecReload=/bin/kill -s HUP $MAINPID
+```
+
+语义（“配置错误不炸线上”）：
+
+- **先构建、后切换**：收到 SIGHUP 后重新读取并严格解析、校验配置文件，构建出完整的
+  新运行时（规则文件、证书、凭据、节点池）后才一次性生效。任一步失败——YAML 错误、
+  未知字段、校验不通过、规则文件 / 证书文件读取失败——都会放弃本次重载并记录失败原因，
+  进程保持旧配置继续服务。
+- **原子生效**：生效边界为“新连接”——切换瞬间已在处理的请求 / 隧道继续使用旧配置，
+  之后到达的连接使用新配置，不会出现半新半旧的状态。
+- **拒绝无法原子完成的变更**：监听地址（`inbound.*`、`listen`、`metrics.listen`、`dns.listen`）
+  属于进程启动时绑定的资源，变更会被明确拒绝并提示需要重启，旧配置保持不变。
+
+热加载生效范围：
+
+| 配置 | proxy-client | proxy-server |
+| --- | --- | --- |
+| 入站凭据 / 隧道用户 | ✅ `inbound.auth` | ✅ `users` |
+| 出口节点与分流 | ✅ `nodes`、`routing.*`（含规则文件内容变化） | — |
+| TLS | ✅ `tls.ca_file`、`tls.insecure_skip_verify` | ✅ `tls.cert_file` / `key_file`（证书轮换） |
+| 连接池 / 超时 / 连接上限 | ✅ `pool.*`、`timeouts.*`、`limits.*` | ✅ `timeouts.*`、`limits.*` |
+| 日志级别与格式 | ✅ `log.*` | ✅ `log.*` |
+| 伪装页 | — | ✅ `decoy_file` |
+| 监听地址 | ❌ 需重启 | ❌ 需重启 |
+
+说明：
+
+- 重载会重建受影响的运行时组件：出口节点或连接池参数变化时预热池整体重建
+  （旧空闲连接关闭、按新配置重新预热）；只改分流规则或凭据时不会抖动预热连接。
+- 每次重载尝试都计入 `config_reloads_total{result}`；成功时日志输出
+  `configuration reloaded`，失败时输出
+  `config reload failed; keeping current configuration` 与具体原因。
+- 重载以配置文件（及启动参数 `-log-level`）为准：会覆盖此前通过 `/log/level`
+  做的运行期级别调整。
+
+```sh
+# 演示：把配置改错后（例如写入未知字段）再发 SIGHUP——进程保持旧配置继续服务，
+# 日志给出原因；改对后再发 SIGHUP 即原子生效。
+# {"level":"ERROR","msg":"config reload failed; keeping current configuration","error":"..."}
+```
+
 ## 观测
 
 ### 指标（Prometheus）
@@ -334,6 +383,7 @@ printf 'nameserver 127.0.0.1\n' | sudo tee /etc/resolv.conf
 | `upstream_pool_warm_failures_total` | counter | `node` | 后台预热拨号失败次数 |
 | `dns_queries_total` | counter | `route`、`result` | DNS 网关查询数（`route`：`direct` / `proxy` / `none`，`result`：`ok` / `error` / `invalid`） |
 | `dns_query_duration_seconds` | histogram | `route` | DNS 网关查询耗时（秒），含隧道往返 |
+| `config_reloads_total` | counter | `result` | 配置热加载尝试数（`success` / `error`） |
 
 `proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
 `result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
@@ -442,6 +492,9 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   空闲超过服务端 `timeouts.handshake` 的连接会被服务端回收，客户端领取时通过
   存活探测丢弃并回退新建。请保持 `pool.idle_ttl`（默认 5s）小于服务端握手超时
   （默认 10s）；节点不可达时预热会失败并计入 `upstream_pool_warm_failures_total`。
+- **配置热加载的边界**：监听地址变更需要重启（热加载明确拒绝并提示）；重载会重建
+  出口节点池与预热连接池，节点冷却状态随之重置；运行期通过 `/log/level` 做的
+  级别调整会被重载后的文件（或启动参数）值覆盖。
 - `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
 - 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
 - 尚未提供 systemd 单元与发行包，请通过源码构建使用。
@@ -510,7 +563,7 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 │   ├── dialer/           #   路由感知的出站拨号
 │   ├── dnsgw/            #   可选 DNS 网关（分流感知的 DNS 转发）
 │   ├── httpproxy/        #   HTTP/HTTPS 入站（CONNECT + 转发）
-│   ├── logging/          #   slog 初始化与 request_id
+│   ├── logging/          #   slog 初始化、request_id 与运行期级别/格式切换
 │   ├── metrics/          #   Prometheus 指标
 │   ├── netutil/          #   网络小工具
 │   ├── nodes/            #   出口节点池（轮询/冷却/切换）
@@ -538,6 +591,8 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 优雅关停排空（存量请求不被中断、新连接被拒绝）、过载保护（超限拒绝与恢复）、
 SOCKS5 与入站认证、DNS 网关（代理名字经出口远程解析且本地解析器零触达、
 直连名字走本机解析器、TC 截断回退 TCP、非法查询拒绝）、指标暴露与日志字段。
+配置热加载同样有端到端覆盖：坏配置重载后旧配置继续服务、凭据与出口节点热替换、
+证书轮换、监听地址变更被拒绝、成功 / 失败计数进入 `config_reloads_total`。
 CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
@@ -553,6 +608,7 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 - [x] 热路径基准测试（本机 + Ubuntu 22.04 对照）
 - [x] 动态日志级别（`/log/level` 运行时切换）
 - [x] DNS 处理策略（remote DNS 默认 + 可选 DNS 网关；fake-IP 权衡与下一步条件记录）
+- [x] 配置热加载（SIGHUP：校验失败保持旧配置，成功原子生效）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
