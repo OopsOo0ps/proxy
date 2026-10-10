@@ -196,11 +196,11 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 
 	stats, relayErr := relay.BiCopy(ctx, relay.PrefixConn(raw, br), conn, s.idleTimeout())
 	result = metrics.ResultOK
-	if !relay.IsExpected(relayErr) {
+	if relay.IsFailure(relayErr) {
 		result = metrics.ResultError
 	}
 	elapsed := time.Since(start)
-	logger.Info("request completed",
+	attrs := []any{
 		"target", target,
 		"route", route,
 		"upstream", r.Label(),
@@ -209,7 +209,11 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		"bytes_up", stats.ClientToUpstream,
 		"bytes_down", stats.UpstreamToClient,
 		"result", result,
-	)
+	}
+	if relayErr != nil {
+		attrs = append(attrs, "error", relayErr.Error())
+	}
+	logger.Info("request completed", attrs...)
 }
 
 // negotiate 完成版本/方法协商与（可选的）用户名密码认证。

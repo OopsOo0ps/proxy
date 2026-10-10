@@ -224,7 +224,9 @@ func TestE2EConnectSuccessRateAndThreeNodes(t *testing.T) {
 
 	target := startTLSTarget(t)
 	cfg := baseClientCfg(nodes)
-	app := startClient(t, cfg, nil)
+	clientLogs := &lockedBuffer{}
+	clientLogger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	app := startClient(t, cfg, clientLogger)
 
 	client := browser(t, "http://"+app.HTTPAddr(), 100)
 	const attempts = 100
@@ -247,11 +249,47 @@ func TestE2EConnectSuccessRateAndThreeNodes(t *testing.T) {
 	}
 	t.Logf("CONNECT 转发成功率 %.1f%%（%d/%d）", rate*100, success, attempts)
 
-	// 验收：至少 3 个节点全部可用——逐一确认每个节点都实际承载过成功请求
+	// 验收一：至少 3 个节点全部可用——每个节点都实际承载过请求
 	//（以服务端隧道完成日志为证据）。
-	for i, logs := range nodeLogs {
-		waitForSuccessfulTunnel(t, logs)
-		t.Logf("节点 %d 已成功承载流量", i+1)
+	// 验收二：本轮所有连接的收尾记录都不得出现 error：收尾阶段 RST/FIN
+	// 竞态曾把「数据已完整送达」的连接误记为 error（历史 flaky）；
+	// 修复后入站侧对端主动中止按正常收尾分类，这里做全量断言。
+	deadline := time.Now().Add(5 * time.Second)
+	var perNode [][]map[string]any
+	for {
+		total := 0
+		perNode = perNode[:0]
+		for _, logs := range nodeLogs {
+			records := parseRecords(t, logs, "tunnel completed")
+			perNode = append(perNode, records)
+			total += len(records)
+		}
+		if total >= success {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("隧道完成记录共 %d 条，少于成功请求数 %d", total, success)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	for i, records := range perNode {
+		if len(records) == 0 {
+			t.Errorf("节点 %d 未承载任何流量", i+1)
+			continue
+		}
+		for _, rec := range records {
+			if rec["result"] != "ok" {
+				t.Errorf("节点 %d 出现非 ok 收尾记录: %v", i+1, rec)
+			}
+		}
+		t.Logf("节点 %d 已成功承载流量（完成记录 %d 条）", i+1, len(records))
+	}
+
+	// 客户端侧：每个成功请求的 CONNECT 收尾记录同样不得出现 error。
+	for _, rec := range waitForRecordCount(t, clientLogs, `"method":"CONNECT"`, success) {
+		if rec["result"] != "ok" {
+			t.Errorf("客户端出现非 ok 收尾记录: %v", rec)
+		}
 	}
 }
 
@@ -558,38 +596,37 @@ func (b *lockedBuffer) findLine(substr string) string {
 	return ""
 }
 
-// findLineFunc 返回第一条满足 predicate 的日志行；没有时返回空串。
-func (b *lockedBuffer) findLineFunc(predicate func(string) bool) string {
-	for _, line := range strings.Split(b.String(), "\n") {
-		if predicate(line) {
-			return line
+// parseRecords 解析缓冲中所有包含 substr 的 JSON 记录行。
+func parseRecords(t *testing.T, buf *lockedBuffer, substr string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if !strings.Contains(line, substr) {
+			continue
 		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("log line is not valid JSON: %v (%q)", err, line)
+		}
+		out = append(out, rec)
 	}
-	return ""
+	return out
 }
 
-// waitForSuccessfulTunnel 轮询节点日志，直到出现一条「隧道完成且 result=ok」的记录。
-//
-// 只要求“存在成功记录”，不要求它是第一条：连接拆除阶段偶发的 RST/FIN 竞态
-// 会把个别已完成转发的隧道记为 error（客户端侧此时依然全部成功），
-// 而“首条记录必须 ok”的断言会命中这类时序抖动造成假失败。
-func waitForSuccessfulTunnel(t *testing.T, buf *lockedBuffer) {
+// waitForRecordCount 轮询缓冲，直到包含 substr 的记录达到 want 条后返回全部记录。
+func waitForRecordCount(t *testing.T, buf *lockedBuffer, substr string, want int) []map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
+	var records []map[string]any
 	for time.Now().Before(deadline) {
-		line := buf.findLineFunc(func(line string) bool {
-			return strings.Contains(line, "tunnel completed") && strings.Contains(line, `"result":"ok"`)
-		})
-		if line != "" {
-			var record map[string]any
-			if err := json.Unmarshal([]byte(line), &record); err != nil {
-				t.Fatalf("log line is not valid JSON: %v (%q)", err, line)
-			}
-			return
+		records = parseRecords(t, buf, substr)
+		if len(records) >= want {
+			return records
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("no successful tunnel record found in:\n%s", buf.String())
+	t.Fatalf("记录数 %d < %d（substr=%q）:\n%s", len(records), want, substr, buf.String())
+	return nil
 }
 
 func waitForLog(t *testing.T, buf *lockedBuffer, substr string) map[string]any {

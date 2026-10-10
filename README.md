@@ -478,7 +478,10 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 | `ruleset_rules` | gauge | — | 当前生效的规则条数 |
 
 `proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
-`result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
+`result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。`ok` 包含**对端主动中止**：
+连接拆除阶段的 TCP RST / EPIPE（浏览器读满响应后直接关闭、Linux 上 TLS 目标站点读完
+`close_notify` 后关闭连接等内核行为）——此时转发通常已完整送达，错误详情保留在完成
+日志的 `error` 字段，不单独计入 `error`。
 `ruleset_*` 系列仅 `proxy-client` 配置了规则源（`routing.rules_file` 或
 `routing.rules_url`）时产生数据。
 `upstream_pool_*` 系列仅 `proxy-client` 输出：连接池默认开启（`pool.max_idle: 2`），
@@ -568,6 +571,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 | `client_ip` | 来源地址 |
 | `upstream` | 命中的出口节点地址；直连为 `direct`，连接池复用为 `pool` |
 | `duration` / `duration_ms` | 可读耗时与毫秒数 |
+| `error` | 收尾错误的详情与来源标注（`client:` 入站侧 / `upstream:` 出站侧，如 `client: read tcp ...: connection reset by peer`）；正常结束时省略 |
 | 其他 | `proto`、`target`、`route`、`result`、`bytes_up`、`bytes_down`、`user`（服务端）等 |
 
 示例（客户端）：
@@ -615,6 +619,9 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   出口节点池与预热连接池（当 `nodes`、`pool`、`health_check`、`tls`、`timeouts`
   变化时），节点冷却与摘除状态随之重置；运行期通过 `/log/level` 做的级别调整会被
   重载后的文件（或启动参数）值覆盖。
+- **收尾中止不可区分**：TCP RST / EPIPE 既可能是收尾竞态（数据已完整送达），也可能
+  是传输中途被截断——relay 层看不到应用语义，两者都按正常收尾计入 `result=ok`；
+  唯一的区分途径是完成日志的 `error` 字段（含 `client` / `upstream` 来源标注）。
 - **远程规则（`rules_url`）的边界**：不含本地缓存——进程重启后若首次拉取失败，
   会以空规则（仅默认动作与内置直连行为）继续运行，直到某次刷新或 SIGHUP 重拉
   成功；仅支持单一规则源（本地文件与远程 URL 二选一，不支持多 URL 合并）；

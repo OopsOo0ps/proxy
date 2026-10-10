@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +20,70 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/socks5"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 )
+
+// logBuffer 是并发安全的日志缓冲（slog handler 可能与测试协程并发写入）。
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitTunnelRecord 轮询日志缓冲，直到出现一条 tunnel completed 完成记录。
+func waitTunnelRecord(t *testing.T, buf *logBuffer) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if !strings.Contains(line, "tunnel completed") {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("log line is not valid JSON: %v (%q)", err, line)
+			}
+			return rec
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("no tunnel completed record in:\n%s", buf.String())
+	return nil
+}
+
+// startResetAfterWrite 启动一个目标：读到首个请求字节后写出 payload，
+// 随即以 RST 断开（模拟出站侧异常中止）。
+func startResetAfterWrite(t *testing.T, payload []byte) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen reset target: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		buf := make([]byte, 64)
+		_, _ = conn.Read(buf)
+		_, _ = conn.Write(payload)
+		if tcp, ok := conn.(*net.TCPConn); ok {
+			_ = tcp.SetLinger(0)
+		}
+		_ = conn.Close()
+	}()
+	return ln.Addr().String()
+}
 
 func TestWriteReadRequestRoundTrip(t *testing.T) {
 	hash := auth.SHA224Hex("secret")
@@ -207,6 +274,117 @@ func TestServerHappyPath(t *testing.T) {
 	}
 	if string(got) != string(payload) {
 		t.Fatalf("echo = %q, want %q", got, payload)
+	}
+}
+
+// TestServerClientResetDuringRelayIsNotError：对端（proxy-client / 浏览器
+// 链路）在数据完整转发后的收尾阶段直接 RST——这正是 CI 偶发红的场景：
+// 完成记录必须按正常收尾记为 result=ok（错误详情保留在日志中），
+// 不能因为拆除阶段的 RST/FIN 竞态被误判为 error。
+func TestServerClientResetDuringRelayIsNotError(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port, _ := strconv.ParseUint(portStr, 10, 16)
+
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &logBuffer{}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	}, host, uint16(port))
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	payload := []byte("trojan payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read echo: %v", err)
+	}
+
+	// 数据已完整送达：不发 close_notify/FIN，直接 RST 模拟对端 abortive close。
+	raw, ok := conn.(*tls.Conn).NetConn().(*net.TCPConn)
+	if !ok {
+		t.Fatal("tunnel is not backed by *net.TCPConn")
+	}
+	if err := raw.SetLinger(0); err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.Close()
+
+	rec := waitTunnelRecord(t, logs)
+	if rec["result"] != "ok" {
+		t.Fatalf("result = %v, want ok (record: %v)", rec["result"], rec)
+	}
+	if detail, _ := rec["error"].(string); !strings.Contains(detail, "connection reset") {
+		t.Fatalf("error detail = %q, want 收到 connection reset 详情", detail)
+	}
+}
+
+// TestServerUpstreamResetDuringRelayIsNotError：出站侧（目标站点）RST 同样是
+// 收尾中止（Linux 上 TLS 目标站点读完 close_notify 后关闭、未读 FIN 触发
+// 内核 RST），完成记录记为 result=ok，错误详情带 upstream 来源标注。
+func TestServerUpstreamResetDuringRelayIsNotError(t *testing.T) {
+	targetAddr := startResetAfterWrite(t, []byte("partial"))
+	host, portStr, _ := net.SplitHostPort(targetAddr)
+	port, _ := strconv.ParseUint(portStr, 10, 16)
+
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &logBuffer{}
+	srv := &Server{
+		Verifier: store,
+		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+			return net.Dial("tcp", addr)
+		},
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	}
+	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
+
+	conn, err := Dial(context.Background(), ClientConfig{
+		ServerAddr: nodeAddr,
+		Password:   "secret",
+		TLSConfig:  clientTLS,
+	}, host, uint16(port))
+	if err != nil {
+		t.Fatalf("trojan.Dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := conn.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Read(make([]byte, 8)); err != nil {
+		t.Fatalf("read partial response: %v", err)
+	}
+	_ = conn.(*tls.Conn).CloseWrite()
+
+	rec := waitTunnelRecord(t, logs)
+	if rec["result"] != "ok" {
+		t.Fatalf("result = %v, want ok (record: %v)", rec["result"], rec)
+	}
+	if detail, _ := rec["error"].(string); !strings.Contains(detail, "upstream") || !strings.Contains(detail, "connection reset") {
+		t.Fatalf("error detail = %q, want upstream 来源标注与 connection reset 详情", detail)
 	}
 }
 

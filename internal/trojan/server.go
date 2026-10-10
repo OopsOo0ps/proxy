@@ -197,11 +197,11 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	clientConn := relay.PrefixConn(conn, br)
 	stats, relayErr := relay.BiCopy(relayCtx, clientConn, upstream, s.idleTimeout())
 	result = metrics.ResultOK
-	if !relay.IsExpected(relayErr) {
+	if relay.IsFailure(relayErr) {
 		result = metrics.ResultError
 	}
 	elapsed := time.Since(start)
-	logger.Info("tunnel completed",
+	attrs := []any{
 		"user", user,
 		"target", target,
 		"route", metrics.RouteDirect,
@@ -211,7 +211,11 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 		"bytes_up", stats.ClientToUpstream,
 		"bytes_down", stats.UpstreamToClient,
 		"result", result,
-	)
+	}
+	if relayErr != nil {
+		attrs = append(attrs, "error", relayErr.Error())
+	}
+	logger.Info("tunnel completed", attrs...)
 }
 
 // serveDecoy 写出伪装网页并优雅关闭，避免 RST 截断响应。
