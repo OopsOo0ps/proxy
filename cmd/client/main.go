@@ -1,4 +1,5 @@
-// Command proxy-client 是 Proxy 的本机客户端进程（当前为骨架实现）。
+// Command proxy-client 是本机代理入口：
+// 提供 HTTP/HTTPS 与 SOCKS5 入站，按规则直连或经出口节点隧道转发。
 package main
 
 import (
@@ -9,34 +10,69 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/OopsOo0ps/proxy/internal/clientapp"
+	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/pkg/version"
 )
 
 func main() {
 	showVersion := flag.Bool("version", false, "print version information and exit")
-	logLevel := flag.String("log-level", "info", "log level: debug|info|warn|error")
+	configPath := flag.String("config", "", "path to client config file (YAML)")
+	logLevel := flag.String("log-level", "", "override log level from config: debug|info|warn|error")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("proxy-client %s\n", version.Get())
 		return
 	}
+	if *configPath == "" {
+		fmt.Fprintln(os.Stderr, "proxy-client: -config is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	cfg, err := config.LoadClient(*configPath)
+	if err != nil {
+		fatal(err)
+	}
+	if *logLevel != "" {
+		cfg.Log.Level = *logLevel
+	}
 
 	info := version.Get()
-	logger := logging.New(*logLevel)
+	logger := logging.New(cfg.Log.Level, cfg.Log.Format)
 	logger.Info("starting proxy-client",
 		"version", info.Version,
 		"commit", info.Commit,
 		"platform", info.Platform,
 	)
 
-	// 骨架阶段：尚未监听本地代理端口。这里先演示生产服务的基本形态——
-	// 阻塞等待退出信号并优雅收尾；本地代理入口将按 README 路线图逐步合入。
+	app, err := clientapp.New(cfg, logger)
+	if err != nil {
+		fatal(err)
+	}
+	if err := app.Listen(); err != nil {
+		fatal(err)
+	}
+	logger.Info("listening",
+		"http", app.HTTPAddr(),
+		"socks5", app.SOCKS5Addr(),
+		"metrics", app.MetricsAddr(),
+		"nodes", len(cfg.Nodes),
+		"routing_default", cfg.Routing.Default,
+	)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	logger.Info("skeleton build: local proxy entry is not implemented yet; waiting for shutdown signal")
-	<-ctx.Done()
-	logger.Info("shutdown signal received, exiting")
+	if err := app.Serve(ctx); err != nil {
+		fatal(err)
+	}
+	logger.Info("shutdown complete")
+}
+
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "proxy-client: %v\n", err)
+	os.Exit(1)
 }
