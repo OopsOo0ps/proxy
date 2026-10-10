@@ -28,6 +28,11 @@ func NewTLSCertificate() (tls.Certificate, []byte, error) {
 
 // newCert 生成密钥与自签证书，返回证书对象与 PEM 编码的证书、私钥。
 func newCert() (tls.Certificate, []byte, []byte, error) {
+	return newCertWithValidity(time.Now().Add(-time.Hour), time.Now().Add(24*time.Hour))
+}
+
+// newCertWithValidity 以指定有效期生成密钥与自签证书。
+func newCertWithValidity(notBefore, notAfter time.Time) (tls.Certificate, []byte, []byte, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, nil, nil, err
@@ -39,8 +44,8 @@ func newCert() (tls.Certificate, []byte, []byte, error) {
 	template := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "proxy-test"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
@@ -76,6 +81,21 @@ func WriteTLSCertFiles(dir string) (certFile, keyFile string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	return writeCertFiles(dir, certPEM, keyPEM)
+}
+
+// WriteTLSCertFilesWithValidity 生成指定有效期的自签证书并写入目录，
+// 返回 cert/key 文件路径（用于过期证书等测试场景）。
+func WriteTLSCertFilesWithValidity(dir string, notBefore, notAfter time.Time) (certFile, keyFile string, err error) {
+	_, certPEM, keyPEM, err := newCertWithValidity(notBefore, notAfter)
+	if err != nil {
+		return "", "", err
+	}
+	return writeCertFiles(dir, certPEM, keyPEM)
+}
+
+// writeCertFiles 把证书与私钥 PEM 写入目录。
+func writeCertFiles(dir string, certPEM, keyPEM []byte) (certFile, keyFile string, err error) {
 	certFile = filepath.Join(dir, "cert.pem")
 	keyFile = filepath.Join(dir, "key.pem")
 	if err := os.WriteFile(certFile, certPEM, 0o600); err != nil {

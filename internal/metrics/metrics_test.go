@@ -78,4 +78,30 @@ func TestNilMetricsSafe(t *testing.T) {
 	if m.Handler() == nil {
 		t.Fatal("nil metrics Handler should not be nil")
 	}
+	if m.ActiveByProto() != nil {
+		t.Fatal("nil metrics ActiveByProto should return nil")
+	}
+}
+
+func TestActiveByProtoSnapshot(t *testing.T) {
+	m := New()
+	m.ConnOpened(ProtoHTTP)
+	m.ConnOpened(ProtoHTTP)
+	m.ConnOpened(ProtoSOCKS5)
+
+	snap := m.ActiveByProto()
+	if snap[ProtoHTTP] != 2 {
+		t.Fatalf("http = %d, want 2", snap[ProtoHTTP])
+	}
+	if snap[ProtoSOCKS5] != 1 {
+		t.Fatalf("socks5 = %d, want 1", snap[ProtoSOCKS5])
+	}
+	if snap[ProtoTunnel] != 0 {
+		t.Fatalf("tunnel = %d, want 0", snap[ProtoTunnel])
+	}
+
+	m.ConnClosed(ProtoHTTP)
+	if got := m.ActiveByProto()[ProtoHTTP]; got != 1 {
+		t.Fatalf("after close http = %d, want 1", got)
+	}
 }

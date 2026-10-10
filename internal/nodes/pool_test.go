@@ -247,3 +247,79 @@ func TestNewValidation(t *testing.T) {
 		t.Fatal("empty password should be rejected")
 	}
 }
+
+func TestSnapshotReflectsFailuresAndCooldown(t *testing.T) {
+	rec := newRecorder()
+	rec.setErr("node1.example.com:443", errors.New("boom"))
+
+	now := time.Now()
+	clock := func() time.Time { return now }
+	pool, err := New(testNodes(), rec.dial, Options{Cooldown: 30 * time.Second, Now: clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 初始：全部健康，无失败记录。
+	snap := pool.Snapshot()
+	if len(snap) != 3 {
+		t.Fatalf("snapshot len = %d, want 3", len(snap))
+	}
+	for _, n := range snap {
+		if !n.Healthy || n.Fails != 0 || n.CooldownRemaining != 0 {
+			t.Fatalf("initial snapshot = %+v, want 健康且无失败", n)
+		}
+	}
+	if !pool.AnyHealthy() {
+		t.Fatal("初始应存在健康节点")
+	}
+
+	// 一次拨号：node1 失败进入冷却（随后 node2 成功）。
+	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	snap = pool.Snapshot()
+	byAddr := map[string]Status{}
+	for _, n := range snap {
+		byAddr[n.Addr] = n
+	}
+	n1 := byAddr["node1.example.com:443"]
+	if n1.Healthy || n1.Fails != 1 || n1.CooldownRemaining != 30*time.Second {
+		t.Fatalf("node1 snapshot = %+v, want 冷却中（30s，1 次失败）", n1)
+	}
+	if n2 := byAddr["node2.example.com:443"]; !n2.Healthy {
+		t.Fatalf("node2 snapshot = %+v, want 健康", n2)
+	}
+	if !pool.AnyHealthy() {
+		t.Fatal("node2 健康时应报告存在可用节点")
+	}
+
+	// 冷却到期后视为健康。
+	now = now.Add(31 * time.Second)
+	if n1 := pool.Snapshot()[0]; !n1.Healthy || n1.CooldownRemaining != 0 {
+		t.Fatalf("冷却到期后 snapshot = %+v, want 健康", n1)
+	}
+}
+
+func TestAnyHealthyFalseWhenAllNodesCooling(t *testing.T) {
+	rec := newRecorder()
+	for _, n := range testNodes() {
+		rec.setErr(n.Addr, errors.New("down"))
+	}
+	pool, err := New(testNodes(), rec.dial, Options{Cooldown: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 全部节点拨号失败后进入冷却。
+	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err == nil {
+		t.Fatal("expected dial error")
+	}
+	if pool.AnyHealthy() {
+		t.Fatal("全部节点冷却时应报告无健康节点")
+	}
+	for _, n := range pool.Snapshot() {
+		if n.Healthy || n.Fails != 1 || n.CooldownRemaining <= 0 {
+			t.Fatalf("snapshot = %+v, want 全部冷却", n)
+		}
+	}
+}

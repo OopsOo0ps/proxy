@@ -21,7 +21,9 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/nodes"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
+	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
+	"github.com/OopsOo0ps/proxy/pkg/version"
 )
 
 // App 是组装完成的 proxy-client 实例。
@@ -33,6 +35,9 @@ type App struct {
 
 	httpSrv  *httpproxy.Server
 	socksSrv *socks5.Server
+
+	pool   *nodes.Pool
+	status *status.Status
 
 	httpLn     net.Listener
 	socksLn    net.Listener
@@ -61,6 +66,12 @@ func New(cfg *config.Client, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	app.pool = pool
+	app.status = status.New(status.Options{
+		Version: version.Get().Version,
+		Checks:  app.healthChecks(),
+		Runtime: app.runtimeStats,
+	})
 	targetDialer := dialer.New(dialer.Options{
 		Router:      engine,
 		Pool:        pool,
@@ -176,7 +187,47 @@ func (a *App) serveMetrics(ctx context.Context) error {
 func (a *App) metricsHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", a.metrics.Handler())
+	mux.Handle("/health", a.status.Health())
+	mux.Handle("/stats", a.status.Stats())
 	return mux
+}
+
+// healthChecks 返回依赖健康检查：配置了出口节点时，池中无健康节点视为依赖不可用。
+func (a *App) healthChecks() []func() error {
+	if a.pool == nil {
+		return nil
+	}
+	return []func() error{func() error {
+		if a.pool.AnyHealthy() {
+			return nil
+		}
+		return errors.New("no healthy exit nodes available")
+	}}
+}
+
+// runtimeStats 组装 /stats 快照：活跃连接数与出口节点状态。
+func (a *App) runtimeStats() status.Runtime {
+	active := a.metrics.ActiveByProto()
+	httpConns := active[metrics.ProtoHTTP]
+	socksConns := active[metrics.ProtoSOCKS5]
+	rt := status.Runtime{
+		Connections: status.Connections{
+			HTTP:   httpConns,
+			SOCKS5: socksConns,
+			Total:  httpConns + socksConns,
+		},
+	}
+	if a.pool != nil {
+		for _, n := range a.pool.Snapshot() {
+			rt.Upstreams = append(rt.Upstreams, status.Upstream{
+				Addr:              n.Addr,
+				Healthy:           n.Healthy,
+				Fails:             n.Fails,
+				CooldownRemaining: status.Seconds(n.CooldownRemaining),
+			})
+		}
+	}
+	return rt
 }
 
 // buildRouter 加载规则文件并构建分流引擎。

@@ -47,6 +47,14 @@ type state struct {
 	unhealthyUntil time.Time
 }
 
+// Status 是单个出口节点的状态快照。
+type Status struct {
+	Addr              string
+	Healthy           bool          // 当前是否不在冷却中
+	Fails             int           // 连续失败次数
+	CooldownRemaining time.Duration // 冷却剩余时间；健康时为 0
+}
+
 // New 构建节点池；节点数量至少为 1。
 func New(cfgs []config.Node, dial DialFunc, opts Options) (*Pool, error) {
 	if len(cfgs) == 0 {
@@ -76,6 +84,36 @@ func New(cfgs []config.Node, dial DialFunc, opts Options) (*Pool, error) {
 
 // Len 返回节点数量。
 func (p *Pool) Len() int { return len(p.nodes) }
+
+// Snapshot 返回所有出口节点的状态快照（并发安全，只读）。
+func (p *Pool) Snapshot() []Status {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.opts.Now()
+	snap := make([]Status, 0, len(p.nodes))
+	for _, st := range p.nodes {
+		item := Status{Addr: st.cfg.Addr, Healthy: true, Fails: st.fails}
+		if now.Before(st.unhealthyUntil) {
+			item.Healthy = false
+			item.CooldownRemaining = st.unhealthyUntil.Sub(now)
+		}
+		snap = append(snap, item)
+	}
+	return snap
+}
+
+// AnyHealthy 报告是否存在至少一个不在冷却中的节点。
+func (p *Pool) AnyHealthy() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.opts.Now()
+	for _, st := range p.nodes {
+		if !now.Before(st.unhealthyUntil) {
+			return true
+		}
+	}
+	return false
+}
 
 // Dial 依次尝试可用节点建立连接；全部失败时返回聚合错误。
 func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, config.Node, error) {
