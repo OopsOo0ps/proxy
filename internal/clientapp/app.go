@@ -251,13 +251,18 @@ func (a *App) Serve(ctx context.Context) error {
 	}()
 
 	a.policy.load().connPool.Start(ctx)
+	a.policy.load().pool.StartHealthChecks(ctx)
 	// 关停一开始就释放池内空闲连接：它们没有在途数据，
 	// 提前关闭既让服务端尽快回收，也避免排空期的新请求再领取。
 	go func() {
 		<-ctx.Done()
 		a.policy.load().connPool.Close()
+		a.policy.load().pool.Close()
 	}()
-	defer func() { a.policy.load().connPool.Close() }()
+	defer func() {
+		a.policy.load().connPool.Close()
+		a.policy.load().pool.Close()
+	}()
 
 	errCh := make(chan error, 4)
 	running := 0
@@ -368,6 +373,8 @@ func (a *App) runtimeStats() status.Runtime {
 				Healthy:           n.Healthy,
 				Fails:             n.Fails,
 				CooldownRemaining: status.Seconds(n.CooldownRemaining),
+				Removed:           n.Removed,
+				ProbeFails:        n.ProbeFails,
 				Idle:              idle[n.Addr],
 			})
 		}
@@ -413,9 +420,15 @@ func (a *App) Reload(next *config.Client) (err error) {
 	if rt.connPool != cur.connPool {
 		rt.connPool.Start(a.poolCtx())
 	}
+	if rt.pool != cur.pool {
+		rt.pool.StartHealthChecks(a.poolCtx())
+	}
 	a.policy.snap.Store(rt)
 	if rt.connPool != cur.connPool {
 		cur.connPool.Close()
+	}
+	if rt.pool != cur.pool {
+		cur.pool.Close()
 	}
 	a.limiter.SetMax(next.Limits.EffectiveMaxConnections())
 	if a.logCtrl != nil {
@@ -467,6 +480,7 @@ func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRun
 	upstreamChanged := reuse == nil ||
 		!reflect.DeepEqual(reuse.cfg.Nodes, cfg.Nodes) ||
 		!reflect.DeepEqual(reuse.cfg.Pool, cfg.Pool) ||
+		!reflect.DeepEqual(reuse.cfg.HealthCheck, cfg.HealthCheck) ||
 		!reflect.DeepEqual(reuse.cfg.TLS, cfg.TLS) ||
 		!reflect.DeepEqual(reuse.cfg.Timeouts, cfg.Timeouts)
 	if upstreamChanged {
@@ -478,7 +492,7 @@ func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRun
 		if err != nil {
 			return nil, err
 		}
-		pool, err := buildNodePool(cfg, baseTLS, connPool)
+		pool, err := buildNodePool(cfg, baseTLS, connPool, a.metrics, a.logger)
 		if err != nil {
 			connPool.Close()
 			return nil, err
@@ -568,7 +582,9 @@ func buildAuth(cfg *config.Client) (*auth.Store, error) {
 
 // buildNodePool 构建出口节点池；未配置节点时返回 nil（仅直连）。
 // 拨号优先从预热连接池领取空闲隧道；未命中或领取失效时新建隧道。
-func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.Pool) (*nodes.Pool, error) {
+// 主动健康检查对节点做 TCP+TLS 握手探测（不发 Trojan 请求、不占预热池）；
+// 节点被摘除时立即清空其空闲预热连接。
+func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.Pool, m *metrics.Metrics, logger *slog.Logger) (*nodes.Pool, error) {
 	if len(cfg.Nodes) == 0 {
 		return nil, nil
 	}
@@ -588,7 +604,42 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 			HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
 		}, host, port)
 	}
-	return nodes.New(cfg.Nodes, dialFn, nodes.Options{})
+	hc := cfg.HealthCheck
+	opts := nodes.Options{
+		Logger:  logger,
+		Metrics: m,
+		Health: nodes.HealthOptions{
+			Interval:  hc.EffectiveInterval(),
+			Timeout:   hc.EffectiveTimeout(),
+			Failures:  hc.EffectiveFailures(),
+			Successes: hc.EffectiveSuccesses(),
+		},
+		OnRemove: func(addr string) {
+			// 摘除后该节点不再接新流量：立即释放其空闲预热连接，避免积压死连接。
+			connPool.DropNode(addr)
+		},
+	}
+	if opts.Health.Interval > 0 {
+		probeTimeout := hc.EffectiveTimeout()
+		opts.Probe = func(ctx context.Context, node config.Node) error {
+			nodeTLS := baseTLS.Clone()
+			if node.SNI != "" {
+				nodeTLS.ServerName = node.SNI
+			}
+			conn, err := trojan.Connect(ctx, trojan.ClientConfig{
+				ServerAddr:       node.Addr,
+				Password:         node.Password,
+				TLSConfig:        nodeTLS,
+				DialTimeout:      probeTimeout,
+				HandshakeTimeout: probeTimeout,
+			})
+			if err != nil {
+				return err
+			}
+			return conn.Close()
+		}
+	}
+	return nodes.New(cfg.Nodes, dialFn, opts)
 }
 
 // buildConnPool 构建上游空闲隧道连接池；未启用（max_idle = 0）或未配置节点时返回 nil。

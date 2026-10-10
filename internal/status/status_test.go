@@ -95,7 +95,7 @@ func TestStatsSnapshot(t *testing.T) {
 				Connections: Connections{HTTP: 2, SOCKS5: 1, Total: 3},
 				Upstreams: []Upstream{
 					{Addr: "node1.example.com:443", Healthy: true},
-					{Addr: "node2.example.com:443", Healthy: false, Fails: 2, CooldownRemaining: 12.5},
+					{Addr: "node2.example.com:443", Healthy: false, Fails: 2, CooldownRemaining: 12.5, Removed: true, ProbeFails: 3},
 				},
 			}
 		},
@@ -123,7 +123,7 @@ func TestStatsSnapshot(t *testing.T) {
 	if len(resp.Upstreams) != 2 {
 		t.Fatalf("upstreams = %+v", resp.Upstreams)
 	}
-	if up := resp.Upstreams[1]; up.Healthy || up.Fails != 2 || up.CooldownRemaining != 12.5 {
+	if up := resp.Upstreams[1]; up.Healthy || up.Fails != 2 || up.CooldownRemaining != 12.5 || !up.Removed || up.ProbeFails != 3 {
 		t.Fatalf("upstream[1] = %+v", up)
 	}
 	if resp.Memory.Goroutines <= 0 {

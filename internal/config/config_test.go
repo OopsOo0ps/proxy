@@ -164,6 +164,103 @@ nodes:
 	}
 }
 
+func TestParseClientHealthCheckDefaults(t *testing.T) {
+	cfg, err := ParseClient([]byte(`
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.HealthCheck.EffectiveInterval(); got != 10*time.Second {
+		t.Fatalf("default health_check.interval = %v, want 10s", got)
+	}
+	if got := cfg.HealthCheck.EffectiveTimeout(); got != 3*time.Second {
+		t.Fatalf("default health_check.timeout = %v, want 3s", got)
+	}
+	if got := cfg.HealthCheck.EffectiveFailures(); got != 3 {
+		t.Fatalf("default health_check.failures = %d, want 3", got)
+	}
+	if got := cfg.HealthCheck.EffectiveSuccesses(); got != 2 {
+		t.Fatalf("default health_check.successes = %d, want 2", got)
+	}
+}
+
+func TestParseClientHealthCheckOverrides(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	// 显式配置生效。
+	cfg, err := ParseClient([]byte(base + `
+health_check:
+  interval: 2s
+  timeout: 500ms
+  failures: 5
+  successes: 1
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.HealthCheck.EffectiveInterval(); got != 2*time.Second {
+		t.Fatalf("health_check.interval = %v, want 2s", got)
+	}
+	if got := cfg.HealthCheck.EffectiveTimeout(); got != 500*time.Millisecond {
+		t.Fatalf("health_check.timeout = %v, want 500ms", got)
+	}
+	if got := cfg.HealthCheck.EffectiveFailures(); got != 5 {
+		t.Fatalf("health_check.failures = %d, want 5", got)
+	}
+	if got := cfg.HealthCheck.EffectiveSuccesses(); got != 1 {
+		t.Fatalf("health_check.successes = %d, want 1", got)
+	}
+
+	// 显式关闭：interval = 0 不会被默认值覆盖，其余字段仍取缺省。
+	cfg, err = ParseClient([]byte(base + "health_check:\n  interval: 0\n"))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.HealthCheck.EffectiveInterval(); got != 0 {
+		t.Fatalf("health_check.interval = %v, want 0（显式关闭）", got)
+	}
+	if got := cfg.HealthCheck.EffectiveTimeout(); got != 3*time.Second {
+		t.Fatalf("health_check.timeout = %v, want 3s", got)
+	}
+	if got := cfg.HealthCheck.EffectiveFailures(); got != 3 {
+		t.Fatalf("health_check.failures = %d, want 3", got)
+	}
+}
+
+func TestParseClientRejectsBadHealthCheck(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	cases := map[string]string{
+		"negative interval": base + "health_check:\n  interval: -1s\n",
+		"negative timeout":  base + "health_check:\n  timeout: -1s\n",
+		"zero failures":     base + "health_check:\n  failures: 0\n",
+		"zero successes":    base + "health_check:\n  successes: 0\n",
+		"unknown key":       base + "health_check:\n  probes: 1\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseClient([]byte(yaml)); err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
 func TestParseClientDurationSecondsFallback(t *testing.T) {
 	cfg, err := ParseClient([]byte(`
 inbound:

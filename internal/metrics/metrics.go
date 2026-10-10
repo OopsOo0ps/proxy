@@ -7,6 +7,8 @@
 //   - upstream_pool_claims_total（counter，标签 node/result）
 //   - upstream_pool_idle_connections（gauge，标签 node）
 //   - upstream_pool_warm_failures_total（counter，标签 node）
+//   - upstream_health_probes_total（counter，标签 node/result）：主动健康探测（路线图 3.3）
+//   - upstream_healthy（gauge，标签 node）：节点当前是否可接流量（0 = 已被摘除）
 //   - connections_rejected_total（counter，标签 proto）：超过连接上限被拒绝的连接
 //   - dns_queries_total（counter，标签 route/result）与 dns_query_duration_seconds
 //     （histogram，标签 route）：DNS 网关查询（路线图 3.1）
@@ -52,6 +54,12 @@ const (
 	PoolClaimStale = "stale"
 )
 
+// 主动健康探测结果标签值。
+const (
+	ProbeSuccess = "success"
+	ProbeFailure = "failure"
+)
+
 // 配置热加载结果标签值。
 const (
 	ReloadSuccess = "success"
@@ -68,6 +76,8 @@ type Metrics struct {
 	poolClaims    *prometheus.CounterVec
 	poolIdle      *prometheus.GaugeVec
 	poolWarmFails *prometheus.CounterVec
+	healthProbes  *prometheus.CounterVec
+	upstreamAlive *prometheus.GaugeVec
 	rejected      *prometheus.CounterVec
 	dnsQueries    *prometheus.CounterVec
 	dnsDuration   *prometheus.HistogramVec
@@ -103,6 +113,14 @@ func New() *Metrics {
 			Name: "upstream_pool_warm_failures_total",
 			Help: "Total number of background warm-up dial failures per node.",
 		}, []string{"node"}),
+		healthProbes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "upstream_health_probes_total",
+			Help: "Total number of active health probes per node by result (success/failure).",
+		}, []string{"node", "result"}),
+		upstreamAlive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "upstream_healthy",
+			Help: "Whether an exit node currently accepts traffic (1 = healthy, 0 = removed by health check).",
+		}, []string{"node"}),
 		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "connections_rejected_total",
 			Help: "Total number of connections rejected due to the configured connection limit.",
@@ -121,7 +139,7 @@ func New() *Metrics {
 			Help: "Total number of configuration reload attempts by result (success/error).",
 		}, []string{"result"}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.healthProbes, m.upstreamAlive, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads)
 	m.preInitialize()
 	return m
 }
@@ -233,6 +251,30 @@ func (m *Metrics) PoolWarmFailed(node string) {
 		return
 	}
 	m.poolWarmFails.WithLabelValues(node).Inc()
+}
+
+// HealthProbe 记录一次主动健康探测结果（ok 为 true 表示成功）。
+func (m *Metrics) HealthProbe(node string, ok bool) {
+	if m == nil {
+		return
+	}
+	result := ProbeFailure
+	if ok {
+		result = ProbeSuccess
+	}
+	m.healthProbes.WithLabelValues(node, result).Inc()
+}
+
+// SetUpstreamHealthy 记录节点当前是否可接流量（1 = 可接，0 = 已被主动摘除）。
+func (m *Metrics) SetUpstreamHealthy(node string, healthy bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if healthy {
+		v = 1
+	}
+	m.upstreamAlive.WithLabelValues(node).Set(v)
 }
 
 // ConnRejected 记录一次因超过连接上限被拒绝的连接。

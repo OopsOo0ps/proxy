@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -321,5 +322,285 @@ func TestAnyHealthyFalseWhenAllNodesCooling(t *testing.T) {
 		if n.Healthy || n.Fails != 1 || n.CooldownRemaining <= 0 {
 			t.Fatalf("snapshot = %+v, want 全部冷却", n)
 		}
+	}
+}
+
+// findState 返回指定地址的内部状态（同包测试内省用）。
+func findState(t *testing.T, p *Pool, addr string) *state {
+	t.Helper()
+	for _, st := range p.nodes {
+		if st.cfg.Addr == addr {
+			return st
+		}
+	}
+	t.Fatalf("state for %s not found", addr)
+	return nil
+}
+
+// snapshotFor 返回指定地址节点的状态快照。
+func snapshotFor(t *testing.T, p *Pool, addr string) Status {
+	t.Helper()
+	for _, snap := range p.Snapshot() {
+		if snap.Addr == addr {
+			return snap
+		}
+	}
+	t.Fatalf("snapshot for %s not found", addr)
+	return Status{}
+}
+
+// waitFor 轮询等待条件成立（测试辅助）。
+func waitFor(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met within deadline")
+}
+
+func TestHealthCheckRemovesThenRejoins(t *testing.T) {
+	rec := newRecorder()
+	rec.setErr("node1.example.com:443", errors.New("connection refused"))
+	var removals, rejoins []string
+	pool, err := New(testNodes(), rec.dial, Options{
+		Health: HealthOptions{Interval: time.Minute, Timeout: time.Second, Failures: 2, Successes: 2},
+		Probe:  func(context.Context, config.Node) error { return nil }, // 本用例手动驱动，不启动探测循环
+		OnRemove: func(addr string) {
+			removals = append(removals, addr)
+		},
+		OnRejoin: func(addr string) {
+			rejoins = append(rejoins, addr)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	// 先用一次真实拨号失败制造被动冷却（node1 fails=1 且处于冷却中）。
+	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	rec.setErr("node1.example.com:443", nil)
+	st := findState(t, pool, "node1.example.com:443")
+	probeErr := errors.New("tls handshake failed")
+
+	// 第 1 次探测失败：未达阈值，节点未被摘除。
+	pool.recordProbe(st, probeErr)
+	if snap := snapshotFor(t, pool, "node1.example.com:443"); snap.Removed || snap.ProbeFails != 1 {
+		t.Fatalf("snapshot after 1 probe failure = %+v, want 未摘除且探测失败 1 次", snap)
+	}
+
+	// 第 2 次探测失败：摘除（硬摘除，拨号不再经过它）。
+	pool.recordProbe(st, probeErr)
+	if snap := snapshotFor(t, pool, "node1.example.com:443"); !snap.Removed || snap.Healthy {
+		t.Fatalf("snapshot after removal = %+v, want 已摘除", snap)
+	}
+	before := rec.callsFor("node1.example.com:443")
+	for i := 0; i < 6; i++ {
+		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+			t.Fatalf("dial %d after removal: %v", i, err)
+		}
+	}
+	if got := rec.callsFor("node1.example.com:443"); got != before {
+		t.Fatalf("removed node dialed %d times, want %d（摘除后不应参与拨号）", got, before)
+	}
+	if len(removals) != 1 || removals[0] != "node1.example.com:443" {
+		t.Fatalf("OnRemove calls = %v, want 1 次 node1", removals)
+	}
+
+	// 恢复：单个成功不够（要求连续 2 次）。
+	pool.recordProbe(st, nil)
+	if snap := snapshotFor(t, pool, "node1.example.com:443"); !snap.Removed {
+		t.Fatalf("snapshot after 1 success = %+v, want 仍摘除", snap)
+	}
+	pool.recordProbe(st, nil)
+	snap := snapshotFor(t, pool, "node1.example.com:443")
+	if snap.Removed || !snap.Healthy || snap.Fails != 0 || snap.CooldownRemaining != 0 || snap.ProbeFails != 0 {
+		t.Fatalf("snapshot after rejoin = %+v, want 已加回且被动状态清零", snap)
+	}
+	if len(rejoins) != 1 || rejoins[0] != "node1.example.com:443" {
+		t.Fatalf("OnRejoin calls = %v, want 1 次 node1", rejoins)
+	}
+
+	// 加回后重新参与轮询。
+	before = rec.callsFor("node1.example.com:443")
+	used := false
+	for i := 0; i < 3; i++ {
+		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+			t.Fatalf("dial %d after rejoin: %v", i, err)
+		}
+		if rec.callsFor("node1.example.com:443") > before {
+			used = true
+		}
+	}
+	if !used {
+		t.Fatal("rejoined node should serve traffic again")
+	}
+}
+
+func TestHealthCheckRecoveryRequiresConsecutiveSuccesses(t *testing.T) {
+	rec := newRecorder()
+	var removals int
+	pool, err := New(testNodes(), rec.dial, Options{
+		Health:   HealthOptions{Interval: time.Minute, Timeout: time.Second, Failures: 1, Successes: 2},
+		Probe:    func(context.Context, config.Node) error { return nil },
+		OnRemove: func(string) { removals++ },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	st := findState(t, pool, "node1.example.com:443")
+	pool.recordProbe(st, errors.New("down"))
+	if !snapshotFor(t, pool, "node1.example.com:443").Removed {
+		t.Fatal("node1 should be removed after 1 failure (failures=1)")
+	}
+
+	// 成功、失败、成功：连续成功被失败打断，不应加回。
+	pool.recordProbe(st, nil)
+	pool.recordProbe(st, errors.New("down"))
+	pool.recordProbe(st, nil)
+	if snap := snapshotFor(t, pool, "node1.example.com:443"); !snap.Removed {
+		t.Fatalf("snapshot = %+v, want 仍摘除（成功需连续）", snap)
+	}
+
+	// 再来一次成功：连续 2 次，加回。
+	pool.recordProbe(st, nil)
+	if snap := snapshotFor(t, pool, "node1.example.com:443"); snap.Removed {
+		t.Fatalf("snapshot = %+v, want 已加回", snap)
+	}
+	// 已摘除状态下继续失败不应重复触发 OnRemove。
+	if removals != 1 {
+		t.Fatalf("OnRemove calls = %d, want 1", removals)
+	}
+}
+
+func TestHealthCheckAllRemovedFailsFast(t *testing.T) {
+	rec := newRecorder()
+	pool, err := New(testNodes(), rec.dial, Options{
+		Health: HealthOptions{Interval: time.Minute, Timeout: time.Second, Failures: 1, Successes: 1},
+		Probe:  func(context.Context, config.Node) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	probeErr := errors.New("down")
+	for _, st := range pool.nodes {
+		pool.recordProbe(st, probeErr)
+	}
+	if pool.AnyHealthy() {
+		t.Fatal("全部节点被摘除时应报告无健康节点")
+	}
+	for _, snap := range pool.Snapshot() {
+		if !snap.Removed || snap.Healthy {
+			t.Fatalf("snapshot = %+v, want 全部摘除", snap)
+		}
+	}
+	if _, _, err := pool.Dial(context.Background(), "example.com", 443); !errors.Is(err, ErrNoHealthyNodes) {
+		t.Fatalf("Dial error = %v, want ErrNoHealthyNodes", err)
+	}
+	for _, n := range testNodes() {
+		if got := rec.callsFor(n.Addr); got != 0 {
+			t.Fatalf("node %s dialed %d times, want 0（全部摘除后应快速失败）", n.Addr, got)
+		}
+	}
+}
+
+func TestHealthCheckLoopRemovesAndRejoins(t *testing.T) {
+	rec := newRecorder()
+	var failing atomic.Bool
+	failing.Store(true)
+	var probes atomic.Int64
+	pool, err := New(testNodes(), rec.dial, Options{
+		Health: HealthOptions{Interval: 5 * time.Millisecond, Timeout: 50 * time.Millisecond, Failures: 2, Successes: 2},
+		Probe: func(context.Context, config.Node) error {
+			probes.Add(1)
+			if failing.Load() {
+				return errors.New("probe failed")
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		pool.Close()
+	})
+
+	pool.StartHealthChecks(ctx)
+	waitFor(t, 3*time.Second, func() bool { return !pool.AnyHealthy() })
+	for _, snap := range pool.Snapshot() {
+		if !snap.Removed {
+			t.Fatalf("snapshot = %+v, want 探测循环连续失败后全部摘除", snap)
+		}
+	}
+
+	// 节点恢复：探测循环应自动加回。
+	failing.Store(false)
+	waitFor(t, 3*time.Second, func() bool {
+		for _, snap := range pool.Snapshot() {
+			if snap.Removed {
+				return false
+			}
+		}
+		return pool.AnyHealthy()
+	})
+	for _, snap := range pool.Snapshot() {
+		if snap.Removed || !snap.Healthy {
+			t.Fatalf("snapshot = %+v, want 全部加回", snap)
+		}
+	}
+	if probes.Load() == 0 {
+		t.Fatal("probe func should be called by the health loop")
+	}
+
+	// 重复启动应幂等（不 panic、不重复建循环）。
+	pool.StartHealthChecks(ctx)
+}
+
+func TestHealthCheckDisabledWithoutInterval(t *testing.T) {
+	var probes atomic.Int64
+	pool, err := New(testNodes(), newRecorder().dial, Options{
+		Health: HealthOptions{Interval: 0},
+		Probe: func(context.Context, config.Node) error {
+			probes.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pool.StartHealthChecks(ctx)
+	time.Sleep(30 * time.Millisecond)
+	if got := probes.Load(); got != 0 {
+		t.Fatalf("probes = %d, want 0（未配置 interval 时不应探测）", got)
+	}
+	pool.Close()
+
+	var nilPool *Pool
+	nilPool.Close() // 应安全
+}
+
+func TestNewRequiresProbeWhenHealthCheckEnabled(t *testing.T) {
+	_, err := New(testNodes(), newRecorder().dial, Options{Health: HealthOptions{Interval: time.Second}})
+	if err == nil {
+		t.Fatal("expected error when health check is enabled without a probe func")
+	}
+	if !strings.Contains(err.Error(), "probe func") {
+		t.Fatalf("error = %v, want 提及 probe func", err)
 	}
 }

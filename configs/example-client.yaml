@@ -27,6 +27,16 @@ pool:
   max_idle: 2   # 每个节点保留的最大空闲连接数；0 = 关闭
   idle_ttl: 5s  # 空闲连接最长保留时间；应小于服务端 timeouts.handshake（默认 10s）
 
+# 出口节点主动健康检查（上游故障自愈）：按周期做 TCP+TLS 握手探测，
+# 连续失败 failures 次后摘除该节点（不再参与拨号），摘除后连续成功
+# successes 次自动加回。interval: 0 可关闭主动探测（仅保留被动冷却切换）；
+# 探测不发送 Trojan 请求、不校验口令（口令错误由真实流量被动兜底）。
+health_check:
+  interval: 10s   # 探测周期；0 = 关闭
+  timeout: 3s     # 单次探测超时
+  failures: 3     # 连续失败 N 次后摘除
+  successes: 2    # 摘除后连续成功 M 次加回
+
 # 过载保护：进程级并发连接上限（HTTP + SOCKS5 合计）；0 = 不限制。
 # 超限时 HTTP 入站回 503、SOCKS5 回 0x05 0xFF；拒绝计入 connections_rejected_total。
 limits:

@@ -89,6 +89,61 @@ func (p Pool) EffectiveIdleTTL() time.Duration {
 	return p.IdleTTL.Std()
 }
 
+// HealthCheck 是出口节点的主动健康检查配置（路线图 3.3）。
+//
+// 行为：按 interval 周期对每个节点做 TCP+TLS 握手探测；节点连续探测失败
+// failures 次后被摘除（不再参与拨号），摘除后连续探测成功 successes 次
+// 自动加回。interval = 0 关闭主动探测，仅保留真实拨号失败的被动冷却切换。
+//
+// 探测只验证节点可达性与 TLS 握手，不发送 Trojan 请求、不校验口令：
+// 口令错误等隧道层问题仍由真实流量的被动冷却兜底。
+type HealthCheck struct {
+	Interval  *Duration `yaml:"interval"`  // 探测周期；缺省 10s，0 = 关闭
+	Timeout   Duration  `yaml:"timeout"`   // 单次探测超时；缺省 3s
+	Failures  *int      `yaml:"failures"`  // 连续失败 N 次后摘除；缺省 3
+	Successes *int      `yaml:"successes"` // 摘除后连续成功 M 次加回；缺省 2
+}
+
+// 主动健康检查缺省值。
+const (
+	defaultHealthInterval  = 10 * time.Second
+	defaultHealthTimeout   = 3 * time.Second
+	defaultHealthFailures  = 3
+	defaultHealthSuccesses = 2
+)
+
+// EffectiveInterval 返回生效的探测周期（缺省 10s；0 = 关闭主动探测）。
+func (h HealthCheck) EffectiveInterval() time.Duration {
+	if h.Interval == nil {
+		return defaultHealthInterval
+	}
+	return h.Interval.Std()
+}
+
+// EffectiveTimeout 返回生效的单次探测超时（缺省 3s）。
+func (h HealthCheck) EffectiveTimeout() time.Duration {
+	if h.Timeout <= 0 {
+		return defaultHealthTimeout
+	}
+	return h.Timeout.Std()
+}
+
+// EffectiveFailures 返回生效的摘除阈值（缺省 3）。
+func (h HealthCheck) EffectiveFailures() int {
+	if h.Failures == nil {
+		return defaultHealthFailures
+	}
+	return *h.Failures
+}
+
+// EffectiveSuccesses 返回生效的加回阈值（缺省 2）。
+func (h HealthCheck) EffectiveSuccesses() int {
+	if h.Successes == nil {
+		return defaultHealthSuccesses
+	}
+	return *h.Successes
+}
+
 // Inbound 描述本机入站代理监听。
 type Inbound struct {
 	HTTP   string `yaml:"http"`   // host:port，空 = 不启用
@@ -190,16 +245,17 @@ type Log struct {
 
 // Client 是 proxy-client 的完整配置。
 type Client struct {
-	Inbound  Inbound   `yaml:"inbound"`
-	Nodes    []Node    `yaml:"nodes"`
-	Pool     Pool      `yaml:"pool"`
-	Limits   Limits    `yaml:"limits"`
-	TLS      ClientTLS `yaml:"tls"`
-	Routing  Routing   `yaml:"routing"`
-	DNS      DNS       `yaml:"dns"`
-	Timeouts Timeouts  `yaml:"timeouts"`
-	Metrics  Metrics   `yaml:"metrics"`
-	Log      Log       `yaml:"log"`
+	Inbound     Inbound     `yaml:"inbound"`
+	Nodes       []Node      `yaml:"nodes"`
+	Pool        Pool        `yaml:"pool"`
+	HealthCheck HealthCheck `yaml:"health_check"`
+	Limits      Limits      `yaml:"limits"`
+	TLS         ClientTLS   `yaml:"tls"`
+	Routing     Routing     `yaml:"routing"`
+	DNS         DNS         `yaml:"dns"`
+	Timeouts    Timeouts    `yaml:"timeouts"`
+	Metrics     Metrics     `yaml:"metrics"`
+	Log         Log         `yaml:"log"`
 }
 
 // Server 是 proxy-server 的完整配置。
@@ -324,6 +380,18 @@ func (c *Client) applyDefaults() {
 	if c.Pool.IdleTTL == 0 {
 		c.Pool.IdleTTL = Duration(defaultPoolIdleTTL)
 	}
+	if c.HealthCheck.Interval == nil {
+		c.HealthCheck.Interval = durationPtr(defaultHealthInterval)
+	}
+	if c.HealthCheck.Timeout == 0 {
+		c.HealthCheck.Timeout = Duration(defaultHealthTimeout)
+	}
+	if c.HealthCheck.Failures == nil {
+		c.HealthCheck.Failures = intPtr(defaultHealthFailures)
+	}
+	if c.HealthCheck.Successes == nil {
+		c.HealthCheck.Successes = intPtr(defaultHealthSuccesses)
+	}
 	if c.Limits.MaxConnections == nil {
 		c.Limits.MaxConnections = intPtr(defaultMaxConnections)
 	}
@@ -389,6 +457,18 @@ func (c *Client) validate() error {
 	}
 	if c.Pool.IdleTTL < 0 {
 		return errors.New("pool.idle_ttl: must not be negative")
+	}
+	if c.HealthCheck.Interval != nil && c.HealthCheck.Interval.Std() < 0 {
+		return errors.New("health_check.interval: must not be negative (0 disables active probing)")
+	}
+	if c.HealthCheck.Timeout.Std() < 0 {
+		return errors.New("health_check.timeout: must not be negative")
+	}
+	if c.HealthCheck.Failures != nil && *c.HealthCheck.Failures < 1 {
+		return errors.New("health_check.failures: must be >= 1")
+	}
+	if c.HealthCheck.Successes != nil && *c.HealthCheck.Successes < 1 {
+		return errors.New("health_check.successes: must be >= 1")
 	}
 	if c.Limits.EffectiveMaxConnections() < 0 {
 		return errors.New("limits.max_connections: must not be negative (0 disables the limit)")
@@ -627,3 +707,8 @@ func isLoopbackListen(addr string) bool {
 func boolPtr(b bool) *bool { return &b }
 
 func intPtr(v int) *int { return &v }
+
+func durationPtr(d time.Duration) *Duration {
+	v := Duration(d)
+	return &v
+}

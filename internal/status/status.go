@@ -61,9 +61,11 @@ type Connections struct {
 // Upstream 是单个出口节点的状态（仅 proxy-client 输出）。
 type Upstream struct {
 	Addr              string  `json:"addr"`
-	Healthy           bool    `json:"healthy"`
-	Fails             int     `json:"fails"`
+	Healthy           bool    `json:"healthy"`            // 当前是否可接流量（未摘除且不在冷却中）
+	Fails             int     `json:"fails"`              // 连续真实拨号失败次数
 	CooldownRemaining float64 `json:"cooldown_remaining"` // 冷却剩余秒数
+	Removed           bool    `json:"removed"`            // 是否被主动健康检查摘除
+	ProbeFails        int     `json:"probe_fails"`        // 当前连续探测失败次数
 	Idle              int     `json:"idle"`               // 空闲预热连接数；未启用连接池时为 0
 }
 

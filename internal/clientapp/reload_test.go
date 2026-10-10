@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/clientapp"
 	"github.com/OopsOo0ps/proxy/internal/config"
@@ -134,6 +135,66 @@ func TestReloadSwapsExitNodes(t *testing.T) {
 	resp = fetchThroughProxy(t, app, target.URL, "u", "p")
 	if body := readBody(t, resp); resp.StatusCode != http.StatusOK || body != "target-ok" {
 		t.Fatalf("after node swap: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+// TestReloadAppliesHealthCheckConfig 验证 health_check 属热加载项：
+// 关闭主动探测后节点池重建，死节点不再被摘除，旧池的探测循环同步停止。
+func TestReloadAppliesHealthCheckConfig(t *testing.T) {
+	stable := startServer(t, "stable-secret", nil, false)
+	deadAddr := freeTCPAddr(t) // 无监听者
+	nodes := []config.Node{
+		{Addr: stable.addr, Password: "stable-secret"},
+		{Addr: deadAddr, Password: "dead-secret"},
+	}
+	target := startPlainTarget(t)
+
+	cfg := baseClientCfg(nodes)
+	cfg.Inbound.Auth = []config.User{{Username: "alice", Password: "pw"}}
+	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.HealthCheck = config.HealthCheck{
+		Interval:  durationPtr(50 * time.Millisecond),
+		Timeout:   config.Duration(200 * time.Millisecond),
+		Failures:  intPtr(1),
+		Successes: intPtr(1),
+	}
+	app := startClient(t, cfg, nil)
+
+	// 初始：探测迅速摘除死节点。
+	waitUpstream(t, app.MetricsAddr(), deadAddr, func(up upstreamStats) bool { return up.Removed })
+	waitForMetric(t, app.MetricsAddr(), `upstream_healthy{node="`+deadAddr+`"} 0`)
+	failures := metricSeriesValue(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+deadAddr+`",result="failure"}`)
+	if failures < 1 {
+		t.Fatalf("probe failures = %d, want >= 1", failures)
+	}
+
+	// 热加载关闭主动探测：节点池重建，死节点恢复“未摘除”初始状态。
+	next := *cfg
+	next.HealthCheck = config.HealthCheck{Interval: durationPtr(0)}
+	if err := app.Reload(&next); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	waitUpstream(t, app.MetricsAddr(), deadAddr, func(up upstreamStats) bool { return !up.Removed })
+
+	// 观察窗口内不应再次被摘除（主动探测已关闭）。
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		up := waitUpstream(t, app.MetricsAddr(), deadAddr, func(upstreamStats) bool { return true })
+		if up.Removed {
+			t.Fatalf("dead node should stay unremoved with probing disabled, got %+v", up)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// 旧池探测循环已停止：失败计数在观察窗口内不再增长。
+	if got := metricSeriesValue(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+deadAddr+`",result="failure"}`); got != failures {
+		t.Fatalf("probe failures grew from %d to %d after disabling probes", failures, got)
+	}
+
+	// 存活节点仍可正常服务。
+	resp := fetchThroughProxy(t, app, target.URL, "alice", "pw")
+	if body := readBody(t, resp); resp.StatusCode != http.StatusOK || body != "target-ok" {
+		t.Fatalf("after reload: status=%d body=%q", resp.StatusCode, body)
 	}
 }
 

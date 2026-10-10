@@ -434,6 +434,60 @@ func TestNewValidation(t *testing.T) {
 	}
 }
 
+func TestDropNodeClosesIdleConnsAndPausesRefill(t *testing.T) {
+	m := metrics.New()
+	n1, n2 := &fakeNode{}, &fakeNode{}
+	p, err := New([]Node{n1.spec("n1"), n2.spec("n2")}, Options{MaxIdle: 2, IdleTTL: time.Minute, Metrics: m})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	p.Start(context.Background())
+	waitIdle(t, p, "n1", 2)
+	waitIdle(t, p, "n2", 2)
+
+	p.DropNode("n1")
+	if got := p.IdleCounts()["n1"]; got != 0 {
+		t.Fatalf("idle[n1] = %d, want 0（摘除后应清空）", got)
+	}
+	if got := p.IdleCounts()["n2"]; got != 2 {
+		t.Fatalf("idle[n2] = %d, want 2（不受其他节点影响）", got)
+	}
+	// 已入池的连接应被实际关闭：对端读到 EOF/错误。
+	n1.mu.Lock()
+	peers := append([]net.Conn(nil), n1.peers...)
+	n1.mu.Unlock()
+	if len(peers) == 0 {
+		t.Fatal("n1 should have dialed connections")
+	}
+	for _, peer := range peers {
+		_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := peer.Read(make([]byte, 1)); err == nil {
+			t.Fatal("dropped idle conn should be closed")
+		}
+	}
+
+	// 摘除期间（无真实领取）不补池。
+	time.Sleep(50 * time.Millisecond)
+	if got := p.IdleCounts()["n1"]; got != 0 {
+		t.Fatalf("idle[n1] = %d, want 0（暂停补池期间不应回升）", got)
+	}
+	if !strings.Contains(metricsText(t, m), `upstream_pool_idle_connections{node="n1"} 0`) {
+		t.Fatalf("idle gauge should be 0 after drop:\n%s", metricsText(t, m))
+	}
+
+	// 节点加回后收到真实领取：首次 miss（回退新建），随后自动恢复预热。
+	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+		t.Fatal("claim should miss right after drop")
+	}
+	waitIdle(t, p, "n1", 2)
+
+	// 未知节点与 nil 接收者安全。
+	p.DropNode("unknown")
+	var nilPool *Pool
+	nilPool.DropNode("n1")
+}
+
 // BenchmarkClaimHit 测量一次“领取成功”的固定开销：首先是存活探测
 // （等待探测窗口，健康连接上无数据即超时），其次是 Trojan 请求写入。
 // 使用内存管道、超长 TTL，结果即为领取路径的下限（约等于 probeWindow）。

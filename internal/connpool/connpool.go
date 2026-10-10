@@ -68,9 +68,12 @@ type Pool struct {
 }
 
 type nodeState struct {
-	spec    Node
-	idle    []*idleConn // 栈：末尾最新，领取优先取最新（最旧的先过期淘汰）
-	warming int         // 后台正在建立连接的数量
+	spec Node
+	idle []*idleConn // 栈：末尾最新，领取优先取最新（最旧的先过期淘汰）
+	// dropped：节点被主动健康检查摘除期间置位，暂停后台补池并丢弃补池结果；
+	// 节点重新收到真实领取（Claim）时解除。
+	dropped bool
+	warming int // 后台正在建立连接的数量
 }
 
 type idleConn struct {
@@ -184,6 +187,10 @@ func (p *Pool) Claim(ctx context.Context, addr, host string, port uint16) (net.C
 	}
 	p.mu.Lock()
 	st := p.nodes[addr]
+	if st != nil {
+		// 真实请求进入说明节点已被重新投入服务：解除摘除期间的停补标记。
+		st.dropped = false
+	}
 	p.mu.Unlock()
 	if st == nil {
 		return nil, false
@@ -234,6 +241,33 @@ func (p *Pool) IdleCounts() map[string]int {
 	return out
 }
 
+// DropNode 关闭并移除指定节点的全部空闲连接，同时暂停该节点的后台补池，
+// 直到它再次收到真实领取（Claim）才恢复预热。用于节点被主动健康检查摘除时
+// 清理积压的空闲隧道。对 nil 接收者、未启用与未知节点安全。
+func (p *Pool) DropNode(addr string) {
+	if !p.Enabled() {
+		return
+	}
+	p.mu.Lock()
+	st := p.nodes[addr]
+	if st == nil {
+		p.mu.Unlock()
+		return
+	}
+	st.dropped = true
+	conns := make([]net.Conn, 0, len(st.idle))
+	for _, ic := range st.idle {
+		conns = append(conns, ic.conn)
+	}
+	st.idle = nil
+	p.mu.Unlock()
+
+	p.opts.Metrics.SetPoolIdle(addr, 0)
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
 // popNewest 弹出最新的空闲连接（空池返回 nil）。
 func (p *Pool) popNewest(st *nodeState) *idleConn {
 	p.mu.Lock()
@@ -260,7 +294,7 @@ func (p *Pool) fresh(ic *idleConn) bool {
 // 池未启动或已关闭时不做任何事；重复调用是安全的。
 func (p *Pool) refill(st *nodeState) {
 	p.mu.Lock()
-	if !p.started || p.closed {
+	if !p.started || p.closed || st.dropped {
 		p.mu.Unlock()
 		return
 	}
@@ -288,17 +322,22 @@ func (p *Pool) warmDone(st *nodeState, conn net.Conn, err error) {
 	p.mu.Lock()
 	st.warming--
 	closed := p.closed
+	dropped := st.dropped
 	var idle int
-	if err == nil && !closed {
+	if err == nil && !closed && !dropped {
 		st.idle = append(st.idle, &idleConn{conn: conn, createdAt: p.opts.Now()})
 		idle = len(st.idle)
 	}
 	p.mu.Unlock()
 
-	if closed {
+	if err == nil && (closed || dropped) {
+		// 池已关闭或节点被摘除：不在池中保留连接。
 		if conn != nil {
 			_ = conn.Close()
 		}
+		return
+	}
+	if closed {
 		return
 	}
 	if err != nil {
