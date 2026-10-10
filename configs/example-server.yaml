@@ -1,0 +1,32 @@
+# proxy-server 示例配置（生产模板）。
+
+# 隧道监听地址（Trojan over TLS）。
+# 建议通过防火墙/安全组限制来源；生产可监听 443 以融入普通 HTTPS 流量。
+listen: "0.0.0.0:8443"
+
+tls:
+  cert_file: /etc/proxy/server.crt
+  key_file: /etc/proxy/server.key
+
+# 隧道凭据：为每个客户端分配独立的用户名与强口令。
+# 认证失败时服务端返回中性伪装页面（不泄露任何代理信息）。
+users:
+  - username: alice
+    password: change-me-alice
+  - username: bob
+    password: change-me-bob
+
+# 认证失败 / 非协议流量时返回的自定义伪装页面（可选）。
+decoy_file: ""
+
+timeouts:
+  dial: 10s
+  handshake: 10s
+  idle: 90s
+
+metrics:
+  listen: "127.0.0.1:9200"
+
+log:
+  level: info
+  format: json

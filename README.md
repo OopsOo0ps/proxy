@@ -6,7 +6,7 @@
 
 Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
 
-> 当前处于脚手架阶段（v0.x）：标准工程布局与 CI 已就绪，代理核心功能将按路线图逐步交付，详见「限制说明」。
+当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点自动切换）、域名分流、认证、结构化日志与 Prometheus 指标。
 
 ## 架构
 
@@ -14,45 +14,43 @@ Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具
 flowchart LR
     subgraph LOCAL["本机"]
         APP["应用 / 浏览器"]
-        CLIENT["proxy-client<br/>本机代理入口"]
+        CLIENT["proxy-client<br/>HTTP(S)/SOCKS5 入站<br/>规则分流 + 节点池"]
     end
 
     subgraph REMOTE["远端服务器（Ubuntu 22.04）"]
-        SERVER["proxy-server<br/>出口转发"]
+        SERVER["proxy-server<br/>Trojan over TLS 出口"]
     end
 
-    CONTROLLER["proxy-controller<br/>配置管理"]
+    CONTROLLER["proxy-controller<br/>（规划中）"]
     TARGET["目标站点"]
 
-    APP -->|"HTTP / HTTPS 请求"| CLIENT
-    CLIENT -->|"代理隧道"| SERVER
+    APP -->|"HTTP / HTTPS(CONNECT) / SOCKS5"| CLIENT
+    CLIENT -->|"Trojan over TLS"| SERVER
+    CLIENT -.->|"直连（规则命中 / 内网地址）"| TARGET
     SERVER -->|"出站访问"| TARGET
-    CONTROLLER -.->|"配置下发"| CLIENT
-    CONTROLLER -.->|"配置下发"| SERVER
+    CONTROLLER -.->|"配置下发（规划中）"| CLIENT
+    CONTROLLER -.->|"配置下发（规划中）"| SERVER
 ```
 
 - 实线：数据流方向（请求逐级转发，响应沿原路返回）。
-- 虚线：控制流方向（控制端向客户端 / 服务端下发配置）。
-- 代码依赖方向：`cmd/` → `internal/` → `pkg/`（详见「项目结构」）。
+- 虚线：控制流方向；`proxy-controller` 仍为骨架，配置下发尚未实现。
+- 代码依赖方向：`cmd/` → `internal/` → `pkg/`。
 
 ## 特性
 
-当前状态：脚手架已就绪，代理能力按路线图逐步合入。
+已交付的代理核心：
 
-已就绪：
+| 能力 | 说明 |
+| --- | --- |
+| HTTP/HTTPS 入站 | 支持 `CONNECT` 隧道与绝对地址形式的 HTTP 请求转发 |
+| SOCKS5 入站 | TCP `CONNECT`；用户名/密码认证可选（RFC 1928 / RFC 1929） |
+| 隧道出站 | Trojan over TLS；出口节点轮询、失败自动切换与冷却退避 |
+| 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
+| 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
+| 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration` |
+| 指标 | `/metrics` 暴露 `requests_total`、`request_duration_seconds`、`active_connections` |
 
-- 标准 Go 工程布局：`cmd/` / `internal/` / `pkg/` 分层，依赖方向清晰
-- 统一开发入口：`make build` / `test` / `lint` / `run`
-- CI 自动化：GitHub Actions 在 ubuntu-22.04 上执行构建、测试与 golangci-lint
-
-规划中：
-
-- HTTP / HTTPS 正向代理核心
-- 客户端 ↔ 服务端代理隧道（传输与加密）
-- 控制端动态配置
-- 智能分流：内网直连、外网走隧道
-- 低内存、低 CPU 占用，适合长期驻留
-- 面向 Ubuntu 22.04 的部署与运维支持（systemd 等）
+规划中：控制端动态配置、systemd / 发行包、UDP 与 TUN 支持（见「限制说明」与「路线图」）。
 
 ## 快速开始
 
@@ -65,69 +63,229 @@ make build
 ./bin/proxy-server -version
 ```
 
-开发期可直接前台运行：
+### 本地三节点演示
+
+仓库自带一套本机演示配置（3 个出口节点 + 1 个客户端），可直接验证完整链路：
 
 ```sh
-make run        # 构建并启动 proxy-server（骨架阶段：启动后等待退出信号）
-make test       # 运行单元测试
-make lint       # 运行 golangci-lint（首次自动下载到 .bin/）
+make dev-cert    # 生成本地自签证书到 var/
+
+./bin/proxy-server -config configs/local/server-1.yaml &
+./bin/proxy-server -config configs/local/server-2.yaml &
+./bin/proxy-server -config configs/local/server-3.yaml &
+./bin/proxy-client -config configs/local/client.yaml &
+
+# HTTP/HTTPS 入站（浏览器同款 CONNECT 隧道）
+curl -x http://127.0.0.1:18080 -U alice:change-me https://example.com
+
+# SOCKS5 入站
+curl --socks5-hostname 127.0.0.1:11080 -U alice:change-me https://example.com
+
+# Prometheus 指标
+curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duration_seconds|active_connections'
 ```
 
-三个二进制各自的角色：
+补充观察点：
 
-| 二进制 | 角色 | 当前状态 |
-| --- | --- | --- |
-| `proxy-server` | 远端出口，转发代理流量 | 骨架 |
-| `proxy-client` | 本机代理入口 | 骨架 |
-| `proxy-controller` | 配置管理 CLI | 骨架 |
+- 不带 `-U` 访问会收到 `407 Proxy Authentication Required`（认证失败不带任何内部信息）。
+- 直接访问节点 `https://127.0.0.1:18443` 会看到一张中性的伪装网页（不暴露代理存在）。
+- 客户端日志（`configs/local/client.yaml` 中 `format: json`）包含逐请求的
+  `request_id`、`client_ip`、`upstream`、`duration` 字段。
+
+### 生产部署（示意）
+
+```sh
+# 服务端（远端出口）
+./bin/proxy-server -config configs/example-server.yaml
+
+# 客户端（本机入口）
+./bin/proxy-client -config configs/example-client.yaml
+```
+
+## 配置
+
+配置为 YAML 且严格解析：**未知字段会直接导致启动失败**，避免拼写错误被静默忽略。
+完整字段见 `configs/` 目录中的示例，以下为核心字段总览。
+
+### 客户端 `proxy-client`
+
+```yaml
+inbound:
+  http: "127.0.0.1:8080"    # HTTP/HTTPS 入站（CONNECT + 绝对地址请求）
+  socks5: "127.0.0.1:1080"  # SOCKS5 入站（TCP CONNECT）
+  auth:                     # 入站认证；监听非环回地址时必填
+    - username: alice
+      password: change-me
+
+nodes:                      # 出口节点（Trojan over TLS），建议 ≥3
+  - addr: "node1.example.com:443"
+    password: node1-token
+    sni: www.example.com    # 可选：TLS SNI / 证书校验名
+  - addr: "node2.example.com:443"
+    password: node2-token
+  - addr: "node3.example.com:443"
+    password: node3-token
+
+tls:
+  ca_file: ""                 # 自签证书时填写 CA 路径
+  insecure_skip_verify: false # 仅调试：跳过证书校验
+
+routing:
+  default: proxy        # direct | proxy
+  rules_file: ""        # 例如 configs/example-rules.yaml
+  private_direct: true  # 环回 / 私网 / 链路本地目标一律直连
+
+timeouts: { dial: 10s, handshake: 10s, idle: 90s }
+metrics:  { listen: "127.0.0.1:9100" }
+log:      { level: info, format: json }   # json | text
+```
+
+入口校验：监听非环回地址时必须配置 `inbound.auth`，否则启动直接报错。
+
+### 服务端 `proxy-server`
+
+```yaml
+listen: "0.0.0.0:8443"       # Trojan over TLS 隧道
+tls: { cert_file: server.crt, key_file: server.key }
+users:                       # 每个客户端分配独立凭据
+  - { username: alice, password: change-me-alice }
+decoy_file: ""               # 可选：认证失败时的伪装页面
+timeouts: { dial: 10s, handshake: 10s, idle: 90s }
+metrics:  { listen: "127.0.0.1:9200" }
+log:      { level: info, format: json }
+```
+
+### 分流规则 `rules_file`
+
+```yaml
+default: proxy   # 未命中任何规则时：direct | proxy
+rules:
+  - action: direct
+    match:
+      - "localhost"        # 精确域名
+      - "*.example.com"    # 通配子域名（不匹配裸域）
+      - "1.2.3.4"          # 精确 IP
+      - "192.168.0.0/16"   # CIDR 网段（IPv6 同样支持）
+  - action: proxy
+    match: ["*.google.com"]
+```
+
+- 规则自上而下匹配，**先命中者生效**；规则文件的 `default` 优先于客户端配置。
+- 内置安全行为：环回、私网（RFC 1918 / ULA）、链路本地、组播地址与 `localhost`
+  在 `private_direct: true`（默认）时一律直连，避免把内网流量误发到远端。
+
+## 观测
+
+### 指标（Prometheus）
+
+任一进程配置 `metrics.listen` 后即可访问 `GET /metrics`：
+
+| 指标 | 类型 | 标签 | 含义 |
+| --- | --- | --- | --- |
+| `requests_total` | counter | `proto`、`route`、`result` | 代理请求总数（含失败分类） |
+| `request_duration_seconds` | histogram | `proto`、`route` | 请求耗时（秒） |
+| `active_connections` | gauge | `proto` | 当前活跃连接数 |
+
+`proto` 取值 `http` / `socks5` / `tunnel`；`route` 取值 `direct` / `proxy`；
+`result` 取值 `ok` / `auth_fail` / `dial_fail` / `error`。
+
+```sh
+curl -s http://127.0.0.1:19100/metrics | grep requests_total
+```
+
+生产环境请将 `metrics.listen` 绑定到环回地址或置于防火墙之后。
+
+### 日志
+
+基于标准库 `log/slog`，默认结构化 JSON（`format: text` 可切换为文本）。每条请求完成日志包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `request_id` | 16 位十六进制随机关联 ID（crypto/rand） |
+| `client_ip` | 来源地址 |
+| `upstream` | 命中的出口节点地址；直连为 `direct`，连接池复用为 `pool` |
+| `duration` / `duration_ms` | 可读耗时与毫秒数 |
+| 其他 | `proto`、`target`、`route`、`result`、`bytes_up`、`bytes_down`、`user`（服务端）等 |
+
+示例（客户端）：
+
+```json
+{"time":"...","level":"INFO","msg":"request completed","request_id":"8ea7571e7f8ede6b","proto":"http","client_ip":"127.0.0.1","method":"CONNECT","target":"example.com:443","route":"proxy","upstream":"127.0.0.1:18443","duration":"1.438054s","duration_ms":1438,"bytes_up":585,"bytes_down":4876,"result":"ok"}
+```
+
+## 安全
+
+- 入站代理支持用户名/密码认证（HTTP `Proxy-Authorization` / SOCKS5 RFC 1929）；
+  监听非环回地址时**强制**要求认证。
+- 隧道凭据以 SHA-224 摘要形式在 TLS 内传输；服务端凭据存储只保留摘要，
+  比较全部使用常量时间实现，避免时序侧信道。
+- 失败响应不泄露信息：入站统一回标准 407 / SOCKS5 通用失败码（固定文案）；
+  隧道层对认证失败与非协议流量返回中性伪装网页（可用 `decoy_file` 自定义），
+  与普通 Web 服务无法区分。
+- 出口节点证书校验默认开启；`insecure_skip_verify` 仅供自签调试，请勿在生产使用。
+
+## 限制说明
+
+- **暂不支持 UDP**：SOCKS5 的 `UDP ASSOCIATE` 与 Trojan 的 UDP 转发均未实现，
+  当前仅代理 TCP（返回标准「命令不支持」响应并在日志中记录）。
+- **暂不支持 TUN**：没有全局透明代理/虚拟网卡模式，仅提供 HTTP/HTTPS 与 SOCKS5 入站，
+  未配置代理的程序不会被自动接管。
+- `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
+- 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
+- 尚未提供 systemd 单元与发行包，请通过源码构建使用。
 
 ## 项目结构
 
 ```text
 ├── cmd/                  # 可执行入口（三个独立二进制）
-│   ├── server/           #   proxy-server
-│   ├── client/           #   proxy-client
-│   └── controller/       #   proxy-controller
-├── internal/             # 仅本仓库使用的进程内实现
-│   └── logging/          #   日志初始化
-├── pkg/                  # 可被外部复用的公共库
-│   └── version/          #   版本信息（构建期注入）
-├── Makefile              # 开发入口（build / test / lint / run ...）
+│   ├── server/           #   proxy-server（远端出口）
+│   ├── client/           #   proxy-client（本机入口）
+│   └── controller/       #   proxy-controller（骨架）
+├── configs/              # 示例配置（生产模板 + 本地三节点演示）
+├── internal/
+│   ├── auth/             #   凭据存储与常量时间校验
+│   ├── clientapp/        #   proxy-client 组装与端到端测试
+│   ├── config/           #   配置解析、默认值与校验
+│   ├── dialer/           #   路由感知的出站拨号
+│   ├── httpproxy/        #   HTTP/HTTPS 入站（CONNECT + 转发）
+│   ├── logging/          #   slog 初始化与 request_id
+│   ├── metrics/          #   Prometheus 指标
+│   ├── netutil/          #   网络小工具
+│   ├── nodes/            #   出口节点池（轮询/冷却/切换）
+│   ├── relay/            #   双向转发（半关闭/空闲超时）
+│   ├── routing/          #   分流规则引擎
+│   ├── serverapp/        #   proxy-server 组装
+│   ├── socks5/           #   SOCKS5 入站与地址编码
+│   ├── testutil/         #   测试辅助（自签证书）
+│   └── trojan/           #   Trojan 协议（客户端握手 / 服务端）
+├── pkg/version/          #   版本信息（构建期注入）
+├── Makefile              # 开发入口（build / test / cover / lint ...）
 └── .github/workflows/    # CI（构建 + 测试 + golangci-lint）
-```
-
-代码依赖方向（上层可依赖下层，禁止反向依赖）：
-
-```mermaid
-flowchart TD
-    CMD["cmd/（可执行入口）"] --> INTERNAL["internal/（进程内实现）"]
-    CMD --> PKG["pkg/（可复用公共库）"]
-    INTERNAL --> PKG
 ```
 
 ## 开发
 
 - `make build`：构建三个二进制到 `bin/`（自动注入版本信息）
-- `make test`：运行全部单元测试
+- `make test`：运行全部单元测试（含端到端用例）
+- `make cover`：运行测试并打印总覆盖率
 - `make lint`：静态检查（golangci-lint v2，首次自动下载）
-- `make fmt` / `make vet`：格式化与基础检查
-- CI 与本地使用同一套 Makefile 目标，行为一致
+- `make dev-cert`：生成本地演示用自签证书
 
-## 限制说明
-
-- 当前为脚手架阶段，尚未实现代理转发能力，不可用于生产环境。
-- 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
-- 二进制参数、包结构与对外接口处于早期阶段，可能随迭代调整。
-- 尚未发布正式版本与发行包，请通过源码构建使用。
+端到端测试使用本机回环与自签证书，覆盖：CONNECT 转发成功率（100 次请求，
+验收线 ≥95%）、三节点轮询、节点故障转移、私网直连、SOCKS5 与入站认证、
+指标暴露与日志字段。CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
 
 - [x] 仓库基础：布局 / Makefile / CI / 文档
-- [ ] HTTP / HTTPS 正向代理核心
-- [ ] 客户端 ↔ 服务端隧道（传输与加密）
+- [x] HTTP / HTTPS 正向代理核心（CONNECT + 绝对地址转发）
+- [x] SOCKS5 入站（TCP CONNECT + 可选认证）
+- [x] 客户端 ↔ 服务端隧道（Trojan over TLS，多节点）
+- [x] 基础域名分流与内网直连
+- [x] 认证、结构化日志、Prometheus 指标
 - [ ] 控制端动态配置
-- [ ] 智能分流与内网直连
 - [ ] 部署与运维（systemd / 发行包）
+- [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
 
 ## 参与贡献
 

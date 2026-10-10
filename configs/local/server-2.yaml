@@ -1,0 +1,17 @@
+# 本地演示节点 2（监听 18444）。
+listen: "127.0.0.1:18444"
+
+tls:
+  cert_file: var/dev-cert.pem
+  key_file: var/dev-key.pem
+
+users:
+  - username: alice
+    password: local-node-2
+
+metrics:
+  listen: "127.0.0.1:19202"
+
+log:
+  level: info
+  format: json
