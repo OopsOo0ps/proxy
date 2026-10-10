@@ -366,6 +366,11 @@ kill -HUP "$(pidof proxy-client)"   # systemd: systemctl reload proxy-client
 # {"level":"ERROR","msg":"config reload failed; keeping current configuration","error":"..."}
 ```
 
+真机验证（2026-10-10，3 台阿里云 VPS 出口 + 本机客户端，全部流量经公网三节点）：
+坏配置 SIGHUP 后旧配置持续服务；入站改密、节点口令与服务端 users 热重载均即时生效
+（旧凭据被拒、新凭据可用）；监听地址变更被明确拒绝且服务不受影响；各轮 6/6 请求
+成功，`config_reloads_total` 与日志按预期记录成功 / 失败。
+
 ## 观测
 
 ### 指标（Prometheus）
