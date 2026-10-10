@@ -176,6 +176,12 @@ func TestReloadAppliesHealthCheckConfig(t *testing.T) {
 	}
 	waitUpstream(t, app.MetricsAddr(), deadAddr, func(up upstreamStats) bool { return !up.Removed })
 
+	// 基线在 Reload 返回后取：validate-then-swap 语义下旧配置在切换前持续
+	// 生效，旧探测循环的最后一批结果可能落在重载期间（Reload 返回之前）；
+	// Reload 内部的 Close 会等待探测循环（含在途探测）退出，因此从返回那一
+	// 刻起计数不再增长才是本用例要断言的性质。
+	baseline := metricSeriesValue(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+deadAddr+`",result="failure"}`)
+
 	// 观察窗口内不应再次被摘除（主动探测已关闭）。
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
@@ -187,8 +193,9 @@ func TestReloadAppliesHealthCheckConfig(t *testing.T) {
 	}
 
 	// 旧池探测循环已停止：失败计数在观察窗口内不再增长。
-	if got := metricSeriesValue(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+deadAddr+`",result="failure"}`); got != failures {
-		t.Fatalf("probe failures grew from %d to %d after disabling probes", failures, got)
+	got := metricSeriesValue(t, app.MetricsAddr(), `upstream_health_probes_total{node="`+deadAddr+`",result="failure"}`)
+	if got != baseline {
+		t.Fatalf("probe failures grew from %d to %d after disabling probes", baseline, got)
 	}
 
 	// 存活节点仍可正常服务。
