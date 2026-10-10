@@ -149,6 +149,39 @@ func TestStatsOmitsUpstreamsWhenAbsent(t *testing.T) {
 	}
 }
 
+func TestStatsIncludesRuleset(t *testing.T) {
+	s := New(Options{
+		Version: "dev",
+		Runtime: func() Runtime {
+			return Runtime{Ruleset: &Ruleset{
+				Source:      "url",
+				Target:      "https://rules.example.com/r.yaml",
+				Refresh:     30,
+				Loaded:      true,
+				Rules:       12,
+				LastSuccess: "2026-10-10T12:00:00Z",
+			}}
+		},
+	})
+	rec := httptest.NewRecorder()
+	s.Stats().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	var resp statsResponse
+	decode(t, rec, &resp)
+	if resp.Ruleset == nil || resp.Ruleset.Source != "url" || resp.Ruleset.Target != "https://rules.example.com/r.yaml" ||
+		resp.Ruleset.Refresh != 30 || !resp.Ruleset.Loaded || resp.Ruleset.Rules != 12 ||
+		resp.Ruleset.LastSuccess != "2026-10-10T12:00:00Z" {
+		t.Fatalf("ruleset = %+v", resp.Ruleset)
+	}
+
+	// 未配置规则源时不输出 ruleset 字段。
+	s2 := New(Options{Version: "dev"})
+	rec2 := httptest.NewRecorder()
+	s2.Stats().ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	if strings.Contains(rec2.Body.String(), "ruleset") {
+		t.Fatalf("无规则源时不应输出 ruleset：%s", rec2.Body.String())
+	}
+}
+
 func TestNilStatusReturnsNotFound(t *testing.T) {
 	var s *Status
 	for _, handler := range []http.Handler{s.Health(), s.Stats()} {

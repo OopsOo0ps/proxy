@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -181,11 +182,27 @@ type ServerTLS struct {
 	KeyFile  string `yaml:"key_file"`
 }
 
-// Routing 是分流配置。
+// Routing 是分流配置。规则源二选一：本地 rules_file 或远程 rules_url。
 type Routing struct {
 	Default       string `yaml:"default"`        // direct | proxy，缺省 proxy
-	RulesFile     string `yaml:"rules_file"`     // 可选：规则文件路径
+	RulesFile     string `yaml:"rules_file"`     // 可选：规则文件路径（与 rules_url 互斥）
+	RulesURL      string `yaml:"rules_url"`      // 可选：远程规则 URL（http/https，与 rules_file 互斥）
 	PrivateDirect *bool  `yaml:"private_direct"` // 环回/私网目标直连，缺省 true
+
+	// RulesRefreshInterval 是远程规则的刷新周期（路线图 3.4）：缺省 30m，
+	// 0 = 仅启动时拉取一次、不周期刷新；仅对 rules_url 有效。
+	RulesRefreshInterval *Duration `yaml:"rules_refresh_interval"`
+}
+
+// defaultRulesRefreshInterval 是远程规则的缺省刷新周期。
+const defaultRulesRefreshInterval = 30 * time.Minute
+
+// EffectiveRulesRefreshInterval 返回远程规则的刷新周期（缺省 30m；0 = 仅启动拉取一次）。
+func (r Routing) EffectiveRulesRefreshInterval() time.Duration {
+	if r.RulesRefreshInterval == nil {
+		return defaultRulesRefreshInterval
+	}
+	return r.RulesRefreshInterval.Std()
 }
 
 // Timeouts 是各类超时。
@@ -293,6 +310,9 @@ func ParseClient(data []byte) (*Client, error) {
 	if err := cfg.DNS.validateBeforeDefaults(); err != nil {
 		return nil, err
 	}
+	if err := cfg.Routing.validateBeforeDefaults(); err != nil {
+		return nil, err
+	}
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -397,6 +417,9 @@ func (c *Client) applyDefaults() {
 	}
 	if strings.TrimSpace(c.Routing.Default) == "" {
 		c.Routing.Default = "proxy"
+	}
+	if c.Routing.RulesURL != "" && c.Routing.RulesRefreshInterval == nil {
+		c.Routing.RulesRefreshInterval = durationPtr(defaultRulesRefreshInterval)
 	}
 	if c.Routing.PrivateDirect == nil {
 		c.Routing.PrivateDirect = boolPtr(true)
@@ -505,6 +528,12 @@ func (c *Client) validate() error {
 		return fmt.Errorf("routing.default: invalid value %q: want direct or proxy", c.Routing.Default)
 	}
 	c.Routing.Default = action
+	if err := validateRulesURL(c.Routing.RulesURL); err != nil {
+		return err
+	}
+	if c.Routing.RulesRefreshInterval != nil && c.Routing.RulesRefreshInterval.Std() < 0 {
+		return errors.New("routing.rules_refresh_interval: must not be negative (0 fetches once at startup)")
+	}
 	if action == "proxy" && len(c.Nodes) == 0 {
 		return errors.New("nodes: at least one exit node is required when routing.default is proxy")
 	}
@@ -600,6 +629,36 @@ func validateMetrics(m Metrics) error {
 func (d DNS) validateBeforeDefaults() error {
 	if d.Listen == "" && (d.Remote != "" || len(d.Local) > 0 || d.Timeout != 0) {
 		return errors.New("dns.listen is empty (DNS gateway disabled): remove the dns section or set dns.listen")
+	}
+	return nil
+}
+
+// validateBeforeDefaults 在应用缺省值之前检查 routing 段：规则源互斥、
+// 刷新周期只对远程规则有意义，避免配置意图被静默吞掉。
+func (r Routing) validateBeforeDefaults() error {
+	if r.RulesFile != "" && r.RulesURL != "" {
+		return errors.New("routing: configure only one of rules_file (local) and rules_url (remote)")
+	}
+	if r.RulesURL == "" && r.RulesRefreshInterval != nil {
+		return errors.New("routing.rules_refresh_interval is set but routing.rules_url is empty (the interval only applies to remote rules)")
+	}
+	return nil
+}
+
+// validateRulesURL 校验远程规则 URL：空值合法（未启用），其余仅允许 http/https 且必须有主机。
+func validateRulesURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("routing.rules_url: invalid URL %q: %w", raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("routing.rules_url: unsupported scheme %q: want http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("routing.rules_url: missing host in %q", raw)
 	}
 	return nil
 }

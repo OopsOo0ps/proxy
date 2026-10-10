@@ -28,6 +28,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
 	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/ruleset"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
 	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
@@ -68,10 +69,10 @@ type App struct {
 // 构建过程不触碰线上状态；全部就绪后整份切换（初始启动与热加载共用）。
 type clientRuntime struct {
 	cfg    *config.Client
-	router *routing.Engine
-	auth   *auth.Store    // nil：入站不校验认证
-	dialer *dialer.Dialer // 目标拨号（含分流与出口节点）
-	pool   *nodes.Pool    // nil：未配置出口节点
+	rules  *ruleset.Provider // 分流规则源（本地文件 / 远程 URL / 空），刷新时原地原子切换
+	auth   *auth.Store       // nil：入站不校验认证
+	dialer *dialer.Dialer    // 目标拨号（含分流与出口节点）
+	pool   *nodes.Pool       // nil：未配置出口节点
 	// connPool 是上游空闲隧道连接池；nil：未启用（pool.max_idle = 0）。
 	connPool *connpool.Pool
 
@@ -125,7 +126,7 @@ func (l socksLive) ShutdownTimeout() time.Duration {
 
 type dnsLive struct{ app *App }
 
-func (l dnsLive) Router() dnsgw.RouteDecider { return l.app.policy.load().router }
+func (l dnsLive) Router() dnsgw.RouteDecider { return l.app.policy.load().rules }
 func (l dnsLive) Remote() string             { return l.app.policy.load().dnsRemote }
 func (l dnsLive) Local() []string            { return l.app.policy.load().dnsLocal }
 func (l dnsLive) Timeout() time.Duration     { return l.app.policy.load().dnsTimeout }
@@ -160,7 +161,7 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 			Remote:     rt.dnsRemote,
 			Local:      rt.dnsLocal,
 			Timeout:    rt.dnsTimeout,
-			Router:     rt.router,
+			Router:     rt.rules,
 			ProxyDial: func(ctx context.Context, host string, port uint16) (net.Conn, string, error) {
 				conn, route, err := app.policy.load().dialer.DialProxy(ctx, host, port)
 				if err != nil {
@@ -252,16 +253,19 @@ func (a *App) Serve(ctx context.Context) error {
 
 	a.policy.load().connPool.Start(ctx)
 	a.policy.load().pool.StartHealthChecks(ctx)
+	a.policy.load().rules.Start(ctx)
 	// 关停一开始就释放池内空闲连接：它们没有在途数据，
 	// 提前关闭既让服务端尽快回收，也避免排空期的新请求再领取。
 	go func() {
 		<-ctx.Done()
 		a.policy.load().connPool.Close()
 		a.policy.load().pool.Close()
+		a.policy.load().rules.Close()
 	}()
 	defer func() {
 		a.policy.load().connPool.Close()
 		a.policy.load().pool.Close()
+		a.policy.load().rules.Close()
 	}()
 
 	errCh := make(chan error, 4)
@@ -379,6 +383,19 @@ func (a *App) runtimeStats() status.Runtime {
 			})
 		}
 	}
+	if snap := rt.rules.Snapshot(); snap.Source != ruleset.SourceNone {
+		out.Ruleset = &status.Ruleset{
+			Source:    snap.Source.String(),
+			Target:    snap.Target,
+			Refresh:   status.Seconds(snap.Interval),
+			Loaded:    snap.Loaded,
+			Rules:     snap.Rules,
+			LastError: snap.LastError,
+		}
+		if !snap.LastSuccess.IsZero() {
+			out.Ruleset.LastSuccess = snap.LastSuccess.UTC().Format(time.RFC3339)
+		}
+	}
 	// 0 = 不限制时不输出 limit 字段（与 README 描述一致）。
 	if a.limiter != nil && a.limiter.Max() > 0 {
 		out.Limit = &status.Limit{
@@ -390,7 +407,7 @@ func (a *App) runtimeStats() status.Runtime {
 	return out
 }
 
-// Reload 应用一份新配置：先完整构建新运行时（规则文件重读、TLS 与凭据重建、
+// Reload 应用一份新配置：先完整构建新运行时（规则源重读/重拉、TLS 与凭据重建、
 // 节点池重建），全部成功后再原子切换；任何失败都返回错误并保持旧配置原样
 // 服务——配置错误不会波及线上。监听地址属于启动时绑定的资源，变更需要重启，
 // 会被明确拒绝（同样保持旧配置）。
@@ -423,12 +440,18 @@ func (a *App) Reload(next *config.Client) (err error) {
 	if rt.pool != cur.pool {
 		rt.pool.StartHealthChecks(a.poolCtx())
 	}
+	if rt.rules != cur.rules {
+		rt.rules.Start(a.poolCtx())
+	}
 	a.policy.snap.Store(rt)
 	if rt.connPool != cur.connPool {
 		cur.connPool.Close()
 	}
 	if rt.pool != cur.pool {
 		cur.pool.Close()
+	}
+	if rt.rules != cur.rules {
+		cur.rules.Close()
 	}
 	a.limiter.SetMax(next.Limits.EffectiveMaxConnections())
 	if a.logCtrl != nil {
@@ -463,19 +486,15 @@ func (a *App) ReloadFile(path, levelOverride string) error {
 }
 
 // buildRuntime 依据配置构建完整运行时；reuse 非 nil 时复用未变更的上游栈
-// （节点池与预热池），避免无关重载抖动预热连接。规则文件在每次构建时重读，
-// 因此规则文件内容的修改也能通过重载生效。任何失败都不产生外部副作用
-// （失败路径关闭新建的池）。
+// （节点池与预热池），避免无关重载抖动预热连接。规则源在每次构建时重新检查
+// （本地文件严格重读、远程 URL 容错重拉），因此规则内容的修改也能通过重载
+// 生效。任何失败都不产生外部副作用（失败路径关闭新建的池）。
 func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRuntime, error) {
-	router, err := buildRouter(cfg)
-	if err != nil {
-		return nil, err
-	}
 	store, err := buildAuth(cfg)
 	if err != nil {
 		return nil, err
 	}
-	rt := &clientRuntime{cfg: cfg, router: router, auth: store}
+	rt := &clientRuntime{cfg: cfg, auth: store}
 
 	upstreamChanged := reuse == nil ||
 		!reflect.DeepEqual(reuse.cfg.Nodes, cfg.Nodes) ||
@@ -503,8 +522,20 @@ func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRun
 		rt.connPool = reuse.connPool
 		rt.pool = reuse.pool
 	}
+	// 规则源放在最后构建：复用时会立即重读 / 重拉一次（文件严格、URL 容错），
+	// 这是本函数中唯一改动在役状态的一步，之后不再有失败点，保证
+	// “重载要么整体生效、要么完全保持旧配置”。
+	rules, err := a.buildRuleset(cfg, reuse)
+	if err != nil {
+		if upstreamChanged {
+			rt.connPool.Close()
+			rt.pool.Close()
+		}
+		return nil, err
+	}
+	rt.rules = rules
 	rt.dialer = dialer.New(dialer.Options{
-		Router:      router,
+		Router:      rules,
 		Pool:        rt.pool,
 		DialTimeout: cfg.Timeouts.Dial.Std(),
 	})
@@ -550,22 +581,41 @@ func (a *App) poolCtx() context.Context {
 	return context.Background()
 }
 
-// buildRouter 加载规则文件并构建分流引擎。
-func buildRouter(cfg *config.Client) (*routing.Engine, error) {
-	var rules *routing.Rules
-	if cfg.Routing.RulesFile != "" {
-		loaded, err := routing.LoadRulesFile(cfg.Routing.RulesFile)
-		if err != nil {
-			return nil, err
-		}
-		rules = loaded
-	}
+// buildRuleset 构建分流规则源（本地文件 / 远程 URL / 空）并完成首次加载。
+//
+// reuse 非 nil 且规则源配置（类型、路径 / URL、刷新周期）未变时复用现有
+// Provider：保留已加载规则与刷新循环，并立即重新检查一次源——本地文件严格
+// 重读（失败拒绝本次重载），远程 URL 容错重拉（失败只告警、保持现有规则）。
+// 规则源配置变化时重建；URL 首次拉取失败为告警语义（空规则 + 后续重试）。
+func (a *App) buildRuleset(cfg *config.Client, reuse *clientRuntime) (*ruleset.Provider, error) {
 	def, err := routing.ParseAction(cfg.Routing.Default)
 	if err != nil {
 		return nil, fmt.Errorf("routing.default: %w", err)
 	}
 	privateDirect := cfg.Routing.PrivateDirect == nil || *cfg.Routing.PrivateDirect
-	return routing.NewEngine(rules, routing.Options{Default: def, PrivateDirect: privateDirect})
+	spec := ruleset.SpecOf(cfg.Routing.RulesFile, cfg.Routing.RulesURL, cfg.Routing.EffectiveRulesRefreshInterval())
+
+	if reuse != nil && reuse.rules != nil && reuse.rules.Spec() == spec {
+		prov := reuse.rules
+		prov.UpdateOptions(def, privateDirect)
+		if err := prov.Recheck(context.Background()); err != nil {
+			return nil, err
+		}
+		return prov, nil
+	}
+	prov, err := ruleset.New(ruleset.Options{
+		FilePath:        cfg.Routing.RulesFile,
+		URL:             cfg.Routing.RulesURL,
+		RefreshInterval: cfg.Routing.EffectiveRulesRefreshInterval(),
+		Default:         def,
+		PrivateDirect:   privateDirect,
+		Logger:          a.logger,
+		Metrics:         a.metrics,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return prov, nil
 }
 
 // buildAuth 构建入站凭据存储；未配置认证时返回 nil。

@@ -438,6 +438,72 @@ func TestParseClientDNSRejects(t *testing.T) {
 	}
 }
 
+func TestParseClientRulesURL(t *testing.T) {
+	// 远程规则源：缺省刷新周期 30m；显式 0 表示仅启动拉取一次。
+	prefix := "inbound:\n  http: \"127.0.0.1:8080\"\nnodes:\n  - addr: \"n.example.com:443\"\n    password: t\n"
+	cfg, err := ParseClient([]byte(prefix + `
+routing:
+  default: proxy
+  rules_url: "https://rules.example.com/proxy.yaml"
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if cfg.Routing.RulesURL != "https://rules.example.com/proxy.yaml" || cfg.Routing.RulesFile != "" {
+		t.Fatalf("unexpected routing: %+v", cfg.Routing)
+	}
+	if got := cfg.Routing.EffectiveRulesRefreshInterval(); got != 30*time.Minute {
+		t.Fatalf("default refresh = %v, want 30m", got)
+	}
+
+	cfg, err = ParseClient([]byte(prefix + `
+routing:
+  default: proxy
+  rules_url: "http://10.0.0.1/rules.yaml"
+  rules_refresh_interval: 0
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Routing.EffectiveRulesRefreshInterval(); got != 0 {
+		t.Fatalf("explicit 0 refresh = %v, want 0", got)
+	}
+
+	cfg, err = ParseClient([]byte(prefix + `
+routing:
+  default: proxy
+  rules_url: "http://10.0.0.1/rules.yaml"
+  rules_refresh_interval: 45s
+`))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Routing.EffectiveRulesRefreshInterval(); got != 45*time.Second {
+		t.Fatalf("explicit refresh = %v, want 45s", got)
+	}
+}
+
+func TestParseClientRulesRejects(t *testing.T) {
+	// 除 routing 段外均为合法配置，确保报错确实来自 routing 校验。
+	prefix := "inbound:\n  http: \"127.0.0.1:8080\"\nnodes:\n  - addr: \"n.example.com:443\"\n    password: t\n"
+	cases := map[string]string{
+		"rules_file and rules_url": prefix + "routing:\n  rules_file: a.yaml\n  rules_url: \"https://r.example.com/r.yaml\"\n",
+		"interval without url":     prefix + "routing:\n  rules_refresh_interval: 5m\n",
+		"file with url interval":   prefix + "routing:\n  rules_file: a.yaml\n  rules_refresh_interval: 5m\n",
+		"unsupported scheme":       prefix + "routing:\n  rules_url: \"ftp://r.example.com/r.yaml\"\n",
+		"missing host":             prefix + "routing:\n  rules_url: \"https:///r.yaml\"\n",
+		"negative interval":        prefix + "routing:\n  rules_url: \"https://r.example.com/r.yaml\"\n  rules_refresh_interval: -1s\n",
+		"unknown routing field":    prefix + "routing:\n  rules_remote: true\n",
+	}
+	for name, yaml := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseClient([]byte(yaml)); err == nil {
+				t.Fatalf("expected error for %s", name)
+			}
+		})
+	}
+}
+
 func TestParseServerValid(t *testing.T) {
 	cfg, err := ParseServer([]byte(`
 listen: "0.0.0.0:8443"
