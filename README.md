@@ -3,6 +3,7 @@
 [![CI](https://github.com/OopsOo0ps/proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/OopsOo0ps/proxy/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/OopsOo0ps/proxy)](go.mod)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15378/badge)](https://www.bestpractices.dev/projects/15378)
 
 Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
 
@@ -661,6 +662,8 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   隧道层对认证失败与非协议流量返回中性伪装网页（可用 `decoy_file` 自定义），
   与普通 Web 服务无法区分。
 - 出口节点证书校验默认开启；`insecure_skip_verify` 仅供自签调试，请勿在生产使用。
+- 漏洞报告流程见 [SECURITY.md](SECURITY.md)：GitHub 私密漏洞报告已启用，亦可邮件私下报告；
+  承诺 14 天内首次响应。
 
 ## 限制说明
 
@@ -885,7 +888,13 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 参与贡献
 
-见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+见 [CONTRIBUTING.md](CONTRIBUTING.md)。问题与功能建议请提交至
+[GitHub Issues](https://github.com/OopsOo0ps/proxy/issues)。
+
+## 发行版本
+
+- 变更记录：[CHANGELOG.md](CHANGELOG.md)
+- 发行说明与下载：[GitHub Releases](https://github.com/OopsOo0ps/proxy/releases)
 
 ## 许可证
 
