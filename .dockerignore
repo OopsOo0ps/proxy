@@ -1,0 +1,9 @@
+.git
+.github
+.bin
+bin
+var
+coverage.out
+test
+*.pem
+*.key
