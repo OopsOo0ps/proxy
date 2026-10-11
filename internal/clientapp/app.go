@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -489,12 +488,16 @@ func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRun
 	}
 	rt := &clientRuntime{cfg: cfg, auth: store}
 
-	upstreamChanged := reuse == nil ||
-		!reflect.DeepEqual(reuse.cfg.Nodes, cfg.Nodes) ||
-		!reflect.DeepEqual(reuse.cfg.Pool, cfg.Pool) ||
-		!reflect.DeepEqual(reuse.cfg.HealthCheck, cfg.HealthCheck) ||
-		!reflect.DeepEqual(reuse.cfg.TLS, cfg.TLS) ||
-		!reflect.DeepEqual(reuse.cfg.Timeouts, cfg.Timeouts)
+	upstreamChanged := true
+	if reuse != nil {
+		// 指纹覆盖整个上游子结构（节点 / 预热池 / 健康检查 / TLS / 超时），
+		// 新字段自动参与比较；计算失败按「已变更」处理，保守重建。
+		if changed, err := upstreamStackChanged(reuse.cfg, cfg); err == nil {
+			upstreamChanged = changed
+		} else {
+			a.logger.Warn("upstream fingerprint failed; rebuilding pools", "error", err)
+		}
+	}
 	if upstreamChanged {
 		baseTLS, err := buildClientTLS(cfg)
 		if err != nil {
@@ -539,6 +542,22 @@ func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRun
 		rt.dnsLocal = a.resolveDNSLocal(cfg.DNS)
 	}
 	return rt, nil
+}
+
+// upstreamStackChanged 判断两份配置的出口链路栈是否相同：相同 ⇒ 复用现有
+// 节点池与预热池；不同 ⇒ 重建。比较依据是 config.UpstreamFingerprint
+// （整份子结构的哈希），不做逐字段手工列举——新增上游相关字段时指纹自动变化，
+// 分类遗漏由 internal/config 的守卫测试在本地拦截。
+func upstreamStackChanged(oldCfg, newCfg *config.Client) (bool, error) {
+	oldFP, err := config.UpstreamFingerprint(oldCfg)
+	if err != nil {
+		return false, err
+	}
+	newFP, err := config.UpstreamFingerprint(newCfg)
+	if err != nil {
+		return false, err
+	}
+	return oldFP != newFP, nil
 }
 
 // resolveDNSLocal 返回生效的直连解析器列表；未显式配置时读取系统
