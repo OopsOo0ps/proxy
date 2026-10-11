@@ -662,8 +662,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   隧道层对认证失败与非协议流量返回中性伪装网页（可用 `decoy_file` 自定义），
   与普通 Web 服务无法区分。
 - 出口节点证书校验默认开启；`insecure_skip_verify` 仅供自签调试，请勿在生产使用。
-- 漏洞报告流程见 [SECURITY.md](SECURITY.md)：GitHub 私密漏洞报告已启用，亦可邮件私下报告；
-  承诺 14 天内首次响应。
+- 漏洞报告流程见 [SECURITY.md](SECURITY.md)：GitHub 私密漏洞报告已启用，承诺 14 天内首次响应。
 
 ## 限制说明
 
