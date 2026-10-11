@@ -36,8 +36,9 @@ type Node struct {
 	Addr string
 	// Dial 建立到节点的 TCP+TLS 连接（握手完成，未发送 Trojan 请求）。
 	Dial func(ctx context.Context) (net.Conn, error)
-	// Start 在领取到的连接上向目标发起 Trojan 请求。
-	Start func(conn net.Conn, host string, port uint16) error
+	// Start 在领取到的连接上向目标发起 Trojan 请求；ctx 是本次领取的上下文
+	// （调用方可能带有故障转移总预算），实现应把请求写出的超时收敛到 ctx 截止时间内。
+	Start func(ctx context.Context, conn net.Conn, host string, port uint16) error
 }
 
 // Options 控制池行为。
@@ -216,7 +217,7 @@ func (p *Pool) Claim(ctx context.Context, addr, host string, port uint16) (net.C
 			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)
 			continue
 		}
-		if err := st.spec.Start(ic.conn, host, port); err != nil {
+		if err := st.spec.Start(ctx, ic.conn, host, port); err != nil {
 			p.debug("failed to start trojan request on idle connection", addr, err)
 			_ = ic.conn.Close()
 			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)

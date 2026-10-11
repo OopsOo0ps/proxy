@@ -5,6 +5,9 @@
 // 冷却期内跳过该节点；全部节点都处于冷却时降级为全量尝试，
 // 避免出现“有节点但永远不试”的黑洞。
 //
+// 整条故障转移链受一个总时间预算约束（Options.FailoverBudget，缺省 30s）：
+// 预算耗尽即停止尝试，已消耗的等待不会随节点数量线性放大。
+//
 // 主动健康检查（路线图 3.3）：按周期对节点做轻量探测（TCP+TLS 握手后立即
 // 关闭），连续失败达阈值后摘除该节点（硬摘除：不再参与任何尝试，真实流量
 // 也不再经过它）；摘除后继续探测，连续成功达阈值自动加回并清空被动失败
@@ -36,6 +39,10 @@ type ProbeFunc func(ctx context.Context, node config.Node) error
 // ErrNoHealthyNodes 表示所有出口节点都被主动健康检查摘除。
 var ErrNoHealthyNodes = errors.New("nodes: all exit nodes removed by health check")
 
+// DefaultFailoverBudget 是单次 Dial 在全部候选节点上的缺省总时间预算。
+// 与 config.defaultFailoverBudget（配置层缺省 30s）保持一致。
+const DefaultFailoverBudget = 30 * time.Second
+
 // HealthOptions 是主动健康检查参数；Interval <= 0 时关闭主动探测。
 type HealthOptions struct {
 	// Interval 是探测周期；<= 0 关闭主动探测。
@@ -54,6 +61,9 @@ type Options struct {
 	Cooldown time.Duration
 	// MaxCooldown 是冷却上限，默认 5m。
 	MaxCooldown time.Duration
+	// FailoverBudget 是单次 Dial 跨全部候选节点的总时间预算（含建连、握手与
+	// 请求写出）；<= 0 时使用 DefaultFailoverBudget。调用方上下文更短时以更短者为准。
+	FailoverBudget time.Duration
 	// Now 可注入时钟（测试用），默认 time.Now。
 	Now func() time.Time
 	// Health 是主动健康检查参数；Interval <= 0 时关闭（仅保留被动冷却）。
@@ -122,6 +132,9 @@ func New(cfgs []config.Node, dial DialFunc, opts Options) (*Pool, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.FailoverBudget <= 0 {
+		opts.FailoverBudget = DefaultFailoverBudget
+	}
 	if opts.Health.Interval > 0 {
 		if opts.Probe == nil {
 			return nil, errors.New("nodes: probe func is required when health check is enabled")
@@ -181,26 +194,52 @@ func (p *Pool) AnyHealthy() bool {
 }
 
 // Dial 依次尝试可用节点建立连接；全部失败时返回聚合错误。
+//
+// 全部候选节点共享一个故障转移总预算（Options.FailoverBudget）：预算耗尽时
+// 立即停止后续尝试，在途尝试随上下文取消，最坏等待从「节点数 × 单节点超时」
+// 收敛为预算上限。因预算或调用方取消（而非节点自身错误）中断的尝试不计入
+// 被动失败，避免把健康节点误送入冷却。
 func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, config.Node, error) {
 	candidates := p.candidates()
 	if len(candidates) == 0 {
 		return nil, config.Node{}, ErrNoHealthyNodes
 	}
+	// 子上下文与父上下文取更短的截止时间：调用方超时优先级更高。
+	chainCtx, cancel := context.WithTimeout(ctx, p.opts.FailoverBudget)
+	defer cancel()
+
 	var errs []error
+	tried := 0
 	for _, st := range candidates {
-		if ctx.Err() != nil {
-			errs = append(errs, ctx.Err())
+		if err := chainCtx.Err(); err != nil {
+			errs = append(errs, p.annotateChainAbort(ctx, err, tried))
 			break
 		}
-		conn, err := p.dial(ctx, st.cfg, host, port)
+		tried++
+		conn, err := p.dial(chainCtx, st.cfg, host, port)
 		if err == nil {
 			p.markSuccess(st)
 			return conn, st.cfg, nil
 		}
-		p.markFailure(st)
 		errs = append(errs, fmt.Errorf("node %s: %w", st.cfg.Addr, err))
+		if chainCtx.Err() != nil {
+			// 链被预算或调用方取消中断：不再尝试后续节点，也不记被动失败。
+			errs = append(errs, p.annotateChainAbort(ctx, chainCtx.Err(), tried))
+			break
+		}
+		p.markFailure(st)
 	}
 	return nil, config.Node{}, fmt.Errorf("all exit nodes failed: %w", errors.Join(errs...))
+}
+
+// annotateChainAbort 为「链被中断」标注原因：预算耗尽与调用方取消（父上下文
+// 先到期或被取消）需要能区分，便于线上判断最坏等待是否已收敛到预算内。
+func (p *Pool) annotateChainAbort(parent context.Context, err error, tried int) error {
+	if parent.Err() == nil {
+		return fmt.Errorf("failover budget %s exhausted after %d node attempt(s): %w",
+			p.opts.FailoverBudget, tried, err)
+	}
+	return err
 }
 
 // candidates 返回本轮尝试顺序：先剔除被主动摘除的节点（硬摘除），

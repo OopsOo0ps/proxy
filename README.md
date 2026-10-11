@@ -150,6 +150,12 @@ health_check:                # 出口节点主动健康检查（故障自愈）
   failures: 3                # 连续失败 N 次摘除
   successes: 2               # 摘除后连续成功 M 次自动加回
 
+timeouts:                    # 纯数字按秒解释
+  dial: 10s                  # 建立目标 / 节点连接
+  handshake: 10s             # 隧道握手（TLS + Trojan）
+  failover: 30s              # 出口节点故障转移总预算（全部候选节点合计）
+  shutdown: 15s              # 优雅关停排空期限
+
 limits:
   max_connections: 1024      # 进程级并发上限（HTTP + SOCKS5 合计）；0 = 不限制
 

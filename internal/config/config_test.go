@@ -88,6 +88,9 @@ nodes:
 	if cfg.Timeouts.Idle.Std() != 90*time.Second {
 		t.Fatalf("default idle = %v, want 90s", cfg.Timeouts.Idle.Std())
 	}
+	if cfg.Timeouts.Failover.Std() != 30*time.Second {
+		t.Fatalf("default failover = %v, want 30s", cfg.Timeouts.Failover.Std())
+	}
 	if cfg.Routing.Default != "proxy" {
 		t.Fatalf("default routing = %q, want proxy", cfg.Routing.Default)
 	}
@@ -102,6 +105,28 @@ nodes:
 	}
 	if got := cfg.Pool.EffectiveIdleTTL(); got != 5*time.Second {
 		t.Fatalf("default pool.idle_ttl = %v, want 5s", got)
+	}
+}
+
+func TestParseClientFailoverBudget(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	cfg, err := ParseClient([]byte(base + "timeouts:\n  failover: 45s\n"))
+	if err != nil {
+		t.Fatalf("ParseClient: %v", err)
+	}
+	if got := cfg.Timeouts.Failover.Std(); got != 45*time.Second {
+		t.Fatalf("failover = %v, want 45s", got)
+	}
+
+	_, err = ParseClient([]byte(base + "timeouts:\n  failover: -1s\n"))
+	if err == nil || !strings.Contains(err.Error(), "timeouts.failover: must be positive") {
+		t.Fatalf("negative failover: err = %v, want positive-value error", err)
 	}
 }
 
@@ -550,13 +575,14 @@ users:
     password: token
 `
 	cases := map[string]string{
-		"missing listen":  "tls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: b}\n",
-		"missing tls":     "listen: \":8443\"\nusers:\n  - {username: a, password: b}\n",
-		"missing users":   "listen: \":8443\"\ntls:\n  cert_file: c\n  key_file: k\n",
-		"empty user name": "listen: \":8443\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: \"\", password: b}\n",
-		"empty password":  "listen: \":8443\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: \"\"}\n",
-		"unknown field":   base + "cache: true\n",
-		"invalid listen":  "listen: \"nope\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: b}\n",
+		"missing listen":              "tls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: b}\n",
+		"missing tls":                 "listen: \":8443\"\nusers:\n  - {username: a, password: b}\n",
+		"missing users":               "listen: \":8443\"\ntls:\n  cert_file: c\n  key_file: k\n",
+		"empty user name":             "listen: \":8443\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: \"\", password: b}\n",
+		"empty password":              "listen: \":8443\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: \"\"}\n",
+		"unknown field":               base + "cache: true\n",
+		"invalid listen":              "listen: \"nope\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: b}\n",
+		"client-only failover budget": base + "timeouts:\n  failover: 10s\n",
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -564,6 +590,23 @@ users:
 				t.Fatalf("expected error for %s", name)
 			}
 		})
+	}
+}
+
+func TestParseServerRejectsFailoverBudget(t *testing.T) {
+	_, err := ParseServer([]byte(`
+listen: "0.0.0.0:8443"
+tls:
+  cert_file: cert.pem
+  key_file: key.pem
+users:
+  - username: alice
+    password: token
+timeouts:
+  failover: 10s
+`))
+	if err == nil || !strings.Contains(err.Error(), "timeouts.failover: only supported by proxy-client") {
+		t.Fatalf("err = %v, want client-only rejection", err)
 	}
 }
 
