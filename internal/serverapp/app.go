@@ -88,6 +88,9 @@ func (l trojanLive) ShutdownTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Shutdown.Std()
 }
 
+// 编译期断言：消费方接口与适配器失配（增删方法）会直接编译失败。
+var _ trojan.LivePolicy = trojanLive{}
+
 // New 加载证书与凭据并组装应用（不绑定端口）。
 // logCtrl 是运行时可调整的日志控制器（可为 nil，此时 /log/level 端点不可用）。
 func New(cfg *config.Server, logger *slog.Logger, logCtrl *logging.Control) (*App, error) {

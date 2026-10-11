@@ -44,6 +44,8 @@ func (d *stubDialer) DialTarget(ctx context.Context, host string, port uint16) (
 	return conn, dialer.Route{Action: routing.Direct}, err
 }
 
+func (d *stubDialer) RouteFor(string) routing.Action { return routing.Direct }
+
 // startEcho 启动一个回显 TCP 服务，并返回其地址。
 func startEcho(t *testing.T) string {
 	t.Helper()

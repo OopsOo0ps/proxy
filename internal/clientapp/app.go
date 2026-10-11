@@ -90,49 +90,36 @@ type livePolicy struct {
 
 func (p *livePolicy) load() *clientRuntime { return p.snap.Load() }
 
-// httpLive / socksLive / dnsLive 把运行时快照适配为各组件需要的动态策略接口。
-// 各组件接口的方法签名不同（各自定义 Dialer 返回类型），因此用适配器区分。
-type httpLive struct{ app *App }
+// clientLive 把运行时快照适配为各组件需要的动态策略接口。
+// 单个适配器同时满足 httpproxy / socks5 / dnsgw 三份消费方接口（方法集是三者
+// 的并集；拨号返回类型经 dialer.Target 统一），新增热加载项只需维护这一处；
+// 任意消费方接口增删方法都会让下方编译期断言失败，不会静默失配。
+type clientLive struct{ app *App }
 
-func (l httpLive) Auth() *auth.Store { return l.app.policy.load().auth }
-func (l httpLive) Dialer() httpproxy.TargetDialer {
-	return l.app.policy.load().dialer
-}
-func (l httpLive) IdleTimeout() time.Duration {
+func (l clientLive) Auth() *auth.Store     { return l.app.policy.load().auth }
+func (l clientLive) Dialer() dialer.Target { return l.app.policy.load().dialer }
+func (l clientLive) IdleTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Idle.Std()
 }
-func (l httpLive) ReadHeaderTimeout() time.Duration {
+func (l clientLive) ReadHeaderTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Handshake.Std()
 }
-func (l httpLive) ShutdownTimeout() time.Duration {
-	return l.app.policy.load().cfg.Timeouts.Shutdown.Std()
-}
-
-type socksLive struct{ app *App }
-
-func (l socksLive) Auth() *auth.Store { return l.app.policy.load().auth }
-func (l socksLive) Dialer() socks5.TargetDialer {
-	return l.app.policy.load().dialer
-}
-func (l socksLive) HandshakeTimeout() time.Duration {
+func (l clientLive) HandshakeTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Handshake.Std()
 }
-func (l socksLive) IdleTimeout() time.Duration {
-	return l.app.policy.load().cfg.Timeouts.Idle.Std()
-}
-func (l socksLive) ShutdownTimeout() time.Duration {
+func (l clientLive) ShutdownTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Shutdown.Std()
 }
+func (l clientLive) Router() dnsgw.RouteDecider { return l.app.policy.load().rules }
+func (l clientLive) Remote() string             { return l.app.policy.load().dnsRemote }
+func (l clientLive) Local() []string            { return l.app.policy.load().dnsLocal }
+func (l clientLive) Timeout() time.Duration     { return l.app.policy.load().dnsTimeout }
 
-type dnsLive struct{ app *App }
-
-func (l dnsLive) Router() dnsgw.RouteDecider { return l.app.policy.load().rules }
-func (l dnsLive) Remote() string             { return l.app.policy.load().dnsRemote }
-func (l dnsLive) Local() []string            { return l.app.policy.load().dnsLocal }
-func (l dnsLive) Timeout() time.Duration     { return l.app.policy.load().dnsTimeout }
-func (l dnsLive) ShutdownTimeout() time.Duration {
-	return l.app.policy.load().cfg.Timeouts.Shutdown.Std()
-}
+var (
+	_ httpproxy.LivePolicy = clientLive{}
+	_ socks5.LivePolicy    = clientLive{}
+	_ dnsgw.LivePolicy     = clientLive{}
+)
 
 // New 校验依赖并组装应用（不绑定端口）。
 // logCtrl 是运行时可调整的日志控制器（可为 nil，此时 /log/level 端点不可用）。
@@ -172,7 +159,7 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 			Logger:          logger,
 			Metrics:         app.metrics,
 			ShutdownTimeout: cfg.Timeouts.Shutdown.Std(),
-			Live:            dnsLive{app: app},
+			Live:            clientLive{app: app},
 		})
 		if err != nil {
 			return nil, err
@@ -181,12 +168,12 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 	}
 
 	app.httpSrv = &httpproxy.Server{
-		Live:    httpLive{app: app},
+		Live:    clientLive{app: app},
 		Logger:  logger,
 		Metrics: app.metrics,
 	}
 	app.socksSrv = &socks5.Server{
-		Live:    socksLive{app: app},
+		Live:    clientLive{app: app},
 		Logger:  logger,
 		Metrics: app.metrics,
 	}
