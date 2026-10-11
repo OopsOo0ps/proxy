@@ -226,6 +226,10 @@ type Timeouts struct {
 // Metrics 是运维端点（/metrics、/health、/stats）的监听配置。
 type Metrics struct {
 	Listen string `yaml:"listen"` // host:port，空 = 不启用
+	// AllowRemote 显式允许把运维端点绑定到非环回地址（默认拒绝——一次绑定
+	// 疏忽不应把拓扑与运行时状态暴露到网络）。只影响只读端点；/log/level 的
+	// 状态变更永远只接受环回来源。
+	AllowRemote bool `yaml:"allow_remote"`
 }
 
 // DNS 是 proxy-client 可选的内置 DNS 网关配置（路线图 3.1）。
@@ -375,6 +379,11 @@ func ClientRestartOnlyChanges(old, next *Client) []string {
 	if old.Metrics.Listen != next.Metrics.Listen {
 		changed = append(changed, "metrics.listen")
 	}
+	if old.Metrics.AllowRemote != next.Metrics.AllowRemote {
+		// 暴露开关决定监听语义：运行中翻转不会改变已绑定的监听，
+		// 明确要求重启，避免配置意图被静默忽略。
+		changed = append(changed, "metrics.allow_remote")
+	}
 	if old.DNS.Listen != next.DNS.Listen {
 		changed = append(changed, "dns.listen")
 	}
@@ -389,6 +398,9 @@ func ServerRestartOnlyChanges(old, next *Server) []string {
 	}
 	if old.Metrics.Listen != next.Metrics.Listen {
 		changed = append(changed, "metrics.listen")
+	}
+	if old.Metrics.AllowRemote != next.Metrics.AllowRemote {
+		changed = append(changed, "metrics.allow_remote")
 	}
 	return changed
 }
@@ -523,7 +535,7 @@ func (c *Client) validate() error {
 		if err := validateListenAddr("inbound.http", c.Inbound.HTTP); err != nil {
 			return err
 		}
-		if len(c.Inbound.Auth) == 0 && !isLoopbackListen(c.Inbound.HTTP) {
+		if len(c.Inbound.Auth) == 0 && !IsLoopbackListen(c.Inbound.HTTP) {
 			return fmt.Errorf("inbound.http: listening on non-loopback address %q requires inbound.auth", c.Inbound.HTTP)
 		}
 	}
@@ -531,7 +543,7 @@ func (c *Client) validate() error {
 		if err := validateListenAddr("inbound.socks5", c.Inbound.SOCKS5); err != nil {
 			return err
 		}
-		if len(c.Inbound.Auth) == 0 && !isLoopbackListen(c.Inbound.SOCKS5) {
+		if len(c.Inbound.Auth) == 0 && !IsLoopbackListen(c.Inbound.SOCKS5) {
 			return fmt.Errorf("inbound.socks5: listening on non-loopback address %q requires inbound.auth", c.Inbound.SOCKS5)
 		}
 	}
@@ -638,9 +650,18 @@ func validateLog(l Log) error {
 
 func validateMetrics(m Metrics) error {
 	if m.Listen == "" {
+		if m.AllowRemote {
+			return errors.New("metrics.allow_remote is set but metrics.listen is empty (the flag only applies to a bound listener)")
+		}
 		return nil
 	}
-	return validateListenAddr("metrics.listen", m.Listen)
+	if err := validateListenAddr("metrics.listen", m.Listen); err != nil {
+		return err
+	}
+	if !IsLoopbackListen(m.Listen) && !m.AllowRemote {
+		return fmt.Errorf("metrics.listen: binding to non-loopback address %q requires metrics.allow_remote: true (ops endpoints expose topology and runtime state)", m.Listen)
+	}
+	return nil
 }
 
 // validateBeforeDefaults 在应用缺省值之前检查 dns 段：字段存在但 listen 为空
@@ -690,7 +711,7 @@ func validateDNS(d DNS) error {
 	if err := validateListenAddr("dns.listen", d.Listen); err != nil {
 		return err
 	}
-	if !isLoopbackListen(d.Listen) {
+	if !IsLoopbackListen(d.Listen) {
 		return fmt.Errorf("dns.listen: only loopback addresses are allowed (got %q): refusing to run as an open resolver", d.Listen)
 	}
 	if err := validateHostPort("dns.remote", d.Remote); err != nil {
@@ -765,9 +786,9 @@ func validatePort(port string) error {
 	return nil
 }
 
-// isLoopbackListen 判断监听地址是否仅绑定本机环回接口。
+// IsLoopbackListen 判断监听地址是否仅绑定本机环回接口。
 // 无法确认（空 host、主机名）时按非环回处理，从严要求认证。
-func isLoopbackListen(addr string) bool {
+func IsLoopbackListen(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil || host == "" {
 		return false

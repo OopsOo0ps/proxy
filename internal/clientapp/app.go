@@ -221,6 +221,9 @@ func (a *App) Listen() error {
 		if err != nil {
 			return fmt.Errorf("clientapp: listen metrics %s: %w", addr, err)
 		}
+		if !config.IsLoopbackListen(addr) {
+			a.logger.Warn("ops endpoints are bound to a non-loopback address; keep them behind a firewall and note PUT /log/level stays loopback-only", "listen", addr)
+		}
 		a.metricsLn = ln
 		a.metricsSrv = &http.Server{
 			Handler:           a.metricsHandler(),

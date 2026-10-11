@@ -187,8 +187,10 @@ func TestLevelHandler(t *testing.T) {
 	}
 
 	// PUT 切换级别：响应含新旧级别，过滤立即生效，变更本身有日志凭证。
+	req := httptest.NewRequest(http.MethodPut, "/log/level?level=debug", nil)
+	req.RemoteAddr = "127.0.0.1:34567" // 状态变更仅接受环回来源
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/log/level?level=debug", nil))
+	h.ServeHTTP(rec, req)
 	body := rec.Body.String()
 	if rec.Code != http.StatusOK || !strings.Contains(body, `"level":"debug"`) || !strings.Contains(body, `"previous":"info"`) {
 		t.Fatalf("PUT = %d %q", rec.Code, body)
@@ -206,8 +208,10 @@ func TestLevelHandler(t *testing.T) {
 	}
 
 	// 切到 error 后 info/debug 被抑制，error 仍可见。
+	req = httptest.NewRequest(http.MethodPut, "/log/level?level=error", nil)
+	req.RemoteAddr = "127.0.0.1:34567"
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/log/level?level=error", nil))
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PUT error = %d", rec.Code)
 	}
@@ -220,8 +224,10 @@ func TestLevelHandler(t *testing.T) {
 	}
 
 	// 非法级别与非法方法。
+	req = httptest.NewRequest(http.MethodPut, "/log/level?level=verbose", nil)
+	req.RemoteAddr = "127.0.0.1:34567"
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/log/level?level=verbose", nil))
+	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("invalid level status = %d, want 400", rec.Code)
 	}
@@ -229,6 +235,32 @@ func TestLevelHandler(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/log/level", nil))
 	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") != "GET, PUT" {
 		t.Fatalf("POST = %d Allow=%q", rec.Code, rec.Header().Get("Allow"))
+	}
+}
+
+func TestLevelHandlerRemotePutForbidden(t *testing.T) {
+	_, lv := newWithWriter(&bytes.Buffer{}, "info", FormatJSON)
+	h := LevelHandler(nil, lv)
+
+	// 远程 GET（只读）允许。
+	req := httptest.NewRequest(http.MethodGet, "/log/level", nil)
+	req.RemoteAddr = "203.0.113.5:45678"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"level":"info"`) {
+		t.Fatalf("remote GET = %d %q, want 200 info", rec.Code, rec.Body.String())
+	}
+
+	// 远程 PUT（状态变更）一律 403，级别保持不变。
+	req = httptest.NewRequest(http.MethodPut, "/log/level?level=debug", nil)
+	req.RemoteAddr = "203.0.113.5:45678"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("remote PUT = %d %q, want 403", rec.Code, rec.Body.String())
+	}
+	if lv.Level() != slog.LevelInfo {
+		t.Fatalf("level = %v, want unchanged info", lv.Level())
 	}
 }
 
