@@ -28,7 +28,7 @@ routing:
   default: proxy
   private_direct: false  # 演示：本机/内网目标也走节点，便于观察隧道流量
 
-# 可选 DNS 网关（README「DNS 处理策略」）：本机 DNS 查询按分流规则转发，
+# 可选 DNS 网关（Wiki「DNS-策略」）：本机 DNS 查询按分流规则转发，
 # 代理名字经出口节点远程解析（DNS over TCP 走隧道）。演示命令见 README。
 dns:
   listen: "127.0.0.1:1053"
