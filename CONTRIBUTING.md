@@ -36,5 +36,6 @@ make help     # 查看全部目标
 
 ## 交流
 
-- Bug 与功能建议：GitHub Issues
-- 安全问题：请勿公开提交 Issue，先通过仓库主页的联系方式私下沟通
+- Bug 与功能建议：[GitHub Issues](https://github.com/OopsOo0ps/proxy/issues)
+- 安全问题：请勿公开提交 Issue，按 [SECURITY.md](SECURITY.md) 的流程私下报告
+  （GitHub 私密漏洞报告 / 邮件）
