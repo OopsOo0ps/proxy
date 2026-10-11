@@ -211,3 +211,44 @@ func TestReloadAppliesLimitsAndLogConfig(t *testing.T) {
 		t.Fatalf("limit after unlimited reload = %d, want 0", got)
 	}
 }
+
+// TestReloadReusesOrRebuildsUpstreamPools 按指纹语义验证复用边界：
+// 非上游变更（日志 / 连接上限）复用节点池与预热池；上游变更（超时）重建。
+func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	if err := os.WriteFile(rulesPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(baseReloadCfg(t, rulesPath), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := app.policy.load()
+	if rt.pool == nil || rt.connPool == nil {
+		t.Fatal("test setup: pools must be built")
+	}
+
+	// 非上游变更：指纹一致，池指针必须复用。
+	hot := *rt.cfg
+	hot.Log.Level = "debug"
+	hot.Limits.MaxConnections = intPtr(2048)
+	if err := app.Reload(&hot); err != nil {
+		t.Fatalf("reload (non-upstream): %v", err)
+	}
+	rt2 := app.policy.load()
+	if rt2.pool != rt.pool || rt2.connPool != rt.connPool {
+		t.Fatal("非上游变更必须复用节点池与预热池（指纹应一致）")
+	}
+
+	// 上游变更：指纹变化，池必须重建。
+	cold := *rt2.cfg
+	cold.Timeouts.Dial = config.Duration(9 * time.Second)
+	if err := app.Reload(&cold); err != nil {
+		t.Fatalf("reload (upstream): %v", err)
+	}
+	rt3 := app.policy.load()
+	if rt3.pool == rt2.pool || rt3.connPool == rt2.connPool {
+		t.Fatal("上游变更必须重建节点池与预热池（指纹应变化）")
+	}
+}

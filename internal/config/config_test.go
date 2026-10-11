@@ -737,6 +737,90 @@ func TestShippedExampleConfigsParse(t *testing.T) {
 	}
 }
 
+func mustFingerprint(t *testing.T, c *Client) string {
+	t.Helper()
+	fp, err := UpstreamFingerprint(c)
+	if err != nil {
+		t.Fatalf("UpstreamFingerprint: %v", err)
+	}
+	return fp
+}
+
+// TestUpstreamFingerprintTracksUpstreamFields：上游字段任一变化都必须改变指纹；
+// 非上游字段的变化不影响指纹（不应触发节点池/预热池重建）。
+func TestUpstreamFingerprintTracksUpstreamFields(t *testing.T) {
+	newCfg := func(t *testing.T) *Client {
+		t.Helper()
+		cfg, err := ParseClient([]byte(validClientYAML))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	baseFP := mustFingerprint(t, newCfg(t))
+
+	upstream := map[string]func(*Client){
+		"nodes":                func(c *Client) { c.Nodes = append(c.Nodes, Node{Addr: "node4.example.com:443", Password: "pw-4"}) },
+		"pool.max_idle":        func(c *Client) { c.Pool.MaxIdle = intPtr(9) },
+		"pool.idle_ttl":        func(c *Client) { c.Pool.IdleTTL = Duration(21 * time.Second) },
+		"health_check.timeout": func(c *Client) { c.HealthCheck.Timeout = Duration(9 * time.Second) },
+		"tls.skip_verify":      func(c *Client) { c.TLS.InsecureSkipVerify = !c.TLS.InsecureSkipVerify },
+		"timeouts.dial":        func(c *Client) { c.Timeouts.Dial = Duration(7 * time.Second) },
+		"timeouts.failover":    func(c *Client) { c.Timeouts.Failover = Duration(11 * time.Second) },
+	}
+	for name, mutate := range upstream {
+		c := newCfg(t)
+		mutate(c)
+		if fp := mustFingerprint(t, c); fp == baseFP {
+			t.Fatalf("%s 是上游字段：变化必须改变指纹", name)
+		}
+	}
+
+	nonUpstream := map[string]func(*Client){
+		"inbound.auth":    func(c *Client) { c.Inbound.Auth = []User{{Username: "bob", Password: "pw"}} },
+		"routing.default": func(c *Client) { c.Routing.Default = "direct" },
+		"dns.timeout":     func(c *Client) { c.DNS.Timeout = Duration(9 * time.Second) },
+		"limits":          func(c *Client) { c.Limits.MaxConnections = intPtr(7) },
+		"metrics.listen":  func(c *Client) { c.Metrics.Listen = "127.0.0.1:9999" },
+		"log.level":       func(c *Client) { c.Log.Level = "debug" },
+	}
+	for name, mutate := range nonUpstream {
+		c := newCfg(t)
+		mutate(c)
+		if fp := mustFingerprint(t, c); fp != baseFP {
+			t.Fatalf("%s 与上游栈无关：指纹必须保持不变", name)
+		}
+	}
+}
+
+// TestUpstreamFingerprintFieldClassification：强制给 config.Client 的每个顶层字段
+// 归类（上游相关 / 明确无关），并要求分类清单与指纹结构体字段完全一致。
+// 新增字段而未归类时直接失败，杜绝「加了影响上游栈的字段、却忘了参与复用判定」。
+func TestUpstreamFingerprintFieldClassification(t *testing.T) {
+	upstream := map[string]bool{"Nodes": true, "Pool": true, "HealthCheck": true, "TLS": true, "Timeouts": true}
+	knownNonUpstream := map[string]bool{"Inbound": true, "Routing": true, "DNS": true, "Limits": true, "Log": true, "Metrics": true}
+
+	client := reflect.TypeOf(Client{})
+	for i := 0; i < client.NumField(); i++ {
+		name := client.Field(i).Name
+		if !upstream[name] && !knownNonUpstream[name] {
+			t.Fatalf("config.Client 新增字段 %q 未分类：影响出口链路栈吗？是 → 加入 upstreamStack 与 upstream 清单；否 → 加入 knownNonUpstream。", name)
+		}
+	}
+
+	stack := reflect.TypeOf(upstreamStack{})
+	for i := 0; i < stack.NumField(); i++ {
+		name := stack.Field(i).Name
+		if !upstream[name] {
+			t.Fatalf("upstreamStack 字段 %q 未登记在 upstream 清单", name)
+		}
+		delete(upstream, name)
+	}
+	if len(upstream) != 0 {
+		t.Fatalf("upstream 清单存在未实现的字段：%v", upstream)
+	}
+}
+
 func TestClientRestartOnlyChanges(t *testing.T) {
 	base := func(t *testing.T) *Client {
 		t.Helper()
