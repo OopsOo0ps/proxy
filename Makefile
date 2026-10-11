@@ -5,6 +5,7 @@
 #   make test       运行全部单元测试
 #   make cover      运行测试并打印总覆盖率
 #   make lint       运行 golangci-lint（首次自动下载到 .bin/，带校验）
+#   make demo       一条命令跑通本地三节点演示（构建 → 启动 → 验证）
 #   make demo-up    本地三节点演示：后台启动 3 节点 + 客户端（日志在 var/demo/）
 #   make demo-check 演示链路验证（HTTP / SOCKS5 / DNS 网关 / 指标）
 #   make demo-down  停止本地演示进程
@@ -53,7 +54,7 @@ GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/down
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
 .PHONY: all build test cover lint fmt vet run run-server run-client run-controller dev-cert \
-	version demo-up demo-check demo-down \
+	version demo demo-up demo-check demo-down \
 	docker-build docker-build-debug clean help
 
 all: build
@@ -127,11 +128,18 @@ dev-cert:
 	@echo "已生成 var/dev-cert.pem 与 var/dev-key.pem"
 
 # ---- 本地三节点演示 ----------------------------------------------------------
+# demo       一条命令跑通：构建 → 启动 3 节点 + 客户端 → 四项验证（进程保持运行）。
 # demo-up    生成证书并后台启动 3 个出口节点 + 1 个客户端（PID 与日志在 var/demo/）。
 # demo-check 验证四条链路：HTTP 入站 / SOCKS5 入站 / DNS 网关 / Prometheus 指标。
 # demo-down  停止全部演示进程（SIGTERM 优雅关停，等待排空后退出）。
 
+demo:
+	@$(MAKE) --no-print-directory demo-up
+	@$(MAKE) --no-print-directory demo-check
+	@echo "演示完成：make demo-down 停止演示进程。"
+
 demo-up: build dev-cert
+	@command -v curl >/dev/null 2>&1 || { echo "需要 curl 用于就绪检查（Ubuntu 可 apt install curl）"; exit 1; }
 	@mkdir -p $(DEMO_DIR)
 	@start() { name=$$1; shift; \
 		if [ -f $(DEMO_DIR)/$$name.pid ] && kill -0 $$(cat $(DEMO_DIR)/$$name.pid) 2>/dev/null; then \
@@ -153,21 +161,28 @@ demo-up: build dev-cert
 		kill -0 $$(cat $(DEMO_DIR)/$$name.pid) 2>/dev/null || { ok=0; echo "  !! $$name 未存活，日志末尾："; tail -n 5 $(DEMO_DIR)/$$name.log; }; \
 	done; \
 	if [ $$ok -eq 1 ]; then \
+		echo "  HTTP 入站 http://$(DEMO_HTTP) ｜ SOCKS5 $(DEMO_SOCKS5) ｜ DNS 网关 $(DEMO_DNS) ｜ 指标 http://$(DEMO_METRICS)/metrics"; \
 		echo "演示已就绪：make demo-check 验证 / make demo-down 停止。"; \
 	else \
 		echo "演示启动异常（见上方日志）"; exit 1; \
 	fi
 
 demo-check:
-	@curl -fsS http://$(DEMO_METRICS)/health >/dev/null 2>&1 || { echo "演示未在运行：先执行 make demo-up"; exit 1; }
+	@command -v curl >/dev/null 2>&1 || { echo "需要 curl（Ubuntu 可 apt install curl）"; exit 1; }
+	@curl -fsS http://$(DEMO_METRICS)/health >/dev/null 2>&1 || { echo "演示未在运行：先执行 make demo-up（或 make demo）"; exit 1; }
 	@printf 'HTTP/HTTPS 入站（CONNECT 隧道）：'; \
 	curl -fsS -x http://$(DEMO_HTTP) -U $(DEMO_USER) $(DEMO_TARGET) -o /dev/null -w 'HTTP %{http_code}，耗时 %{time_total}s\n'
 	@printf 'SOCKS5 入站：'; \
 	curl -fsS --socks5-hostname $(DEMO_SOCKS5) -U $(DEMO_USER) $(DEMO_TARGET) -o /dev/null -w 'HTTP %{http_code}，耗时 %{time_total}s\n'
-	@dns=$(DEMO_DNS); printf 'DNS 网关（经出口节点远程解析 example.com）：'; \
-	dig @$${dns%:*} -p $${dns##*:} +short example.com | tr '\n' ' '; echo
-	@echo 'Prometheus 指标（客户端，节选）：'; \
-	curl -fsS http://$(DEMO_METRICS)/metrics | grep -E '^(requests_total|active_connections)' | head -6 | sed 's/^/  /'
+	@dns=$(DEMO_DNS); \
+	if command -v dig >/dev/null 2>&1; then \
+		printf 'DNS 网关（经出口节点远程解析 example.com）：'; \
+		dig @$${dns%:*} -p $${dns##*:} +short example.com | tr '\n' ' '; echo; \
+	else \
+		echo 'DNS 网关：未找到 dig（Ubuntu 可 apt install dnsutils），跳过该验证'; \
+	fi
+	@echo 'Prometheus 指标（客户端，非零项节选）：'; \
+	curl -fsS http://$(DEMO_METRICS)/metrics | grep -E '^(requests_total|active_connections)' | awk '$$NF != 0' | head -6 | sed 's/^/  /'
 
 demo-down:
 	@pids=''; \
@@ -222,6 +237,7 @@ help:
 		'  lint            运行 golangci-lint' \
 		'  fmt             格式化代码（go fmt）' \
 		'  vet             运行 go vet' \
+		'  demo            一条命令跑通本地演示（demo-up + demo-check）' \
 		'  demo-up         本地三节点演示：后台启动 3 节点 + 客户端' \
 		'  demo-check      演示链路验证（HTTP / SOCKS5 / DNS / 指标）' \
 		'  demo-down       停止本地演示进程' \

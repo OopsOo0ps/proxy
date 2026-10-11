@@ -63,35 +63,40 @@ flowchart LR
 
 ## 快速开始
 
-环境要求：Go 1.25+（仅构建需要）；生产运行目标为 Ubuntu 22.04。
+环境要求：Go 1.25+ 与 make（构建用；Ubuntu 可 `apt install build-essential`）；演示需要 curl，DNS 验证需要 dig（缺失时自动跳过）。生产运行目标为 Ubuntu 22.04。
 
 ```sh
 git clone https://github.com/OopsOo0ps/proxy.git
 cd proxy
-make build      # 构建三个二进制到 bin/
-make version    # 确认构建可用（打印版本信息）
+make demo   # 一条命令跑通：构建 → 启动本机三节点演示 → 四项验证
 ```
 
-### 本地三节点演示
-
-仓库自带一套本机演示配置（3 个出口节点 + 1 个客户端，`configs/local/`）。三条 Make 命令即可起、验、停：
-
-```sh
-make demo-up     # 生成自签证书并后台启动 3 节点 + 客户端（日志在 var/demo/）
-make demo-check  # 四项验证：HTTP 入站 / SOCKS5 入站 / DNS 网关 / Prometheus 指标
-make demo-down   # 停止演示进程（SIGTERM 优雅关停）
-```
-
-`make demo-check` 的输出形如（数值随网络环境变化）：
+输出形如（数值随网络环境变化）：
 
 ```text
+  server-1 已启动（pid 10823）
+  ...（server-2 / server-3 / client 同理）
+  HTTP 入站 http://127.0.0.1:18080 ｜ SOCKS5 127.0.0.1:11080 ｜ DNS 网关 127.0.0.1:1053 ｜ 指标 http://127.0.0.1:19100/metrics
+演示已就绪：make demo-check 验证 / make demo-down 停止。
 HTTP/HTTPS 入站（CONNECT 隧道）：HTTP 200，耗时 0.7s
 SOCKS5 入站：HTTP 200，耗时 0.7s
 DNS 网关（经出口节点远程解析 example.com）：172.66.147.243 104.20.23.154
-Prometheus 指标（客户端，节选）：
+Prometheus 指标（客户端，非零项节选）：
   active_connections{proto="socks5"} 1
   requests_total{proto="http",result="ok",route="proxy"} 1
   requests_total{proto="socks5",result="ok",route="proxy"} 1
+  ...
+演示完成：make demo-down 停止演示进程。
+```
+
+### 本地三节点演示（分步）
+
+演示来自仓库自带的 `configs/local/`（3 个出口节点 + 1 个客户端）；`make demo` 结束后进程保持运行便于继续观察，也可以分步使用：
+
+```sh
+make demo-up     # 只启动：生成自签证书并后台运行（日志与 PID 在 var/demo/）
+make demo-check  # 只验证：HTTP 入站 / SOCKS5 入站 / DNS 网关 / Prometheus 指标
+make demo-down   # 只停止：SIGTERM 优雅关停
 ```
 
 值得注意：
@@ -269,7 +274,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 - `make test`：运行全部单元测试（含端到端、黑盒集成与混沌用例，不依赖外部网络）
 - `make cover`：运行测试并打印总覆盖率
 - `make lint`：静态检查（golangci-lint v2，首次自动下载）
-- `make demo-up` / `make demo-check` / `make demo-down`：本地三节点演示（后台起停 + 链路验证）
+- `make demo`：一条命令跑通本地三节点演示；分步使用 `make demo-up` / `make demo-check` / `make demo-down`
 - `make run-server` / `make run-client`：前台运行（`SERVER_CONFIG` / `CLIENT_CONFIG` 指定配置）
 - `make dev-cert`：生成本地演示用自签证书
 - `make docker-build` / `make docker-build-debug`：构建容器镜像

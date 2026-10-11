@@ -8,9 +8,10 @@
 
 ### 构建（Build）
 
-- Makefile 新增本地演示工作流：`demo-up` / `demo-check` / `demo-down` 一键起停
-  3 节点演示并验证 HTTP / SOCKS5 / DNS / 指标；新增 `version` 目标；
-  `run-server` / `run-client` 支持 `SERVER_CONFIG` / `CLIENT_CONFIG` 覆盖配置。
+- Makefile 新增本地演示工作流：`make demo` 一条命令完成构建 → 启动 → 验证，
+  `demo-up` / `demo-check` / `demo-down` 可分步起停并验证 3 节点演示
+  （HTTP / SOCKS5 / DNS / 指标）；新增 `version` 目标；`run-server` / `run-client`
+  支持 `SERVER_CONFIG` / `CLIENT_CONFIG` 覆盖配置。
 
 ### 文档（Documentation）
 

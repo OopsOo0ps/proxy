@@ -15,6 +15,7 @@ make build        # 构建三个二进制到 bin/
 make test         # 运行全部单元测试
 make cover        # 运行测试并打印总覆盖率
 make lint         # 运行 golangci-lint
+make demo         # 一条命令跑通本地演示（demo-up + demo-check）
 make demo-up      # 本地三节点演示：后台启动 3 节点 + 客户端
 make demo-check   # 演示链路验证（HTTP / SOCKS5 / DNS / 指标）
 make demo-down    # 停止演示进程
