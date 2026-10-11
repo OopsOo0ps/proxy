@@ -156,6 +156,42 @@ docker run --rm proxy-client-debug -version
 Docker Desktop 上可经 Rosetta 仿真运行（功能验证可用，性能非原生）。
 CI 会构建两个最小镜像并校验 < 30MB，同时做冒烟（版本输出、排错镜像工具齐全）。
 
+### systemd（Ubuntu 22.04）
+
+仓库提供两个单元文件（`deploy/systemd/`），按最小权限原则配置了完整沙箱
+（`ProtectSystem=strict`、`ProtectHome`、`PrivateTmp/PrivateDevices`、
+`ProtectProc=invisible`、清空的能力集与 `@system-service` 系统调用过滤、
+`MemoryDenyWriteExecute` 等；清单见单元文件与 `systemd-analyze security` 评分）。
+
+```sh
+# 1) 专用系统用户与目录（配置含明文口令：仅 root 可读、proxy 组可读）
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin proxy
+sudo install -d -o root -g proxy -m 0750 /etc/proxy /etc/proxy/tls
+
+# 2) 二进制、配置与证书（示例；证书/口令按实际替换）
+sudo install -m 0755 bin/proxy-client /usr/local/bin/proxy-client
+sudo install -m 0755 bin/proxy-server /usr/local/bin/proxy-server
+sudo install -o root -g proxy -m 0640 configs/example-client.yaml /etc/proxy/client.yaml
+sudo install -o root -g proxy -m 0640 configs/example-server.yaml /etc/proxy/server.yaml
+sudo install -o root -g proxy -m 0640 server.crt server.key /etc/proxy/tls/
+
+# 3) 安装单元并启动（按需选择 client / server）
+sudo install -m 0644 deploy/systemd/proxy-client.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/proxy-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now proxy-client
+
+# 4) 运维：日志、热加载（SIGHUP）与沙箱评分
+journalctl -u proxy-client -f
+sudo systemctl reload proxy-client     # 校验失败时保持旧配置继续服务
+systemd-analyze security proxy-client
+```
+
+注意：单元默认以高位端口示例（`timeouts`/`inbound` 配置内）；若要监听
+< 1024 端口（如 443、53），按单元文件注释放开 `CAP_NET_BIND_SERVICE`。
+`Restart=on-failure` + `RestartSec=1s` 提供进程级自愈；`ExecReload` 触发
+SIGHUP 配置热加载。
+
 ## 配置
 
 配置为 YAML 且严格解析：**未知字段会直接导致启动失败**，避免拼写错误被静默忽略。
@@ -667,7 +703,8 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
   认证；变更检测基于内容摘要——远端语义相同但字节不同也会触发一次重建（无害）。
 - `proxy-controller` 仍为骨架，配置尚不支持集中下发；请手动分发配置文件。
 - 生产运行目标平台为 Ubuntu 22.04；其他平台尚未验证。
-- 尚未提供 systemd 单元与发行包，请通过源码构建使用。
+- 尚未提供发行包（deb / apt 源）；systemd 单元见「systemd（Ubuntu 22.04）」
+  小节，也可直接以源码构建的二进制运行。
 - 关停期间不接受新连接；超过 `timeouts.shutdown` 仍未结束的连接会被强制断开
   （日志中有明确记录），这是有意的“有限期 drain”语义。
 - 连接上限语义：客户端统计 HTTP + SOCKS5 入站合计，服务端统计隧道连接。
@@ -747,6 +784,7 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 ├── pkg/version/          #   版本信息（构建期注入）
 ├── test/integration/     #   黑盒集成测试（真实二进制端到端）
 ├── Dockerfile            # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
+├── deploy/systemd/       # systemd 单元（Ubuntu 22.04，含沙箱配置）
 ├── Makefile              # 开发入口（build / test / cover / lint ...）
 └── .github/workflows/    # CI（构建 + 测试 + golangci-lint）
 ```
@@ -810,8 +848,9 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 - [x] 集成测试（黑盒：构建并启动真实二进制，验证分流、指标与半关闭传播）
 - [x] 混沌测试（最小版：SIGKILL 上游 → 自动摘除 / 流量转移 / 自动加回；含真机演练）
 - [x] Docker 镜像（多阶段构建；最小版 <30MB + 排错版，linux/amd64）
+- [x] systemd unit 文件（Ubuntu 22.04 原生部署，含沙箱；真机验证）
 - [ ] 控制端动态配置
-- [ ] 部署与运维（systemd / 发行包）
+- [ ] 发行包（deb / apt 源）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
 
 ## 参与贡献
