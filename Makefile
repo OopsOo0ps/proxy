@@ -17,6 +17,10 @@ BIN_DIR    := bin
 TOOL_DIR   := .bin
 MODULE     := github.com/OopsOo0ps/proxy
 
+DOCKER           ?= docker
+DOCKER_PLATFORM  ?= linux/amd64
+DOCKER_TAG       ?= dev
+
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -30,7 +34,8 @@ GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
-.PHONY: all build test cover lint fmt vet run run-server run-client run-controller dev-cert clean help
+.PHONY: all build test cover lint fmt vet run run-server run-client run-controller dev-cert \
+	docker-build docker-build-debug clean help
 
 all: build
 
@@ -98,6 +103,25 @@ dev-cert:
 		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 	@echo "已生成 var/dev-cert.pem 与 var/dev-key.pem"
 
+# 构建最小运行镜像（distroless，非 root，linux/amd64）。
+docker-build:
+	$(DOCKER) build --platform $(DOCKER_PLATFORM) --target client -t proxy-client:$(DOCKER_TAG) \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE) .
+	$(DOCKER) build --platform $(DOCKER_PLATFORM) --target server -t proxy-server:$(DOCKER_TAG) \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE) .
+	@echo "最小镜像（目标 <30MB）："
+	@$(DOCKER) images --filter reference='proxy-client' --filter reference='proxy-server' \
+		--format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+# 构建排错镜像（alpine + curl/dig/tcpdump/ss/nc/openssl/bash/jq，root）。
+docker-build-debug:
+	$(DOCKER) build --platform $(DOCKER_PLATFORM) --target client-debug -t proxy-client-debug:$(DOCKER_TAG) \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE) .
+	$(DOCKER) build --platform $(DOCKER_PLATFORM) --target server-debug -t proxy-server-debug:$(DOCKER_TAG) \
+		--build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) --build-arg BUILD_DATE=$(BUILD_DATE) .
+	@$(DOCKER) images --filter reference='proxy-client-debug' --filter reference='proxy-server-debug' \
+		--format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
 clean:
 	rm -rf $(BIN_DIR) $(TOOL_DIR)
 
@@ -114,4 +138,6 @@ help:
 		'  run-client      构建并前台启动 proxy-client' \
 		'  run-controller  运行 proxy-controller' \
 		'  dev-cert        生成本地演示用自签证书到 var/' \
+		'  docker-build    构建最小运行镜像（linux/amd64，distroless）' \
+		'  docker-build-debug 构建排错镜像（alpine + 网络排查工具）' \
 		'  clean           清理 bin/ 与 .bin/'
