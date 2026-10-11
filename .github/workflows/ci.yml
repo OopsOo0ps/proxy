@@ -75,6 +75,6 @@ jobs:
         run: docker run --rm proxy-client:dev -version
       - name: Smoke debug image (tools present)
         run: |
-          docker run --rm proxy-client-debug -version
-          docker run --rm --entrypoint /bin/sh proxy-client-debug -c \
+          docker run --rm proxy-client-debug:dev -version
+          docker run --rm --entrypoint /bin/sh proxy-client-debug:dev -c \
             'curl --version | head -1; dig -v 2>&1 | head -1; tcpdump --version | head -1; ss -V | head -1; openssl version'
