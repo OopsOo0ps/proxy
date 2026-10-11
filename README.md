@@ -712,6 +712,7 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 │   ├── testutil/         #   测试辅助（自签证书）
 │   └── trojan/           #   Trojan 协议（客户端握手 / 服务端）
 ├── pkg/version/          #   版本信息（构建期注入）
+├── test/integration/     #   黑盒集成测试（真实二进制端到端）
 ├── Makefile              # 开发入口（build / test / cover / lint ...）
 └── .github/workflows/    # CI（构建 + 测试 + golangci-lint）
 ```
@@ -736,6 +737,16 @@ SOCKS5 与入站认证、DNS 网关（代理名字经出口远程解析且本地
 规则集动态加载也有端到端覆盖：远程规则按周期刷新生效（路由翻转）、非法内容与
 拉取失败保持旧规则并在源恢复后自动收敛、启动拉取失败告警后继续运行、SIGHUP
 立即重拉（失败容错）、`ruleset_refreshes_total` 与 `/stats` 的 `ruleset` 字段按预期记录。
+
+集成测试（`test/integration/`，随 `make test` 运行，`-short` 跳过）以**黑盒**方式
+验证交付物本身：`go test` 时构建并启动真实的 `proxy-server` / `proxy-client`
+二进制，端口全部动态分配（配置写 `:0`，从启动日志读取实际地址）。链路为
+「启动服务 → 发请求（HTTP 转发 / HTTPS CONNECT / SOCKS5 / 原始 CONNECT）→
+验证分流（客户端指标 `route` 标签、结构化日志的 `route`/`upstream`/`target`、
+服务端成功隧道计数）→ 验证指标（`/metrics` 的 `requests_total`、
+`request_duration_seconds`、`active_connections`）→ SIGTERM 优雅关停（退出码 0）」；
+其中 SOCKS5 与 CONNECT 请求要求「读到 EOF」，覆盖目标先关闭时半关闭沿
+入站 → 隧道 → 出口逐层传播。全程不依赖外部网络。
 CI 与本地使用同一套 Makefile 目标，行为一致。
 
 ## 路线图
@@ -754,6 +765,7 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 - [x] 配置热加载（SIGHUP：校验失败保持旧配置，成功原子生效）
 - [x] 上游故障自愈（主动健康检查：连续失败摘除、连续成功自动加回；被动冷却转移）
 - [x] 规则集动态加载（远程 URL 拉取 + 定时刷新；失败保持现有规则，SIGHUP 立即重拉）
+- [x] 集成测试（黑盒：构建并启动真实二进制，验证分流、指标与半关闭传播）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
