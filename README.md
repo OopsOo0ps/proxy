@@ -123,6 +123,39 @@ curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duratio
 ./bin/proxy-client -config configs/example-client.yaml
 ```
 
+### Docker 镜像
+
+多阶段构建，按二进制拆分为独立镜像（linux/amd64，目标平台 Ubuntu 22.04）：
+
+| 目标 | 镜像 | 说明 |
+| --- | --- | --- |
+| `client` / `server` | `proxy-client:dev` / `proxy-server:dev` | 最小运行镜像：distroless/static、非 root、无 shell（**< 30MB**） |
+| `client-debug` / `server-debug` | `proxy-client-debug:dev` / `proxy-server-debug:dev` | 排错镜像：alpine + curl / dig / tcpdump / ss / nc / openssl / bash / jq（root） |
+
+```sh
+make docker-build          # 构建最小镜像（可 DOCKER_TAG=v0.1.0 指定标签）
+make docker-build-debug    # 构建排错镜像
+
+# 运行（配置与证书以卷挂载；镜像内自带 configs/example-*.yaml 作为模板）
+docker run -d --name proxy-server \
+  -v /etc/proxy/server.yaml:/etc/proxy/server.yaml:ro \
+  -v /etc/proxy/tls:/etc/proxy/tls:ro \
+  -p 8443:8443 \
+  proxy-server:dev
+
+docker run -d --name proxy-client \
+  -v /etc/proxy/client.yaml:/etc/proxy/client.yaml:ro \
+  -p 8080:8080 -p 1080:1080 \
+  proxy-client:dev
+
+# 排错镜像：除同一二进制外，另带网络排查工具（dig / tcpdump / ss / nc 等），以 root 运行
+docker run --rm proxy-client-debug -version
+```
+
+说明：镜像仅构建 **linux/amd64**（与目标平台一致）；在 Apple Silicon 的
+Docker Desktop 上可经 Rosetta 仿真运行（功能验证可用，性能非原生）。
+CI 会构建两个最小镜像并校验 < 30MB，同时做冒烟（版本输出、排错镜像工具齐全）。
+
 ## 配置
 
 配置为 YAML 且严格解析：**未知字段会直接导致启动失败**，避免拼写错误被静默忽略。
@@ -713,6 +746,7 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 │   └── trojan/           #   Trojan 协议（客户端握手 / 服务端）
 ├── pkg/version/          #   版本信息（构建期注入）
 ├── test/integration/     #   黑盒集成测试（真实二进制端到端）
+├── Dockerfile            # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
 ├── Makefile              # 开发入口（build / test / cover / lint ...）
 └── .github/workflows/    # CI（构建 + 测试 + golangci-lint）
 ```
@@ -775,6 +809,7 @@ CI 与本地使用同一套 Makefile 目标，行为一致。
 - [x] 规则集动态加载（远程 URL 拉取 + 定时刷新；失败保持现有规则，SIGHUP 立即重拉）
 - [x] 集成测试（黑盒：构建并启动真实二进制，验证分流、指标与半关闭传播）
 - [x] 混沌测试（最小版：SIGKILL 上游 → 自动摘除 / 流量转移 / 自动加回；含真机演练）
+- [x] Docker 镜像（多阶段构建；最小版 <30MB + 排错版，linux/amd64）
 - [ ] 控制端动态配置
 - [ ] 部署与运维（systemd / 发行包）
 - [ ] UDP（SOCKS5 UDP ASSOCIATE）与 TUN 模式
