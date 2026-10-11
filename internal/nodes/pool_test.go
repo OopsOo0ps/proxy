@@ -9,8 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/OopsOo0ps/proxy/internal/config"
 )
 
 // nopConn 是最小的 net.Conn 实现，仅用于测试。
@@ -25,8 +23,8 @@ func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 
-func testNodes() []config.Node {
-	return []config.Node{
+func testNodes() []Node {
+	return []Node{
 		{Addr: "node1.example.com:443", Password: "p1"},
 		{Addr: "node2.example.com:443", Password: "p2"},
 		{Addr: "node3.example.com:443", Password: "p3"},
@@ -44,7 +42,7 @@ func newRecorder() *recorder {
 	return &recorder{calls: map[string]int{}, errs: map[string]error{}}
 }
 
-func (r *recorder) dial(_ context.Context, node config.Node, _ string, _ uint16) (net.Conn, error) {
+func (r *recorder) dial(_ context.Context, node Node, _ string, _ uint16) (net.Conn, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls[node.Addr]++
@@ -70,7 +68,7 @@ func (r *recorder) setErr(addr string, err error) {
 // 模拟“TCP 可连但始终不完成握手”的半死节点。
 func blockingDial() (DialFunc, func() int) {
 	var calls atomic.Int64
-	dial := func(ctx context.Context, _ config.Node, _ string, _ uint16) (net.Conn, error) {
+	dial := func(ctx context.Context, _ Node, _ string, _ uint16) (net.Conn, error) {
 		calls.Add(1)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -334,10 +332,10 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(testNodes(), nil, Options{}); err == nil {
 		t.Fatal("nil dial should be rejected")
 	}
-	if _, err := New([]config.Node{{Addr: "no-port", Password: "x"}}, dial, Options{}); err == nil {
+	if _, err := New([]Node{{Addr: "no-port", Password: "x"}}, dial, Options{}); err == nil {
 		t.Fatal("bad addr should be rejected")
 	}
-	if _, err := New([]config.Node{{Addr: "n.example.com:443", Password: ""}}, dial, Options{}); err == nil {
+	if _, err := New([]Node{{Addr: "n.example.com:443", Password: ""}}, dial, Options{}); err == nil {
 		t.Fatal("empty password should be rejected")
 	}
 }
@@ -461,7 +459,7 @@ func TestHealthCheckRemovesThenRejoins(t *testing.T) {
 	var removals, rejoins []string
 	pool, err := New(testNodes(), rec.dial, Options{
 		Health: HealthOptions{Interval: time.Minute, Timeout: time.Second, Failures: 2, Successes: 2},
-		Probe:  func(context.Context, config.Node) error { return nil }, // 本用例手动驱动，不启动探测循环
+		Probe:  func(context.Context, Node) error { return nil }, // 本用例手动驱动，不启动探测循环
 		OnRemove: func(addr string) {
 			removals = append(removals, addr)
 		},
@@ -541,7 +539,7 @@ func TestHealthCheckRecoveryRequiresConsecutiveSuccesses(t *testing.T) {
 	var removals int
 	pool, err := New(testNodes(), rec.dial, Options{
 		Health:   HealthOptions{Interval: time.Minute, Timeout: time.Second, Failures: 1, Successes: 2},
-		Probe:    func(context.Context, config.Node) error { return nil },
+		Probe:    func(context.Context, Node) error { return nil },
 		OnRemove: func(string) { removals++ },
 	})
 	if err != nil {
@@ -578,7 +576,7 @@ func TestHealthCheckAllRemovedFailsFast(t *testing.T) {
 	rec := newRecorder()
 	pool, err := New(testNodes(), rec.dial, Options{
 		Health: HealthOptions{Interval: time.Minute, Timeout: time.Second, Failures: 1, Successes: 1},
-		Probe:  func(context.Context, config.Node) error { return nil },
+		Probe:  func(context.Context, Node) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -614,7 +612,7 @@ func TestHealthCheckLoopRemovesAndRejoins(t *testing.T) {
 	var probes atomic.Int64
 	pool, err := New(testNodes(), rec.dial, Options{
 		Health: HealthOptions{Interval: 5 * time.Millisecond, Timeout: 50 * time.Millisecond, Failures: 2, Successes: 2},
-		Probe: func(context.Context, config.Node) error {
+		Probe: func(context.Context, Node) error {
 			probes.Add(1)
 			if failing.Load() {
 				return errors.New("probe failed")
@@ -666,7 +664,7 @@ func TestHealthCheckDisabledWithoutInterval(t *testing.T) {
 	var probes atomic.Int64
 	pool, err := New(testNodes(), newRecorder().dial, Options{
 		Health: HealthOptions{Interval: 0},
-		Probe: func(context.Context, config.Node) error {
+		Probe: func(context.Context, Node) error {
 			probes.Add(1)
 			return nil
 		},
@@ -697,7 +695,7 @@ func TestCloseWaitsForInFlightProbe(t *testing.T) {
 	var once sync.Once
 	pool, err := New(testNodes()[:1], newRecorder().dial, Options{
 		Health: HealthOptions{Interval: time.Hour, Timeout: time.Minute, Failures: 1, Successes: 1},
-		Probe: func(context.Context, config.Node) error {
+		Probe: func(context.Context, Node) error {
 			once.Do(func() { close(probeStarted) })
 			<-releaseProbe
 			return errors.New("probe failed")

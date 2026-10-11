@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/netutil"
-	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"gopkg.in/yaml.v3"
 )
 
@@ -77,6 +76,11 @@ const (
 // defaultFailoverBudget 是出口节点故障转移链的缺省总时间预算（proxy-client 专用）。
 // 与 nodes.DefaultFailoverBudget 保持一致：一个约束配置层默认值，一个约束库调用方。
 const defaultFailoverBudget = 30 * time.Second
+
+// defaultShutdownTimeout 是优雅关停排空的缺省期限。
+// 取值与 shutdown.DefaultTimeout 保持一致（由外部包测试防漂移）：
+// 配置层不依赖运行时生命周期包，运行时组件各自仍可用 shutdown.DefaultTimeout 兜底。
+const defaultShutdownTimeout = 15 * time.Second
 
 // EffectiveMaxIdle 返回生效的每节点空闲连接上限（缺省 2，0 = 关闭）。
 func (p Pool) EffectiveMaxIdle() int {
@@ -480,7 +484,7 @@ func applyTimeoutDefaults(t *Timeouts) {
 		t.Idle = Duration(90 * time.Second)
 	}
 	if t.Shutdown == 0 {
-		t.Shutdown = Duration(shutdown.DefaultTimeout)
+		t.Shutdown = Duration(defaultShutdownTimeout)
 	}
 }
 

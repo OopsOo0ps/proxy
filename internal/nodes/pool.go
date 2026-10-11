@@ -26,15 +26,23 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
 
+// Node 描述一个出口节点（Trojan over TLS）。
+// 运行时模型与配置模式解耦：由组装根从 config.Node 映射而来，
+// 本包不反向依赖配置层。
+type Node struct {
+	Addr     string // host:port
+	Password string // 隧道口令
+	SNI      string // 可选：TLS SNI / 证书校验名
+}
+
 // DialFunc 通过指定节点建立到目标的隧道连接。
-type DialFunc func(ctx context.Context, node config.Node, host string, port uint16) (net.Conn, error)
+type DialFunc func(ctx context.Context, node Node, host string, port uint16) (net.Conn, error)
 
 // ProbeFunc 对节点做一次轻量健康探测（如 TCP+TLS 握手），失败时返回错误。
-type ProbeFunc func(ctx context.Context, node config.Node) error
+type ProbeFunc func(ctx context.Context, node Node) error
 
 // ErrNoHealthyNodes 表示所有出口节点都被主动健康检查摘除。
 var ErrNoHealthyNodes = errors.New("nodes: all exit nodes removed by health check")
@@ -95,7 +103,7 @@ type Pool struct {
 }
 
 type state struct {
-	cfg            config.Node
+	cfg            Node
 	fails          int
 	unhealthyUntil time.Time
 	// removed 表示被主动健康检查摘除（硬摘除，不参与任何尝试）。
@@ -116,7 +124,7 @@ type Status struct {
 }
 
 // New 构建节点池；节点数量至少为 1。
-func New(cfgs []config.Node, dial DialFunc, opts Options) (*Pool, error) {
+func New(cfgs []Node, dial DialFunc, opts Options) (*Pool, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("nodes: at least one exit node is required")
 	}
@@ -199,10 +207,10 @@ func (p *Pool) AnyHealthy() bool {
 // 立即停止后续尝试，在途尝试随上下文取消，最坏等待从「节点数 × 单节点超时」
 // 收敛为预算上限。因预算或调用方取消（而非节点自身错误）中断的尝试不计入
 // 被动失败，避免把健康节点误送入冷却。
-func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, config.Node, error) {
+func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, Node, error) {
 	candidates := p.candidates()
 	if len(candidates) == 0 {
-		return nil, config.Node{}, ErrNoHealthyNodes
+		return nil, Node{}, ErrNoHealthyNodes
 	}
 	// 子上下文与父上下文取更短的截止时间：调用方超时优先级更高。
 	chainCtx, cancel := context.WithTimeout(ctx, p.opts.FailoverBudget)
@@ -229,7 +237,7 @@ func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, co
 		}
 		p.markFailure(st)
 	}
-	return nil, config.Node{}, fmt.Errorf("all exit nodes failed: %w", errors.Join(errs...))
+	return nil, Node{}, fmt.Errorf("all exit nodes failed: %w", errors.Join(errs...))
 }
 
 // annotateChainAbort 为「链被中断」标注原因：预算耗尽与调用方取消（父上下文
@@ -448,7 +456,7 @@ func (p *Pool) recordProbe(st *state, err error) {
 	}
 }
 
-func validateNode(n config.Node) error {
+func validateNode(n Node) error {
 	if _, _, err := net.SplitHostPort(n.Addr); err != nil {
 		return fmt.Errorf("invalid node addr %q: %w", n.Addr, err)
 	}

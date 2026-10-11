@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
-	"github.com/OopsOo0ps/proxy/internal/socks5"
+	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
 // MaxHandshakeLine 限制握手行长度，防御恶意超长输入。
@@ -68,13 +68,13 @@ func IsNotProtocol(err error) bool {
 
 // WriteRequest 写出客户端握手。
 func WriteRequest(w io.Writer, passwordHash, host string, port uint16) error {
-	addr, err := socks5.EncodeAddr(host, port)
+	addr, err := sockswire.EncodeAddr(host, port)
 	if err != nil {
 		return err
 	}
 	buf := make([]byte, 0, len(passwordHash)+2+1+len(addr)+2)
 	buf = append(buf, passwordHash...)
-	buf = append(buf, '\r', '\n', socks5.CmdConnect)
+	buf = append(buf, '\r', '\n', sockswire.CmdConnect)
 	buf = append(buf, addr...)
 	buf = append(buf, '\r', '\n')
 	_, err = w.Write(buf)
@@ -102,7 +102,7 @@ func ReadRequest(r *bufio.Reader) (Request, error) {
 	if err != nil {
 		return req, fmt.Errorf("trojan: read command: %w", err)
 	}
-	host, port, err := socks5.DecodeAddr(r)
+	host, port, err := sockswire.DecodeAddr(r)
 	if err != nil {
 		return req, fmt.Errorf("trojan: decode target: %w", err)
 	}

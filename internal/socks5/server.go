@@ -20,6 +20,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
+	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
 var (
@@ -298,7 +299,7 @@ func readRequest(br *bufio.Reader) (host string, port uint16, cmd byte, err erro
 	if head[2] != 0 {
 		return "", 0, 0, fmt.Errorf("socks5: reserved byte must be zero, got %#x", head[2])
 	}
-	host, port, err = DecodeAddr(br)
+	host, port, err = sockswire.DecodeAddr(br)
 	return host, port, head[1], err
 }
 

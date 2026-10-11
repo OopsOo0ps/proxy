@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
-	"github.com/OopsOo0ps/proxy/internal/socks5"
+	"github.com/OopsOo0ps/proxy/internal/sockswire"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 )
 
@@ -111,7 +111,7 @@ func TestWriteReadRequestRoundTrip(t *testing.T) {
 		if req.PasswordHash != hash {
 			t.Fatalf("hash = %q, want %q", req.PasswordHash, hash)
 		}
-		if req.Command != socks5.CmdConnect {
+		if req.Command != sockswire.CmdConnect {
 			t.Fatalf("command = %#x, want connect", req.Command)
 		}
 		if req.Host != tc.host || req.Port != tc.port {
@@ -133,7 +133,7 @@ func TestWriteRequestFormat(t *testing.T) {
 	if !bytes.HasSuffix(raw, []byte("\r\n")) {
 		t.Fatalf("request should end with CRLF, got %q", raw)
 	}
-	if !bytes.Contains(raw, []byte{socks5.CmdConnect}) {
+	if !bytes.Contains(raw, []byte{sockswire.CmdConnect}) {
 		t.Fatal("request should contain connect command")
 	}
 }
@@ -520,8 +520,8 @@ func TestServerUnsupportedCommand(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 
-	addr, _ := socks5.EncodeAddr("example.com", 53)
-	req := append([]byte(auth.SHA224Hex("secret")+"\r\n"), socks5.CmdUDPAssociate)
+	addr, _ := sockswire.EncodeAddr("example.com", 53)
+	req := append([]byte(auth.SHA224Hex("secret")+"\r\n"), sockswire.CmdUDPAssociate)
 	req = append(req, addr...)
 	req = append(req, '\r', '\n')
 	if _, err := conn.Write(req); err != nil {

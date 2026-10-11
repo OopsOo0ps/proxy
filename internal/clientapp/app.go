@@ -660,7 +660,12 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 	if len(cfg.Nodes) == 0 {
 		return nil, nil
 	}
-	dialFn := func(ctx context.Context, node config.Node, host string, port uint16) (net.Conn, error) {
+	// 配置模型 → 节点池运行时模型（nodes 包不反向依赖 config）。
+	nodeCfgs := make([]nodes.Node, 0, len(cfg.Nodes))
+	for _, n := range cfg.Nodes {
+		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: n.Addr, Password: n.Password, SNI: n.SNI})
+	}
+	dialFn := func(ctx context.Context, node nodes.Node, host string, port uint16) (net.Conn, error) {
 		if conn, ok := connPool.Claim(ctx, node.Addr, host, port); ok {
 			return conn, nil
 		}
@@ -695,7 +700,7 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 	}
 	if opts.Health.Interval > 0 {
 		probeTimeout := hc.EffectiveTimeout()
-		opts.Probe = func(ctx context.Context, node config.Node) error {
+		opts.Probe = func(ctx context.Context, node nodes.Node) error {
 			nodeTLS := baseTLS.Clone()
 			if node.SNI != "" {
 				nodeTLS.ServerName = node.SNI
@@ -713,7 +718,7 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 			return conn.Close()
 		}
 	}
-	return nodes.New(cfg.Nodes, dialFn, opts)
+	return nodes.New(nodeCfgs, dialFn, opts)
 }
 
 // buildConnPool 构建上游空闲隧道连接池；未启用（max_idle = 0）或未配置节点时返回 nil。
