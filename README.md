@@ -68,53 +68,50 @@ flowchart LR
 ```sh
 git clone https://github.com/OopsOo0ps/proxy.git
 cd proxy
-make build
-./bin/proxy-server -version
+make build      # 构建三个二进制到 bin/
+make version    # 确认构建可用（打印版本信息）
 ```
 
 ### 本地三节点演示
 
-仓库自带一套本机演示配置（3 个出口节点 + 1 个客户端，`configs/local/`），可直接验证完整链路；以下命令的端口与凭据均来自这套配置：
+仓库自带一套本机演示配置（3 个出口节点 + 1 个客户端，`configs/local/`）。三条 Make 命令即可起、验、停：
 
 ```sh
-make dev-cert    # 生成本地自签证书到 var/
+make demo-up     # 生成自签证书并后台启动 3 节点 + 客户端（日志在 var/demo/）
+make demo-check  # 四项验证：HTTP 入站 / SOCKS5 入站 / DNS 网关 / Prometheus 指标
+make demo-down   # 停止演示进程（SIGTERM 优雅关停）
+```
 
-./bin/proxy-server -config configs/local/server-1.yaml &
-./bin/proxy-server -config configs/local/server-2.yaml &
-./bin/proxy-server -config configs/local/server-3.yaml &
-./bin/proxy-client -config configs/local/client.yaml &
+`make demo-check` 的输出形如（数值随网络环境变化）：
 
-# HTTP/HTTPS 入站（浏览器同款 CONNECT 隧道）
-curl -x http://127.0.0.1:18080 -U alice:change-me https://example.com
-
-# SOCKS5 入站
-curl --socks5-hostname 127.0.0.1:11080 -U alice:change-me https://example.com
-
-# DNS 网关（演示配置已启用；代理名字经出口节点远程解析）
-dig @127.0.0.1 -p 1053 +short example.com
-
-# Prometheus 指标
-curl -s http://127.0.0.1:19100/metrics | grep -E 'requests_total|request_duration_seconds|active_connections'
+```text
+HTTP/HTTPS 入站（CONNECT 隧道）：HTTP 200，耗时 0.7s
+SOCKS5 入站：HTTP 200，耗时 0.7s
+DNS 网关（经出口节点远程解析 example.com）：172.66.147.243 104.20.23.154
+Prometheus 指标（客户端，节选）：
+  active_connections{proto="socks5"} 1
+  requests_total{proto="http",result="ok",route="proxy"} 1
+  requests_total{proto="socks5",result="ok",route="proxy"} 1
 ```
 
 值得注意：
 
-- 不带 `-U` 访问会收到 `407 Proxy Authentication Required`；直接访问节点 `https://127.0.0.1:18443` 只会看到一张中性的伪装网页（不暴露代理存在）。
-- 客户端日志（`format: json`）包含逐请求的 `request_id`、`client_ip`、`upstream`、`duration` 字段；每个节点默认预热 2 条空闲隧道，可在 `/metrics` 的 `upstream_pool_*` 观察。
-- 停掉任一 `proxy-server` 进程可观察故障自愈：连续探测失败后该节点被摘除（`/stats` 中 `removed: true`），重启并连续探测成功后自动加回。
+- 入站认证失败会收到标准 `407`（固定文案，不泄露任何内部信息）；直接访问任一节点端口（如 `https://127.0.0.1:18443`）只会看到一张中性伪装网页。
+- 客户端日志（`configs/local/client.yaml` 中 `format: json`）包含逐请求的 `request_id`、`client_ip`、`upstream`、`duration` 字段；每个节点默认预热 2 条空闲隧道，可在指标 `upstream_pool_*` 观察。
+- 停掉任一节点进程（PID 在 `var/demo/*.pid`）可观察故障自愈：连续探测失败后该节点被摘除（`/stats` 中 `removed: true`），重启并连续探测成功后自动加回。
 
-更多观察点与指标含义见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。
+演示端口与凭据集中在 `configs/local/`；Makefile 的 `DEMO_*` 变量与之对应、可覆盖。更多观察点与指标含义见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。
 
 ### 生产部署
 
-`configs/example-*.yaml` 是生产模板（客户端默认 8080 / 1080 / 9100，服务端默认 8443 / 9200）：
+生产模板在 `configs/example-*.yaml`（客户端默认 8080 / 1080 / 9100，服务端默认 8443 / 9200），本地试验可直接前台运行（`Ctrl-C` 优雅关停）：
 
 ```sh
-./bin/proxy-server -config configs/example-server.yaml   # 远端出口
-./bin/proxy-client -config configs/example-client.yaml   # 本机入口
+make run-server SERVER_CONFIG=configs/example-server.yaml   # 远端出口
+make run-client CLIENT_CONFIG=configs/example-client.yaml   # 本机入口
 ```
 
-Docker 镜像（distroless 最小版 <30MB + 排错版）与 systemd 单元（Ubuntu 22.04，含沙箱加固）均已提供，完整安装步骤见 [Wiki：部署指南](https://github.com/OopsOo0ps/proxy/wiki/部署指南)。
+正式部署使用 Docker 镜像（distroless 最小版 <30MB + 排错版）或 systemd 单元（Ubuntu 22.04，含沙箱加固），完整步骤见 [Wiki：部署指南](https://github.com/OopsOo0ps/proxy/wiki/部署指南)。
 
 ## 配置
 
@@ -268,11 +265,15 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 ## 开发
 
 - `make build`：构建三个二进制到 `bin/`（自动注入版本信息）
+- `make version`：打印两个二进制的版本信息
 - `make test`：运行全部单元测试（含端到端、黑盒集成与混沌用例，不依赖外部网络）
 - `make cover`：运行测试并打印总覆盖率
 - `make lint`：静态检查（golangci-lint v2，首次自动下载）
+- `make demo-up` / `make demo-check` / `make demo-down`：本地三节点演示（后台起停 + 链路验证）
+- `make run-server` / `make run-client`：前台运行（`SERVER_CONFIG` / `CLIENT_CONFIG` 指定配置）
 - `make dev-cert`：生成本地演示用自签证书
 - `make docker-build` / `make docker-build-debug`：构建容器镜像
+- `make help`：查看全部目标
 
 测试覆盖清单（端到端断言、集成与混沌场景）与真机验证记录见 [Wiki：测试与验收](https://github.com/OopsOo0ps/proxy/wiki/测试与验收)。
 

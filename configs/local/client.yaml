@@ -1,4 +1,4 @@
-# 本机三节点演示配置（配合 make dev-cert 与 configs/local/server-*.yaml 使用）。
+# 本机三节点演示配置（make demo-up / make run-* 使用，配合 configs/local/server-*.yaml）。
 # 演示命令见 README「本地三节点演示」。
 
 inbound:
