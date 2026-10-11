@@ -4,6 +4,22 @@
 [Keep a Changelog](https://keepachangelog.com/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 构建（Build）
+
+- Makefile 新增本地演示工作流：`make demo` 一条命令完成构建 → 启动 → 验证，
+  `demo-up` / `demo-check` / `demo-down` 可分步起停并验证 3 节点演示
+  （HTTP / SOCKS5 / DNS / 指标）；新增 `version` 目标；`run-server` / `run-client`
+  支持 `SERVER_CONFIG` / `CLIENT_CONFIG` 覆盖配置。
+
+### 文档（Documentation）
+
+- README 重组为「定位 / 快速开始 / 关键信号」，配置、运维与验证的深度内容
+  迁入 [Wiki](https://github.com/OopsOo0ps/proxy/wiki)（配置参考、分流与规则、
+  DNS 策略、运行时语义、可观测性、部署指南、性能与容量、测试与验收等）；
+  文档命令统一为 Makefile 目标，不再出现直接调用 `bin/` 二进制的示例。
+
 ## [0.1.0] - 2026-10-11
 
 首个公开发布：可用的代理核心与生产部署能力。
@@ -19,7 +35,7 @@
 - 配置热加载（SIGHUP 校验失败保持旧配置，成功原子生效）。
 - 认证：HTTP `Proxy-Authorization` / SOCKS5 RFC 1929；监听非环回地址时强制认证。
 - 结构化 JSON 日志与运行时动态日志级别（`/log/level`）。
-- Prometheus 指标（`/metrics`）与健康/运行时状态端点（`/healthz`、`/stats`）。
+- Prometheus 指标（`/metrics`）与健康/运行时状态端点（`/health`、`/stats`）。
 - 优雅关闭（SIGTERM drain）与过载保护（连接上限 + 背压）。
 - 多阶段 Docker 镜像：distroless 最小版（<30MB）与排错版，linux/amd64。
 - systemd 单元（Ubuntu 22.04 原生部署，含沙箱加固）。

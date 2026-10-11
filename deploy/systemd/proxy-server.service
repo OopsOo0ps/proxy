@@ -1,6 +1,6 @@
 # proxy-server：远端出口（Trojan over TLS），Ubuntu 22.04 原生部署。
 #
-# 安装见 README「生产部署 → systemd」小节；沙箱配置说明同 proxy-client.service。
+# 安装见 Wiki「部署指南」；沙箱配置说明同 proxy-client.service。
 [Unit]
 Description=Proxy exit node (Trojan over TLS server)
 Documentation=https://github.com/OopsOo0ps/proxy
