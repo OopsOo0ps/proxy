@@ -130,6 +130,39 @@ nodes:
 	}
 }
 
+func TestParseClientMetricsBindPolicy(t *testing.T) {
+	base := `
+inbound:
+  http: "127.0.0.1:8080"
+nodes:
+  - addr: "node1.example.com:443"
+    password: token
+`
+	// 环回绑定默认允许；显式 allow_remote 后允许非环回。
+	allowed := map[string]string{
+		"loopback":        base + "metrics:\n  listen: \"127.0.0.1:9100\"\n",
+		"remote explicit": base + "metrics:\n  listen: \"0.0.0.0:9100\"\n  allow_remote: true\n",
+		"empty listen":    base,
+		"loopback + flag": base + "metrics:\n  listen: \"127.0.0.1:9100\"\n  allow_remote: true\n",
+	}
+	for name, yaml := range allowed {
+		if _, err := ParseClient([]byte(yaml)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+
+	// 非环回未显式开启：拒绝（防一次绑定疏忽直接对外暴露）。
+	_, err := ParseClient([]byte(base + "metrics:\n  listen: \"0.0.0.0:9100\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "allow_remote") {
+		t.Fatalf("non-loopback without allow_remote: err = %v", err)
+	}
+	// allow_remote 开着但没有监听：拒绝（意图被静默吞掉）。
+	_, err = ParseClient([]byte(base + "metrics:\n  allow_remote: true\n"))
+	if err == nil || !strings.Contains(err.Error(), "metrics.allow_remote") {
+		t.Fatalf("allow_remote without listen: err = %v", err)
+	}
+}
+
 func TestParseClientPoolOverrides(t *testing.T) {
 	base := `
 inbound:
@@ -562,6 +595,22 @@ metrics:
 	if cfg.Log.Format != "json" {
 		t.Fatalf("default log format = %q", cfg.Log.Format)
 	}
+
+	// 非环回运维端点：显式 allow_remote 后允许（只读端点远程可达）。
+	if _, err := ParseServer([]byte(`
+listen: "0.0.0.0:8443"
+tls:
+  cert_file: /etc/proxy/server.crt
+  key_file: /etc/proxy/server.key
+users:
+  - username: alice
+    password: token-1
+metrics:
+  listen: "0.0.0.0:9200"
+  allow_remote: true
+`)); err != nil {
+		t.Fatalf("explicit allow_remote: %v", err)
+	}
 }
 
 func TestParseServerRejects(t *testing.T) {
@@ -583,6 +632,8 @@ users:
 		"unknown field":               base + "cache: true\n",
 		"invalid listen":              "listen: \"nope\"\ntls:\n  cert_file: c\n  key_file: k\nusers:\n  - {username: a, password: b}\n",
 		"client-only failover budget": base + "timeouts:\n  failover: 10s\n",
+		"non-loopback metrics":        base + "metrics:\n  listen: \"0.0.0.0:9200\"\n",
+		"allow_remote without listen": base + "metrics:\n  allow_remote: true\n",
 	}
 	for name, yaml := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -654,8 +705,8 @@ func TestIsLoopbackListen(t *testing.T) {
 		"192.168.1.10:8080": false,
 	}
 	for addr, want := range cases {
-		if got := isLoopbackListen(addr); got != want {
-			t.Fatalf("isLoopbackListen(%q) = %v, want %v", addr, got, want)
+		if got := IsLoopbackListen(addr); got != want {
+			t.Fatalf("IsLoopbackListen(%q) = %v, want %v", addr, got, want)
 		}
 	}
 }
@@ -720,8 +771,9 @@ func TestClientRestartOnlyChanges(t *testing.T) {
 	addrs.Inbound.HTTP = "127.0.0.1:18080"
 	addrs.Inbound.SOCKS5 = "127.0.0.1:11080"
 	addrs.Metrics.Listen = "127.0.0.1:19100"
+	addrs.Metrics.AllowRemote = true
 	addrs.DNS.Listen = "127.0.0.1:1053"
-	want := []string{"inbound.http", "inbound.socks5", "metrics.listen", "dns.listen"}
+	want := []string{"inbound.http", "inbound.socks5", "metrics.listen", "metrics.allow_remote", "dns.listen"}
 	if got := ClientRestartOnlyChanges(base(t), addrs); !reflect.DeepEqual(got, want) {
 		t.Fatalf("restart-only fields = %v, want %v", got, want)
 	}
@@ -762,7 +814,8 @@ metrics: { listen: "127.0.0.1:9200" }
 	restart := base(t)
 	restart.Listen = "0.0.0.0:9443"
 	restart.Metrics.Listen = "127.0.0.1:9300"
-	want := []string{"listen", "metrics.listen"}
+	restart.Metrics.AllowRemote = true
+	want := []string{"listen", "metrics.listen", "metrics.allow_remote"}
 	if got := ServerRestartOnlyChanges(base(t), restart); !reflect.DeepEqual(got, want) {
 		t.Fatalf("restart-only fields = %v, want %v", got, want)
 	}

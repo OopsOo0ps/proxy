@@ -160,7 +160,7 @@ limits:
   max_connections: 1024      # 进程级并发上限（HTTP + SOCKS5 合计）；0 = 不限制
 
 metrics:
-  listen: "127.0.0.1:9100"   # /metrics、/health、/stats；建议仅监听环回
+  listen: "127.0.0.1:9100"   # /metrics、/health、/stats；默认仅允许环回，非环回需 allow_remote: true
 log:
   level: info                # debug | info | warn | error
   format: json               # json | text
@@ -208,7 +208,7 @@ curl -s http://127.0.0.1:9100/stats | python3 -m json.tool
 curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 ```
 
-指标全表、日志字段、出口节点健康检查（主动探测 + 被动冷却）与 `/stats` 完整字段见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。所有运维端点均不做鉴权，请仅在环回地址或防火墙之后暴露。
+指标全表、日志字段、出口节点健康检查（主动探测 + 被动冷却）与 `/stats` 完整字段见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。运维端点默认仅允许绑定环回地址；确需远程只读访问时可显式设置 `metrics.allow_remote: true`（仍不做鉴权，请配合防火墙）。`PUT /log/level` 是状态变更，永远只接受环回来源，不受该开关影响。
 
 ## 安全
 

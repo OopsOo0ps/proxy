@@ -1,11 +1,15 @@
 // 运行时日志级别端点：GET 查询当前级别，PUT 切换级别（debug/info/warn/error）。
-// 与 /metrics、/stats 等运维端点一样不做鉴权，请仅在环回地址或防火墙之后暴露。
+// GET 是只读操作；PUT 是运行时状态变更，永远只接受环回来源的请求（远程一律
+// 403）——即使运维端点通过 metrics.allow_remote 绑定了非环回地址。端点不做
+// 鉴权，非环回暴露时请配合防火墙，并注意反向代理会让请求看起来来自环回。
 package logging
 
 import (
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
@@ -31,7 +35,7 @@ func LevelName(lv *slog.LevelVar) string {
 //	GET /log/level                -> 200 {"level":"info"}
 //	PUT /log/level?level=debug    -> 200 {"level":"debug","previous":"info"}
 //
-// 非法级别返回 400；其它方法返回 405（Allow: GET, PUT）。
+// 非法级别返回 400；远程 PUT 返回 403；其它方法返回 405（Allow: GET, PUT）。
 // lv 为 nil 时端点不可用（404）。
 func LevelHandler(logger *slog.Logger, lv *slog.LevelVar) http.Handler {
 	if lv == nil {
@@ -45,6 +49,12 @@ func LevelHandler(logger *slog.Logger, lv *slog.LevelVar) http.Handler {
 		case http.MethodGet:
 			writeLevelJSON(w, http.StatusOK, map[string]string{"level": LevelName(lv)})
 		case http.MethodPut:
+			if !isLoopbackRemote(r.RemoteAddr) {
+				writeLevelJSON(w, http.StatusForbidden, map[string]string{
+					"error": "log level changes are restricted to loopback clients",
+				})
+				return
+			}
 			name := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("level")))
 			level, ok := parseLevelStrict(name)
 			if !ok {
@@ -63,6 +73,21 @@ func LevelHandler(logger *slog.Logger, lv *slog.LevelVar) http.Handler {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+// isLoopbackRemote 判断请求的直接来源（TCP 对端地址）是否为本机环回。
+// 只信任 r.RemoteAddr，不解析任何转发头：反代场景下所有请求看起来都来自
+// 环回，需要在反向代理层自行限制本端点的转发。
+func isLoopbackRemote(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // parseLevelStrict 解析端点参数；只接受四档合法级别（大小写不敏感）。

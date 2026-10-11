@@ -30,7 +30,8 @@ timeouts:
   idle: 90s
   shutdown: 15s   # 优雅关停：停止接受新连接后，等待存量隧道结束的最长时间
 
-# 指标与运维端点（/metrics、/health、/stats）；建议只监听本机或置于防火墙之后。
+# 指标与运维端点（/metrics、/health、/stats）。默认仅允许监听环回地址；
+# 确需远程只读访问时显式加 allow_remote: true（PUT /log/level 永远只限环回）。
 metrics:
   listen: "127.0.0.1:9200"
 
