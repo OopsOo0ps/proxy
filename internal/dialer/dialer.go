@@ -42,6 +42,15 @@ type Router interface {
 	Decide(host string) routing.Action
 }
 
+// Target 是路由感知的出站拨号能力：*Dialer 满足。
+// httpproxy 与 socks5 的服务端都以它作为可注入的拨号类型（见各自的
+// TargetDialer 别名）——类型统一后，组装根的单个运行期适配器可以用一个
+// Dialer() 方法同时满足两边的策略接口，新增热加载项只需维护一处适配器。
+type Target interface {
+	DialTarget(ctx context.Context, host string, port uint16) (net.Conn, Route, error)
+	RouteFor(host string) routing.Action
+}
+
 // Dialer 是路由感知的出站拨号器，可安全并发使用。
 type Dialer struct {
 	router Router

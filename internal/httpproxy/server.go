@@ -33,10 +33,9 @@ import (
 )
 
 // TargetDialer 建立到目标的连接（由路由与出口节点决定直连或经隧道）。
-type TargetDialer interface {
-	DialTarget(ctx context.Context, host string, port uint16) (net.Conn, dialer.Route, error)
-	RouteFor(host string) routing.Action
-}
+// 与 socks5 共用 dialer.Target：类型统一后，组装根可以用单个运行期适配器
+// 同时满足两边的策略接口（见 internal/clientapp 的 clientLive）。
+type TargetDialer = dialer.Target
 
 // LivePolicy 提供配置热加载后的动态策略。
 // 为 nil 时使用 Server 的静态字段（测试与直接构造场景）。
