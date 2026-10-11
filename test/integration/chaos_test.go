@@ -37,8 +37,9 @@ func TestChaosKilledUpstreamRemovedAndRejoins(t *testing.T) {
 	}
 
 	// 固定地址：节点 A 需要「同址重启」才能自动加回。
-	nodeAAddr := freeAddr(t)
-	nodeBAddr := freeAddr(t)
+	// 从临时端口段之外取地址，避免端口在测试中途被并行测试/出站连接抢占。
+	nodeAAddr := freeFixedPort(t)
+	nodeBAddr := freeFixedPort(t)
 	nodeAPassword := "chaos-a-secret"
 	nodeBPassword := "chaos-b-secret"
 
@@ -196,17 +197,29 @@ log:
 		map[string]string{"proto": "tunnel", "result": "ok"}, 1)
 }
 
-// freeAddr 返回一个当前空闲的 127.0.0.1 监听地址（先绑定 :0 再释放）。
-// 固定地址是混沌场景的前提：节点必须在同址重启后才能被自动加回。
-func freeAddr(t *testing.T) string {
+// nextFixedPort 是 freeFixedPort 的分配游标：单调递增保证同一次测试进程内的
+// 多次调用拿到互不相同的端口。
+var nextFixedPort = 20000
+
+// freeFixedPort 从固定高段（20000–29999）分配一个空闲的 127.0.0.1 监听地址。
+//
+// 混沌用例要求节点「同址重启」，不能用 :0：它拿到的端口通常落在临时端口
+// 范围内，测试随后拨号/探测产生的出站连接或并行测试包的新监听都可能把它
+// 当作本地端口占用，重启时 bind 失败（main 分支 CI 实际发生过一次）。
+func freeFixedPort(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freeAddr: %v", err)
+	for ; nextFixedPort < 30000; nextFixedPort++ {
+		addr := fmt.Sprintf("127.0.0.1:%d", nextFixedPort)
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			continue
+		}
+		_ = ln.Close()
+		nextFixedPort++
+		return addr
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
+	t.Fatalf("20000–29999 段内无空闲端口")
+	return ""
 }
 
 // killNow 立即 SIGKILL 并回收进程（模拟上游崩溃，区别于优雅关停）。
