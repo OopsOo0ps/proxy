@@ -29,6 +29,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
+	"github.com/OopsOo0ps/proxy/internal/sockswire"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
 )
@@ -494,7 +495,7 @@ func socks5Dial(t *testing.T, proxyAddr, username, password, targetHost string, 
 		return nil, errors.New("socks5: no acceptable method")
 	}
 
-	addr, err := socks5.EncodeAddr(targetHost, targetPort)
+	addr, err := sockswire.EncodeAddr(targetHost, targetPort)
 	if err != nil {
 		_ = conn.Close()
 		return nil, err

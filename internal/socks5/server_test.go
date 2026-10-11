@@ -13,6 +13,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
 // mustPort 解析端口字符串，失败即终止测试。
@@ -142,7 +143,7 @@ func socks5Connect(t *testing.T, proxyAddr, username, password, targetHost strin
 		return conn, 0, errNoAcceptableMethod
 	}
 
-	addr, err := EncodeAddr(targetHost, targetPort)
+	addr, err := sockswire.EncodeAddr(targetHost, targetPort)
 	if err != nil {
 		return conn, 0, err
 	}
@@ -273,7 +274,7 @@ func TestServerUnsupportedCommands(t *testing.T) {
 		if _, err := io.ReadFull(conn, sel[:]); err != nil {
 			t.Fatal(err)
 		}
-		addr, _ := EncodeAddr("1.2.3.4", 80)
+		addr, _ := sockswire.EncodeAddr("1.2.3.4", 80)
 		if _, err := conn.Write(append([]byte{Version, cmd, 0x00}, addr...)); err != nil {
 			t.Fatal(err)
 		}

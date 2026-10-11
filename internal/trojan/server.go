@@ -16,7 +16,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
-	"github.com/OopsOo0ps/proxy/internal/socks5"
+	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
 // DefaultDecoyPage 是认证失败/非协议流量时返回的伪装页面。
@@ -175,7 +175,7 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 		s.serveDecoy(conn)
 		return
 	}
-	if req.Command != socks5.CmdConnect {
+	if req.Command != sockswire.CmdConnect {
 		// UDP ASSOCIATE 等命令暂不支持：直接关闭并记录。
 		logger.Warn("unsupported tunnel command", "command", req.Command)
 		return

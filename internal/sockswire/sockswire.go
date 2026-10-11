@@ -1,7 +1,9 @@
-// Package socks5 实现 SOCKS5 入站代理（RFC 1928 / RFC 1929）与地址编码。
+// Package sockswire 提供 SOCKS5 线格式的基础件：地址编码（ATYP + ADDR + PORT）
+// 与命令码常量。Trojan 的请求头（CMD ATYP DST.ADDR DST.PORT）复用同一格式，
+// 因此两个协议包共享本包，而不是互相依赖。
 //
-// 地址编码（ATYP + ADDR + PORT）为 SOCKS5 与 Trojan 协议共用。
-package socks5
+// 错误信息仍以 "socks5:" 为前缀：地址格式本身由 SOCKS5（RFC 1928）定义。
+package sockswire
 
 import (
 	"encoding/binary"
@@ -11,32 +13,12 @@ import (
 	"net/netip"
 )
 
-// SOCKS5 常量。
+// 命令（RFC 1928 第 4 节）与地址类型常量。
 const (
-	Version = 0x05
-
-	// 认证方法（RFC 1928 第 3 节）。
-	MethodNoAuth       = 0x00
-	MethodUserPass     = 0x02
-	MethodNoAcceptable = 0xFF
-
-	// 用户名/密码子协商（RFC 1929）。
-	UserPassVersion    = 0x01
-	UserPassStatusOK   = 0x00
-	UserPassStatusFail = 0x01
-
-	// 命令。
 	CmdConnect      = 0x01
 	CmdBind         = 0x02
 	CmdUDPAssociate = 0x03
 
-	// 回复码。
-	ReplySuccess         = 0x00
-	ReplyGeneralFailure  = 0x01
-	ReplyConnRefused     = 0x05
-	ReplyCmdNotSupported = 0x07
-
-	// 地址类型。
 	ATYPIPv4   = 0x01
 	ATYPDomain = 0x03
 	ATYPIPv6   = 0x04

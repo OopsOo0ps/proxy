@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
@@ -63,8 +62,8 @@ func TestDialDirect(t *testing.T) {
 
 func TestDialProxy(t *testing.T) {
 	pool, err := nodes.New(
-		[]config.Node{{Addr: "node1.example.com:443", Password: "p"}},
-		func(context.Context, config.Node, string, uint16) (net.Conn, error) { return nopConn{}, nil },
+		[]nodes.Node{{Addr: "node1.example.com:443", Password: "p"}},
+		func(context.Context, nodes.Node, string, uint16) (net.Conn, error) { return nopConn{}, nil },
 		nodes.Options{},
 	)
 	if err != nil {
@@ -108,8 +107,8 @@ func TestDialProxyKeepsDomainUnresolved(t *testing.T) {
 	var gotHost string
 	var gotPort uint16
 	pool, err := nodes.New(
-		[]config.Node{{Addr: "node1.example.com:443", Password: "p"}},
-		func(_ context.Context, _ config.Node, host string, port uint16) (net.Conn, error) {
+		[]nodes.Node{{Addr: "node1.example.com:443", Password: "p"}},
+		func(_ context.Context, _ nodes.Node, host string, port uint16) (net.Conn, error) {
 			gotHost, gotPort = host, port
 			return nopConn{}, nil
 		},
