@@ -44,7 +44,7 @@ type fakeNode struct {
 	mu     sync.Mutex
 	peers  []net.Conn // 管道对端（测试侧），可用来模拟服务端行为
 	onDial func() (net.Conn, error)
-	start  func(conn net.Conn, host string, port uint16) error
+	start  func(ctx context.Context, conn net.Conn, host string, port uint16) error
 }
 
 func (n *fakeNode) dial(ctx context.Context) (net.Conn, error) {
@@ -59,9 +59,9 @@ func (n *fakeNode) dial(ctx context.Context) (net.Conn, error) {
 	return client, nil
 }
 
-func (n *fakeNode) startRequest(conn net.Conn, host string, port uint16) error {
+func (n *fakeNode) startRequest(ctx context.Context, conn net.Conn, host string, port uint16) error {
 	if n.start != nil {
-		return n.start(conn, host, port)
+		return n.start(ctx, conn, host, port)
 	}
 	n.started.Add(1)
 	return nil
@@ -412,7 +412,7 @@ func TestProbeAliveTCP(t *testing.T) {
 }
 
 func TestClaimStartFailureDiscardsConn(t *testing.T) {
-	n := &fakeNode{start: func(net.Conn, string, uint16) error {
+	n := &fakeNode{start: func(context.Context, net.Conn, string, uint16) error {
 		return errors.New("write failed")
 	}}
 	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1})
@@ -559,8 +559,8 @@ func TestNewValidation(t *testing.T) {
 		t.Fatal("empty node list should fail")
 	}
 	dup := []Node{
-		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(net.Conn, string, uint16) error { return nil }},
-		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(net.Conn, string, uint16) error { return nil }},
+		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(context.Context, net.Conn, string, uint16) error { return nil }},
+		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(context.Context, net.Conn, string, uint16) error { return nil }},
 	}
 	if _, err := New(dup, Options{}); err == nil {
 		t.Fatal("duplicate addr should fail")

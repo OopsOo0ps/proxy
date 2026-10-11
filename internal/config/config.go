@@ -74,6 +74,10 @@ const (
 	defaultPoolIdleTTL = 5 * time.Second
 )
 
+// defaultFailoverBudget 是出口节点故障转移链的缺省总时间预算（proxy-client 专用）。
+// 与 nodes.DefaultFailoverBudget 保持一致：一个约束配置层默认值，一个约束库调用方。
+const defaultFailoverBudget = 30 * time.Second
+
 // EffectiveMaxIdle 返回生效的每节点空闲连接上限（缺省 2，0 = 关闭）。
 func (p Pool) EffectiveMaxIdle() int {
 	if p.MaxIdle == nil {
@@ -210,6 +214,10 @@ type Timeouts struct {
 	Dial      Duration `yaml:"dial"`      // 建立目标/节点连接
 	Handshake Duration `yaml:"handshake"` // 握手阶段（TLS + 协议协商）
 	Idle      Duration `yaml:"idle"`      // 连接空闲回收
+	// Failover 是单次请求在出口节点故障转移链上的总时间预算：覆盖全部候选
+	// 节点的建连、TLS/Trojan 握手与请求写出（proxy-client 专用，缺省 30s）。
+	// 请求上下文更短时以更短者为准；直连路径与健康探测不受影响。
+	Failover Duration `yaml:"failover"`
 	// Shutdown 是优雅关停的排空期限：收到 SIGTERM 后先停止接受新连接，
 	// 允许存量请求在此期间自然结束，超时后强制断开剩余连接并退出。
 	Shutdown Duration `yaml:"shutdown"`
@@ -339,6 +347,11 @@ func ParseServer(data []byte) (*Server, error) {
 	if err := decodeStrict(data, &cfg); err != nil {
 		return nil, err
 	}
+	// timeouts.failover 只对 proxy-client 有意义（出口节点故障转移链）；
+	// 服务端显式配置时报错，避免无效配置被静默接受。
+	if cfg.Timeouts.Failover != 0 {
+		return nil, errors.New("timeouts.failover: only supported by proxy-client")
+	}
 	cfg.applyDefaults()
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -394,6 +407,9 @@ func decodeStrict(data []byte, out any) error {
 
 func (c *Client) applyDefaults() {
 	applyTimeoutDefaults(&c.Timeouts)
+	if c.Timeouts.Failover == 0 {
+		c.Timeouts.Failover = Duration(defaultFailoverBudget)
+	}
 	if c.Pool.MaxIdle == nil {
 		c.Pool.MaxIdle = intPtr(defaultPoolMaxIdle)
 	}
@@ -474,6 +490,9 @@ func (c *Client) validate() error {
 	}
 	if err := validateTimeouts(c.Timeouts); err != nil {
 		return err
+	}
+	if c.Timeouts.Failover <= 0 {
+		return errors.New("timeouts.failover: must be positive")
 	}
 	if c.Pool.EffectiveMaxIdle() < 0 {
 		return errors.New("pool.max_idle: must not be negative (0 disables the pool)")

@@ -671,6 +671,8 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 	opts := nodes.Options{
 		Logger:  logger,
 		Metrics: m,
+		// 故障转移总预算：整条候选节点的等待上限（缺省 30s，可配置）。
+		FailoverBudget: cfg.Timeouts.Failover.Std(),
 		Health: nodes.HealthOptions{
 			Interval:  hc.EffectiveInterval(),
 			Timeout:   hc.EffectiveTimeout(),
@@ -731,8 +733,8 @@ func buildConnPool(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, 
 					HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
 				})
 			},
-			Start: func(conn net.Conn, host string, port uint16) error {
-				if err := trojan.StartRequest(conn, hash, host, port, cfg.Timeouts.Handshake.Std()); err != nil {
+			Start: func(ctx context.Context, conn net.Conn, host string, port uint16) error {
+				if err := trojan.StartRequest(ctx, conn, hash, host, port, cfg.Timeouts.Handshake.Std()); err != nil {
 					return fmt.Errorf("trojan: write request to %s: %w", node.Addr, err)
 				}
 				return nil

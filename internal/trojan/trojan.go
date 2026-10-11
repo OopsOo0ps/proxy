@@ -191,10 +191,16 @@ func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 }
 
 // StartRequest 在已完成握手的隧道连接上向 target(host, port) 写出 Trojan 请求。
-// timeout 是写超时（<=0 时默认 10s）；成功后清除写期限，连接可直接用于转发。
-func StartRequest(conn net.Conn, passwordHash, host string, port uint16, timeout time.Duration) error {
+// timeout 是写超时（<=0 时默认 10s）；写期限同时不晚于 ctx 的截止时间，
+// 保证故障转移总预算能覆盖请求写出阶段。成功后清除写期限，连接可直接用于转发。
+func StartRequest(ctx context.Context, conn net.Conn, passwordHash, host string, port uint16, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return fmt.Errorf("trojan: set write deadline: %w", err)
@@ -212,7 +218,7 @@ func Dial(ctx context.Context, cfg ClientConfig, host string, port uint16) (net.
 	if err != nil {
 		return nil, err
 	}
-	if err := StartRequest(conn, auth.SHA224Hex(cfg.Password), host, port, cfg.HandshakeTimeout); err != nil {
+	if err := StartRequest(ctx, conn, auth.SHA224Hex(cfg.Password), host, port, cfg.HandshakeTimeout); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("trojan: write request to %s: %w", cfg.ServerAddr, err)
 	}

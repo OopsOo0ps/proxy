@@ -623,7 +623,7 @@ func TestConnectThenStartRequest(t *testing.T) {
 
 	// 领取路径：停留一段时间后（小于服务端握手超时）再补发 Trojan 请求。
 	time.Sleep(50 * time.Millisecond)
-	if err := StartRequest(conn, auth.SHA224Hex("secret"), host, uint16(port), time.Second); err != nil {
+	if err := StartRequest(context.Background(), conn, auth.SHA224Hex("secret"), host, uint16(port), time.Second); err != nil {
 		t.Fatalf("StartRequest: %v", err)
 	}
 

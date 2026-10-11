@@ -1583,3 +1583,54 @@ func TestE2EDNSGatewayRoutesRemoteAndDirect(t *testing.T) {
 	waitForMetric(t, app.MetricsAddr(), `dns_queries_total{result="ok",route="proxy"} 1`)
 	waitForMetric(t, app.MetricsAddr(), `dns_queries_total{result="ok",route="direct"} 1`)
 }
+
+// TestFailoverBudgetCapsHalfDeadNodes：全部候选节点都是“半死”（TCP 可连、
+// TLS 黑洞）时，请求等待必须收敛到故障转移总预算，而不是 节点数 × 握手超时。
+func TestFailoverBudgetCapsHalfDeadNodes(t *testing.T) {
+	// 半死节点：接受 TCP 连接、吞掉入站字节、永不回应 TLS 握手。
+	blackhole := func() string {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(c net.Conn) {
+					_, _ = io.Copy(io.Discard, c)
+					_ = c.Close()
+				}(conn)
+			}
+		}()
+		return ln.Addr().String()
+	}
+
+	cfg := baseClientCfg([]config.Node{
+		{Addr: blackhole(), Password: "p1"},
+		{Addr: blackhole(), Password: "p2"},
+	})
+	cfg.Timeouts.Dial = config.Duration(2 * time.Second)
+	// 单节点握手超时远大于预算：没有预算时最坏等待 ≈ 2 × 10s。
+	cfg.Timeouts.Handshake = config.Duration(10 * time.Second)
+	cfg.Timeouts.Failover = config.Duration(300 * time.Millisecond)
+	app := startClient(t, cfg, slog.New(slog.DiscardHandler))
+
+	client := browser(t, "http://"+app.HTTPAddr(), 1)
+	start := time.Now()
+	resp, err := client.Get("https://example.com/")
+	elapsed := time.Since(start)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("request must fail when every candidate node is half-dead")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("request took %v; the failover budget (300ms) must cap the wait", elapsed)
+	}
+	if elapsed < 200*time.Millisecond {
+		t.Fatalf("request failed after %v; expected to wait for the budget", elapsed)
+	}
+}

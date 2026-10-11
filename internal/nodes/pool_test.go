@@ -66,6 +66,99 @@ func (r *recorder) setErr(addr string, err error) {
 	r.errs[addr] = err
 }
 
+// blockingDial 返回一个拨号函数：每次调用计数并阻塞到上下文结束，
+// 模拟“TCP 可连但始终不完成握手”的半死节点。
+func blockingDial() (DialFunc, func() int) {
+	var calls atomic.Int64
+	dial := func(ctx context.Context, _ config.Node, _ string, _ uint16) (net.Conn, error) {
+		calls.Add(1)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return dial, func() int { return int(calls.Load()) }
+}
+
+func TestDialFailoverBudgetExhausted(t *testing.T) {
+	dial, calls := blockingDial()
+	pool, err := New(testNodes(), dial, Options{FailoverBudget: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, _, err = pool.Dial(context.Background(), "example.com", 443)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("dial must fail when the failover budget expires")
+	}
+	if !strings.Contains(err.Error(), "failover budget") {
+		t.Fatalf("err = %v, want failover budget annotation", err)
+	}
+	if elapsed < 100*time.Millisecond || elapsed > 2*time.Second {
+		t.Fatalf("elapsed = %v, want ≈150ms (budget)", elapsed)
+	}
+	if got := calls(); got != 1 {
+		t.Fatalf("attempts = %d, want 1: the chain must stop at the budget", got)
+	}
+	// 预算中断不是节点自身的错误：不得把节点送入被动冷却。
+	for _, st := range pool.Snapshot() {
+		if st.Fails != 0 {
+			t.Fatalf("node %s fails = %d, want 0 (budget abort must not cool down nodes)", st.Addr, st.Fails)
+		}
+	}
+}
+
+func TestDialParentDeadlineBeatsBudget(t *testing.T) {
+	dial, calls := blockingDial()
+	pool, err := New(testNodes(), dial, Options{FailoverBudget: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err = pool.Dial(ctx, "example.com", 443)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("dial must fail when the caller context expires first")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context deadline exceeded", err)
+	}
+	if strings.Contains(err.Error(), "failover budget") {
+		t.Fatalf("err = %v: caller deadline must not be labeled as the failover budget", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("elapsed = %v, want ≈100ms (caller deadline)", elapsed)
+	}
+	if got := calls(); got != 1 {
+		t.Fatalf("attempts = %d, want 1", got)
+	}
+}
+
+func TestDialFailoverBudgetDoesNotBlockFailover(t *testing.T) {
+	rec := newRecorder()
+	rec.setErr("node1.example.com:443", errors.New("refused"))
+	pool, err := New(testNodes(), rec.dial, Options{FailoverBudget: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, node, err := pool.Dial(context.Background(), "example.com", 443)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if node.Addr != "node2.example.com:443" {
+		t.Fatalf("node = %s, want node2 (first candidate failed)", node.Addr)
+	}
+	if got := rec.callsFor("node1.example.com:443"); got != 1 {
+		t.Fatalf("node1 attempts = %d, want 1", got)
+	}
+}
+
 func TestRoundRobinUsesAllNodes(t *testing.T) {
 	rec := newRecorder()
 	pool, err := New(testNodes(), rec.dial, Options{})
