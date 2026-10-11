@@ -47,3 +47,34 @@ jobs:
           cache: true
       - name: Run golangci-lint
         run: make lint
+
+  docker:
+    name: Docker Images
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Build minimal images (linux/amd64)
+        run: make docker-build
+      - name: Check minimal image size (< 30MB)
+        run: |
+          fail=0
+          for img in proxy-client:dev proxy-server:dev; do
+            size=$(docker image inspect -f '{{.Size}}' "$img")
+            echo "$img: $((size / 1024 / 1024))MB ($size bytes)"
+            if [ "$size" -ge $((30 * 1024 * 1024)) ]; then
+              echo "::error::$img exceeds the 30MB budget"
+              fail=1
+            fi
+          done
+          exit $fail
+      - name: Build debug images
+        run: make docker-build-debug
+      - name: Smoke minimal image
+        run: docker run --rm proxy-client:dev -version
+      - name: Smoke debug image (tools present)
+        run: |
+          docker run --rm proxy-client-debug -version
+          docker run --rm --entrypoint /bin/sh proxy-client-debug -c \
+            'curl --version | head -1; dig -v 2>&1 | head -1; tcpdump --version | head -1; ss -V | head -1; openssl version'
