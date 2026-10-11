@@ -11,12 +11,16 @@
 ## 常用命令
 
 ```sh
-make build    # 构建三个二进制到 bin/
-make test     # 运行全部单元测试
-make cover    # 运行测试并打印总覆盖率
-make lint     # 运行 golangci-lint
-make run      # 前台运行 proxy-server
-make help     # 查看全部目标
+make build        # 构建三个二进制到 bin/
+make test         # 运行全部单元测试
+make cover        # 运行测试并打印总覆盖率
+make lint         # 运行 golangci-lint
+make demo-up      # 本地三节点演示：后台启动 3 节点 + 客户端
+make demo-check   # 演示链路验证（HTTP / SOCKS5 / DNS / 指标）
+make demo-down    # 停止演示进程
+make run-server   # 前台运行 proxy-server（SERVER_CONFIG= 覆盖配置）
+make run-client   # 前台运行 proxy-client（CLIENT_CONFIG= 覆盖配置）
+make help         # 查看全部目标
 ```
 
 单元测试包含本机回环上的端到端用例（会短暂绑定本地端口），无需外部网络。

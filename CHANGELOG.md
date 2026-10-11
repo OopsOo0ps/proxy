@@ -6,11 +6,18 @@
 
 ## [Unreleased]
 
+### 构建（Build）
+
+- Makefile 新增本地演示工作流：`demo-up` / `demo-check` / `demo-down` 一键起停
+  3 节点演示并验证 HTTP / SOCKS5 / DNS / 指标；新增 `version` 目标；
+  `run-server` / `run-client` 支持 `SERVER_CONFIG` / `CLIENT_CONFIG` 覆盖配置。
+
 ### 文档（Documentation）
 
 - README 重组为「定位 / 快速开始 / 关键信号」，配置、运维与验证的深度内容
   迁入 [Wiki](https://github.com/OopsOo0ps/proxy/wiki)（配置参考、分流与规则、
-  DNS 策略、运行时语义、可观测性、部署指南、性能与容量、测试与验收等）。
+  DNS 策略、运行时语义、可观测性、部署指南、性能与容量、测试与验收等）；
+  文档命令统一为 Makefile 目标，不再出现直接调用 `bin/` 二进制的示例。
 
 ## [0.1.0] - 2026-10-11
 
