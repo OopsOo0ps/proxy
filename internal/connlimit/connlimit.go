@@ -132,6 +132,10 @@ func (l *Listener) Accept() (net.Conn, error) {
 }
 
 // limitedConn 在关闭时归还名额（重复 Close 只归还一次）。
+//
+// 同时透传半关闭能力：relay 层用 CloseWrite 把一侧的 EOF 传播为对侧的 FIN，
+// 包装类型若只实现 Close，halfClose 的类型断言会静默失败（no-op），
+// 对端将等不到 EOF 而挂到空闲超时。CloseRead 同理。
 type limitedConn struct {
 	net.Conn
 	limiter *Limiter
@@ -142,4 +146,20 @@ func (c *limitedConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(c.limiter.Release)
 	return err
+}
+
+// CloseWrite 透传底层连接的半关闭写方向；底层不支持时是安全的 no-op。
+func (c *limitedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// CloseRead 透传底层连接的半关闭读方向；底层不支持时是安全的 no-op。
+func (c *limitedConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
 }

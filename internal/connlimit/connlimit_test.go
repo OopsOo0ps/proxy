@@ -1,6 +1,7 @@
 package connlimit
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -167,5 +168,68 @@ func TestListenerRejectsOverLimit(t *testing.T) {
 		_ = s4.Close()
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection after release was not accepted")
+	}
+}
+
+// stubConn 是满足 net.Conn 的空连接，供包装测试使用。
+type stubConn struct{}
+
+func (stubConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (stubConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (stubConn) Close() error                     { return nil }
+func (stubConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
+func (stubConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
+func (stubConn) SetDeadline(time.Time) error      { return nil }
+func (stubConn) SetReadDeadline(time.Time) error  { return nil }
+func (stubConn) SetWriteDeadline(time.Time) error { return nil }
+
+// halfCloseConn 是支持半关闭的测试连接，并记录调用次数。
+type halfCloseConn struct {
+	stubConn
+	closeWrites int
+	closeReads  int
+}
+
+func (c *halfCloseConn) CloseWrite() error { c.closeWrites++; return nil }
+func (c *halfCloseConn) CloseRead() error  { c.closeReads++; return nil }
+
+// TestLimitedConnPreservesHalfClose 验证包装连接仍透传半关闭能力：
+// relay 层依赖 CloseWrite 把 EOF 传播为对侧 FIN（见 relay.halfClose），
+// 包装丢失该能力会让对端等不到 EOF 而挂到空闲超时。
+func TestLimitedConnPreservesHalfClose(t *testing.T) {
+	base := &halfCloseConn{}
+	limiter := New(1)
+	if !limiter.TryAcquire() {
+		t.Fatal("acquire")
+	}
+	wrapped := &limitedConn{Conn: base, limiter: limiter}
+
+	// 包装后必须仍可被 relay 断言为 closeWriter。
+	cw, ok := any(wrapped).(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("limitedConn 必须支持 CloseWrite，否则半关闭会被静默吞掉")
+	}
+	if err := cw.CloseWrite(); err != nil || base.closeWrites != 1 {
+		t.Fatalf("CloseWrite 透传: err=%v calls=%d, want nil/1", err, base.closeWrites)
+	}
+	if err := wrapped.CloseRead(); err != nil || base.closeReads != 1 {
+		t.Fatalf("CloseRead 透传: err=%v calls=%d, want nil/1", err, base.closeReads)
+	}
+
+	// Close 仍归还名额。
+	if err := wrapped.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if limiter.Active() != 0 {
+		t.Fatalf("active=%d after Close, want 0", limiter.Active())
+	}
+
+	// 底层不支持半关闭时安全 no-op，不 panic。
+	plain := &limitedConn{Conn: stubConn{}, limiter: New(1)}
+	if err := plain.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite on plain underlying: %v", err)
+	}
+	if err := plain.CloseRead(); err != nil {
+		t.Fatalf("CloseRead on plain underlying: %v", err)
 	}
 }
