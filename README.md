@@ -776,6 +776,14 @@ go test -bench=. -benchmem -run='^$' -count=3 ./internal/...
 更高吞吐按 vCPU 近似线性扩容，或改用长连接/连接池路径（本表为冷路径天花板）。
 完整条件、逐档系统快照与复现脚本见项目仓库外的验证记录（小样本单轮，趋势优先）。
 
+**隧道长连接容量（补充）**：同机建立 1k / 5k / 10k 条持久 CONNECT 隧道并各以
+1s 心跳（64B 回显）保持 60s——三档均 **100% 建立、0 失败、全部存活至结束**；
+10k 档实测心跳 **9.9k msg/s**（RTT p50 415ms / p99 663ms），`/metrics` 的
+`active_connections` 与探针计数一致（client http=10000、server tunnel=10000），
+client/server RSS ≈ **1.10GB / 0.93GB**（无 OOM）；另 1k 隧道 × 4KB/100ms 数据档
+~9.9k msg/s（≈40MB/s 单向载荷）、0 失败。规划经验值：**每条隧道双进程合计
+≈200KB**；隧道数上限 ≈ min(可用内存 ÷ 200KB, vCPU 数 × 5k ÷ 每秒心跳数)。
+
 ## 项目结构
 
 ```text
