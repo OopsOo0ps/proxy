@@ -8,12 +8,11 @@
 
 ## 报告安全漏洞
 
-请**不要**通过公开的 GitHub Issue 报告安全漏洞。可任选以下私下渠道：
+请**不要**通过公开的 GitHub Issue 报告安全漏洞。请使用 GitHub 私密漏洞报告渠道：
 
-1. **GitHub 私密漏洞报告（首选）**：在仓库
-   [Security → Advisories → Report a vulnerability](https://github.com/OopsOo0ps/proxy/security/advisories/new)
-   提交，仅维护者可见。
-2. **邮件**：发送至 `cpioops@outlook.com`，标题注明 `[SECURITY]`。
+**GitHub 私密漏洞报告**：在仓库
+[Security → Advisories → Report a vulnerability](https://github.com/OopsOo0ps/proxy/security/advisories/new)
+提交，仅维护者可见。
 
 报告中请尽量包含：
 
