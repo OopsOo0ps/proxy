@@ -27,6 +27,9 @@ const wildcard = "*"
 // 阶段 3 落位：outbound 传输契约落位——nodes 携带 outbound.Transport 实现
 // 协议无关（仍禁 trojan）；outbound 只依赖 core + stdlib；trojan 经编译期
 // 断言实现契约（协议实现可以 import 契约，反向不允许）。
+// 阶段 4 落位：session 统一 socks5/trojan 的 accept/drain 机械部分——生命周期
+// 层除 shutdown 排空原语外零依赖（协议细节不进 session）；入站三包改经
+// session 获得统一关停语义（httpproxy 仅复用完成日志辅助函数）。
 var forbidden = map[string][]string{
 	"internal/httpproxy": {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
 	"internal/socks5":    {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
@@ -38,6 +41,7 @@ var forbidden = map[string][]string{
 	"internal/dialer":    {"metrics"},
 	"internal/core":      {wildcard},
 	"internal/outbound":  {wildcard},
+	"internal/session":   {wildcard},
 }
 
 // allowAny 是 wildcard 规则的例外名单：键为包，值为其仍允许依赖的 internal 包。
@@ -46,6 +50,9 @@ var allowAny = map[string][]string{
 	// outbound 契约消费 core.Target；routing 经 core 传递进入依赖闭包，
 	// 一并在例外中放行（outbound 自身不直接 import routing）。
 	"internal/outbound": {"core", "routing"},
+	// session 只承载 accept/drain 机械部分：除 shutdown 排空原语外
+	// 不依赖任何 internal 包（协议细节与契约词汇都不进生命周期层）。
+	"internal/session": {"shutdown"},
 }
 
 // TestDependencyDirection 对矩阵中的每个包执行 go list -deps 并断言

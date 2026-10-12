@@ -11,6 +11,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/outbound"
 )
 
 // newTestTransport 启动回环 Trojan 服务端（自签证书 + 回显目标）并返回
@@ -77,51 +78,13 @@ func TestNewTransportRejectsBadPassword(t *testing.T) {
 	}
 }
 
-// TestTransportDialTunnel 钉住 outbound.Transport 能力：一次调用建立绑定到
-// 目标的就绪隧道。
-func TestTransportDialTunnel(t *testing.T) {
+// TestTransportConformance 把 Trojan 传输跑一遍 outbound 一致性验收
+// （回环 TLS 服务端 + 回显目标；dial / prewarm-bind / probe 全部三项能力，
+// 断言由 internal/outbound 统一持有：未来协议接入即跑同一套验收）。
+func TestTransportConformance(t *testing.T) {
 	tr, target := newTestTransport(t)
 
-	conn, err := tr.DialTunnel(context.Background(), target)
-	if err != nil {
-		t.Fatalf("DialTunnel: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	echoThrough(t, conn)
-}
-
-// TestTransportConnectIdleThenBind 钉住 outbound.Prewarmer 契约：先建立空闲
-// 隧道（connect），停留片刻后再补发绑定请求（bind）——SHA-224 派生在 Bind
-// 内部完成，调用方不接触口令摘要。
-func TestTransportConnectIdleThenBind(t *testing.T) {
-	tr, target := newTestTransport(t)
-
-	conn, err := tr.ConnectIdle(context.Background())
-	if err != nil {
-		t.Fatalf("ConnectIdle: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-
-	// 模拟在池中停留（小于服务端握手超时）后领取。
-	time.Sleep(50 * time.Millisecond)
-	if err := tr.Bind(context.Background(), conn, target); err != nil {
-		t.Fatalf("Bind: %v", err)
-	}
-	echoThrough(t, conn)
-}
-
-// TestTransportProbe 钉住 outbound.Prober 契约：健康节点探测成功（握手后
-// 立即关闭），不可达节点返回错误。
-func TestTransportProbe(t *testing.T) {
-	tr, _ := newTestTransport(t)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	if err := tr.Probe(ctx); err != nil {
-		t.Fatalf("Probe against healthy node: %v", err)
-	}
-
-	// 端口无人监听。
+	// 不可达端点（端口无人监听）：探测失败路径。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -132,7 +95,13 @@ func TestTransportProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dead.Probe(ctx); err == nil {
-		t.Fatal("expected probe error for closed port")
-	}
+
+	outbound.RunConformance(t, outbound.ConformanceSpec{
+		Transport:  tr,
+		Target:     target,
+		RoundTrip:  echoThrough,
+		Prewarmer:  tr,
+		Prober:     tr,
+		DeadProber: dead,
+	})
 }

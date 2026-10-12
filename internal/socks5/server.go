@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
+	"github.com/OopsOo0ps/proxy/internal/session"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
@@ -78,48 +78,14 @@ type Server struct {
 
 // Serve 在 ln 上接受并处理 SOCKS5 连接；ctx 取消后优雅关停：
 // 先停止接受新连接，让存量连接在关停期限内自然结束，超时后强制断开。
+// accept/drain 机械部分委托 internal/session（与 trojan 服务端共用同一实现）。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	// handlerCtx 与关停信号解耦：收到关停后存量连接继续处理，
-	// 只有超过关停期限（forceCancel）才被打断。
-	handlerCtx, forceCancel := context.WithCancel(context.WithoutCancel(ctx))
-	defer forceCancel()
-
-	var wg sync.WaitGroup
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = ln.Close()
-		case <-done:
-		}
-	}()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				s.drain(&wg, forceCancel)
-				return nil
-			}
-			return err
-		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.handle(handlerCtx, conn)
-		}()
-	}
-}
-
-// drain 排空存量连接；超过关停期限后强制中断仍阻塞的连接。
-func (s *Server) drain(wg *sync.WaitGroup, forceCancel context.CancelFunc) {
-	s.logger().Info("shutdown: stopped accepting new connections",
-		"drain_timeout", s.shutdownTimeout().String())
-	if shutdown.Wait(wg, s.shutdownTimeout(), forceCancel) {
-		s.logger().Info("shutdown: all in-flight connections drained")
-		return
-	}
-	s.logger().Warn("shutdown: timeout exceeded, remaining connections closed")
+	return session.Serve(ctx, ln, session.Options{
+		Logger:       s.Logger,
+		DrainTimeout: s.shutdownTimeout,
+	}, func(serveCtx, connCtx context.Context, conn net.Conn) {
+		s.handle(connCtx, conn)
+	})
 }
 
 func (s *Server) handle(ctx context.Context, raw net.Conn) {
@@ -200,19 +166,11 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 		result = core.ResultError
 	}
 	elapsed := time.Since(start)
-	attrs := []any{
+	attrs := append([]any{
 		"target", target,
 		"route", route,
 		"upstream", r.Label(),
-		"duration", elapsed.Round(time.Microsecond).String(),
-		"duration_ms", elapsed.Milliseconds(),
-		"bytes_up", stats.ClientToUpstream,
-		"bytes_down", stats.UpstreamToClient,
-		"result", result,
-	}
-	if relayErr != nil {
-		attrs = append(attrs, "error", relayErr.Error())
-	}
+	}, session.RelayAttrs(elapsed, stats.ClientToUpstream, stats.UpstreamToClient, result, relayErr)...)
 	logger.Info("request completed", attrs...)
 }
 
