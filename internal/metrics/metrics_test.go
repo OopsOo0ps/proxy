@@ -6,29 +6,31 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/connpool"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func TestObserveAndConnGauge(t *testing.T) {
+func TestRequestDoneAndConnGauge(t *testing.T) {
 	m := New()
-	m.Observe(ProtoHTTP, RouteProxy, ResultOK, 25*time.Millisecond)
-	m.Observe(ProtoHTTP, RouteProxy, ResultOK, 75*time.Millisecond)
-	m.Observe(ProtoSOCKS5, RouteDirect, ResultDialFail, 5*time.Millisecond)
+	m.RequestDone(core.ProtoHTTP, core.RouteProxy, core.ResultOK, 25*time.Millisecond)
+	m.RequestDone(core.ProtoHTTP, core.RouteProxy, core.ResultOK, 75*time.Millisecond)
+	m.RequestDone(core.ProtoSOCKS5, core.RouteDirect, core.ResultDialFail, 5*time.Millisecond)
 
-	if got := testutil.ToFloat64(m.requests.WithLabelValues(ProtoHTTP, RouteProxy, ResultOK)); got != 2 {
+	if got := testutil.ToFloat64(m.requests.WithLabelValues(core.ProtoHTTP, core.RouteProxy, core.ResultOK)); got != 2 {
 		t.Fatalf("requests_total{http,proxy,ok} = %v, want 2", got)
 	}
-	if got := testutil.ToFloat64(m.requests.WithLabelValues(ProtoSOCKS5, RouteDirect, ResultDialFail)); got != 1 {
+	if got := testutil.ToFloat64(m.requests.WithLabelValues(core.ProtoSOCKS5, core.RouteDirect, core.ResultDialFail)); got != 1 {
 		t.Fatalf("requests_total{socks5,direct,dial_fail} = %v, want 1", got)
 	}
 
-	m.ConnOpened(ProtoHTTP)
-	m.ConnOpened(ProtoHTTP)
-	if got := testutil.ToFloat64(m.active.WithLabelValues(ProtoHTTP)); got != 2 {
+	m.ConnOpened(core.ProtoHTTP)
+	m.ConnOpened(core.ProtoHTTP)
+	if got := testutil.ToFloat64(m.active.WithLabelValues(core.ProtoHTTP)); got != 2 {
 		t.Fatalf("active_connections{http} = %v, want 2", got)
 	}
-	m.ConnClosed(ProtoHTTP)
-	if got := testutil.ToFloat64(m.active.WithLabelValues(ProtoHTTP)); got != 1 {
+	m.ConnClosed(core.ProtoHTTP)
+	if got := testutil.ToFloat64(m.active.WithLabelValues(core.ProtoHTTP)); got != 1 {
 		t.Fatalf("active_connections{http} = %v, want 1", got)
 	}
 
@@ -36,9 +38,9 @@ func TestObserveAndConnGauge(t *testing.T) {
 
 func TestHandlerExposesRequiredMetricNames(t *testing.T) {
 	m := New()
-	m.Observe(ProtoTunnel, RouteDirect, ResultOK, 10*time.Millisecond)
-	m.ConnOpened(ProtoTunnel)
-	defer m.ConnClosed(ProtoTunnel)
+	m.RequestDone(core.ProtoTunnel, core.RouteDirect, core.ResultOK, 10*time.Millisecond)
+	m.ConnOpened(core.ProtoTunnel)
+	defer m.ConnClosed(core.ProtoTunnel)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/metrics", nil)
@@ -72,11 +74,11 @@ func TestHandlerExposesNamesWithoutTraffic(t *testing.T) {
 
 func TestNilMetricsSafe(t *testing.T) {
 	var m *Metrics
-	m.Observe(ProtoHTTP, RouteDirect, ResultOK, time.Second)
-	m.ConnOpened(ProtoHTTP)
-	m.ConnClosed(ProtoHTTP)
-	m.HealthProbe("n1", true)
-	m.SetUpstreamHealthy("n1", false)
+	m.RequestDone(core.ProtoHTTP, core.RouteDirect, core.ResultOK, time.Second)
+	m.ConnOpened(core.ProtoHTTP)
+	m.ConnClosed(core.ProtoHTTP)
+	m.ProbeResult("n1", true)
+	m.HealthChanged("n1", false)
 	if m.Handler() == nil {
 		t.Fatal("nil metrics Handler should not be nil")
 	}
@@ -85,13 +87,13 @@ func TestNilMetricsSafe(t *testing.T) {
 	}
 }
 
-func TestHealthProbeMetrics(t *testing.T) {
+func TestProbeResultMetrics(t *testing.T) {
 	m := New()
-	m.HealthProbe("n1", true)
-	m.HealthProbe("n1", false)
-	m.HealthProbe("n1", false)
-	m.SetUpstreamHealthy("n1", false)
-	m.SetUpstreamHealthy("n2", true)
+	m.ProbeResult("n1", true)
+	m.ProbeResult("n1", false)
+	m.ProbeResult("n1", false)
+	m.HealthChanged("n1", false)
+	m.HealthChanged("n2", true)
 
 	rec := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
@@ -110,43 +112,43 @@ func TestHealthProbeMetrics(t *testing.T) {
 
 func TestActiveByProtoSnapshot(t *testing.T) {
 	m := New()
-	m.ConnOpened(ProtoHTTP)
-	m.ConnOpened(ProtoHTTP)
-	m.ConnOpened(ProtoSOCKS5)
+	m.ConnOpened(core.ProtoHTTP)
+	m.ConnOpened(core.ProtoHTTP)
+	m.ConnOpened(core.ProtoSOCKS5)
 
 	snap := m.ActiveByProto()
-	if snap[ProtoHTTP] != 2 {
-		t.Fatalf("http = %d, want 2", snap[ProtoHTTP])
+	if snap[core.ProtoHTTP] != 2 {
+		t.Fatalf("http = %d, want 2", snap[core.ProtoHTTP])
 	}
-	if snap[ProtoSOCKS5] != 1 {
-		t.Fatalf("socks5 = %d, want 1", snap[ProtoSOCKS5])
+	if snap[core.ProtoSOCKS5] != 1 {
+		t.Fatalf("socks5 = %d, want 1", snap[core.ProtoSOCKS5])
 	}
-	if snap[ProtoTunnel] != 0 {
-		t.Fatalf("tunnel = %d, want 0", snap[ProtoTunnel])
+	if snap[core.ProtoTunnel] != 0 {
+		t.Fatalf("tunnel = %d, want 0", snap[core.ProtoTunnel])
 	}
 
-	m.ConnClosed(ProtoHTTP)
-	if got := m.ActiveByProto()[ProtoHTTP]; got != 1 {
+	m.ConnClosed(core.ProtoHTTP)
+	if got := m.ActiveByProto()[core.ProtoHTTP]; got != 1 {
 		t.Fatalf("after close http = %d, want 1", got)
 	}
 }
 
 func TestPoolMetrics(t *testing.T) {
 	m := New()
-	m.PoolClaim(PoolClaimHit, "n1")
-	m.PoolClaim(PoolClaimHit, "n1")
-	m.PoolClaim(PoolClaimMiss, "n1")
-	m.PoolClaim(PoolClaimStale, "n2")
-	m.SetPoolIdle("n1", 2)
-	m.PoolWarmFailed("n2")
+	m.ClaimResult("n1", connpool.ClaimHit)
+	m.ClaimResult("n1", connpool.ClaimHit)
+	m.ClaimResult("n1", connpool.ClaimMiss)
+	m.ClaimResult("n2", connpool.ClaimStale)
+	m.IdleSet("n1", 2)
+	m.WarmFailed("n2")
 
-	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n1", PoolClaimHit)); got != 2 {
+	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n1", connpool.ClaimHit)); got != 2 {
 		t.Fatalf("claims{n1,hit} = %v, want 2", got)
 	}
-	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n1", PoolClaimMiss)); got != 1 {
+	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n1", connpool.ClaimMiss)); got != 1 {
 		t.Fatalf("claims{n1,miss} = %v, want 1", got)
 	}
-	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n2", PoolClaimStale)); got != 1 {
+	if got := testutil.ToFloat64(m.poolClaims.WithLabelValues("n2", connpool.ClaimStale)); got != 1 {
 		t.Fatalf("claims{n2,stale} = %v, want 1", got)
 	}
 	if got := testutil.ToFloat64(m.poolIdle.WithLabelValues("n1")); got != 2 {
@@ -158,7 +160,7 @@ func TestPoolMetrics(t *testing.T) {
 
 	// nil 接收者不应 panic。
 	var nilMetrics *Metrics
-	nilMetrics.PoolClaim(PoolClaimHit, "n1")
-	nilMetrics.SetPoolIdle("n1", 0)
-	nilMetrics.PoolWarmFailed("n1")
+	nilMetrics.ClaimResult("n1", connpool.ClaimHit)
+	nilMetrics.IdleSet("n1", 0)
+	nilMetrics.WarmFailed("n1")
 }

@@ -25,7 +25,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/routing"
@@ -75,8 +74,8 @@ type Server struct {
 	Live LivePolicy
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
-	// Metrics 指标；可为 nil。
-	Metrics *metrics.Metrics
+	// Telemetry 是遥测出口；nil 时使用 core.NopTelemetry。
+	Telemetry core.Telemetry
 	// IdleTimeout 隧道空闲回收，默认 90s。
 	IdleTimeout time.Duration
 	// ReadHeaderTimeout 请求头读取超时，默认 10s。
@@ -209,7 +208,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger := h.logger().With("request_id", reqID, "proto", "http", "client_ip", netutil.RemoteIP(remoteAddrOf(r)))
 
 	if !h.authorize(w, r, logger) {
-		h.srv.Metrics.Observe(metrics.ProtoHTTP, metrics.RouteNone, metrics.ResultAuthFail, time.Since(start))
+		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, core.RouteNone, core.ResultAuthFail, time.Since(start))
 		return
 	}
 
@@ -246,22 +245,22 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	if err != nil {
 		logger.Warn("invalid CONNECT target", "target", target, "error", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
-		h.srv.Metrics.Observe(metrics.ProtoHTTP, metrics.RouteNone, metrics.ResultError, time.Since(start))
+		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, core.RouteNone, core.ResultError, time.Since(start))
 		return
 	}
 	target = net.JoinHostPort(host, strconv.Itoa(int(port)))
 
 	h.wg.Add(1)
 	defer h.wg.Done()
-	h.srv.Metrics.ConnOpened(metrics.ProtoHTTP)
-	defer h.srv.Metrics.ConnClosed(metrics.ProtoHTTP)
+	h.srv.telemetryNow().ConnOpened(core.ProtoHTTP)
+	defer h.srv.telemetryNow().ConnClosed(core.ProtoHTTP)
 
 	conn, route, err := h.srv.dialerNow().DialTarget(r.Context(), core.Target{Host: host, Port: port})
 	if err != nil {
 		// 错误细节只进日志，对客户端统一 502。
 		logger.Warn("dial target failed", "target", target, "error", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		h.srv.Metrics.Observe(metrics.ProtoHTTP, route.Action.String(), metrics.ResultDialFail, time.Since(start))
+		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), core.ResultDialFail, time.Since(start))
 		return
 	}
 	defer func() { _ = conn.Close() }()
@@ -270,13 +269,13 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	if !ok {
 		logger.Error("response writer does not support hijacking")
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		h.srv.Metrics.Observe(metrics.ProtoHTTP, route.Action.String(), metrics.ResultError, time.Since(start))
+		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), core.ResultError, time.Since(start))
 		return
 	}
 	clientConn, brw, err := hijacker.Hijack()
 	if err != nil {
 		logger.Error("hijack failed", "error", err)
-		h.srv.Metrics.Observe(metrics.ProtoHTTP, route.Action.String(), metrics.ResultError, time.Since(start))
+		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), core.ResultError, time.Since(start))
 		return
 	}
 	defer func() { _ = clientConn.Close() }()
@@ -293,9 +292,9 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	// 客户端可能在发送 CONNECT 后立即发送载荷（如 TLS ClientHello），
 	// 这些字节可能已被 bufio 预读，必须通过 PrefixConn 原样转发。
 	stats, relayErr := relay.BiCopy(r.Context(), relay.PrefixConn(clientConn, brw.Reader), conn, h.srv.idleTimeout())
-	result := metrics.ResultOK
+	result := core.ResultOK
 	if relay.IsFailure(relayErr) {
-		result = metrics.ResultError
+		result = core.ResultError
 	}
 	elapsed := time.Since(start)
 	attrs := []any{
@@ -313,7 +312,7 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 		attrs = append(attrs, "error", relayErr.Error())
 	}
 	logger.Info("request completed", attrs...)
-	h.srv.Metrics.Observe(metrics.ProtoHTTP, route.Action.String(), result, elapsed)
+	h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), result, elapsed)
 }
 
 // serveForward 处理绝对地址形式的普通 HTTP 请求。
@@ -321,7 +320,7 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 	if !r.URL.IsAbs() || r.URL.Host == "" || r.URL.Scheme != "http" {
 		logger.Warn("rejecting unsupported request form", "method", r.Method, "url", r.URL.String())
 		http.Error(w, "bad request", http.StatusBadRequest)
-		h.srv.Metrics.Observe(metrics.ProtoHTTP, metrics.RouteNone, metrics.ResultError, time.Since(start))
+		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, core.RouteNone, core.ResultError, time.Since(start))
 		return
 	}
 	route := h.srv.dialerNow().RouteFor(r.URL.Hostname())
@@ -331,9 +330,9 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 	sw := &statusRecorder{ResponseWriter: w}
 	h.proxy.ServeHTTP(sw, r.WithContext(ctx))
 
-	result := metrics.ResultOK
+	result := core.ResultOK
 	if sw.status >= http.StatusInternalServerError {
-		result = metrics.ResultError
+		result = core.ResultError
 	}
 	elapsed := time.Since(start)
 	logger.Info("request completed",
@@ -346,7 +345,7 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 		"duration_ms", elapsed.Milliseconds(),
 		"result", result,
 	)
-	h.srv.Metrics.Observe(metrics.ProtoHTTP, route.String(), result, elapsed)
+	h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.String(), result, elapsed)
 }
 
 // onUpstreamError 处理 Transport 层的错误：对客户端统一 502，日志保留细节。
@@ -518,6 +517,14 @@ func (s *Server) logger() *slog.Logger {
 		return slog.New(slog.DiscardHandler)
 	}
 	return s.Logger
+}
+
+// telemetryNow 返回当前遥测出口；未配置时使用 Nop（组件测试零构造）。
+func (s *Server) telemetryNow() core.Telemetry {
+	if s.Telemetry == nil {
+		return core.NopTelemetry
+	}
+	return s.Telemetry
 }
 
 func (s *Server) idleTimeout() time.Duration {

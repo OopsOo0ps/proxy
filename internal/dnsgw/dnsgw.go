@@ -30,7 +30,6 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
@@ -76,6 +75,27 @@ type LivePolicy interface {
 // 返回的 core.Route 供日志的 upstream 字段使用，本包不再自造标签词汇。
 type ProxyDialer = core.ProxyDialer
 
+// ResultInvalid 是被网关拒绝 / 丢弃的非法查询（未转发给任何上游）的
+// 结果标签值；route/result 的其余取值与 core.Telemetry 的请求观测共享
+// 词汇（DNS 走哪条路 = 流量走哪条路），本包只补充 DNS 特有的拒绝语义。
+const ResultInvalid = "invalid"
+
+// DNSObserver 是 DNS 网关的遥测出口；*metrics.Metrics 适配实现（L4 单点）。
+type DNSObserver interface {
+	// QueryDone 记录一次查询（含失败与被拒绝的非法查询）。
+	// route 取值 core.RouteDirect / core.RouteProxy / core.RouteNone；
+	// 耗时是否按路径统计由实现决定（Prometheus 适配只统计实际转发路径）。
+	QueryDone(route, result string, d time.Duration)
+}
+
+// NopObserver 是 Options 的缺省遥测出口：全部方法为空操作，
+// 组件测试零构造、无需 registry。
+var NopObserver DNSObserver = nopObserver{}
+
+type nopObserver struct{}
+
+func (nopObserver) QueryDone(string, string, time.Duration) {}
+
 // Options 是 Server 构造参数。
 type Options struct {
 	// ListenAddr 是网关监听地址，仅用于日志与自环排除（实际 bind 见 Listen）。
@@ -95,8 +115,8 @@ type Options struct {
 	ProxyDialer ProxyDialer
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
-	// Metrics 指标；可为 nil。
-	Metrics *metrics.Metrics
+	// Observer 是遥测出口；nil 时使用 NopObserver。
+	Observer DNSObserver
 	// ShutdownTimeout 关停时等待存量查询结束的最长时间，缺省 15s。
 	ShutdownTimeout time.Duration
 	// Live 提供热加载后的动态解析策略；非 nil 时优先于上方静态选项。
@@ -111,7 +131,7 @@ type Server struct {
 	router          RouteDecider
 	proxyDialer     ProxyDialer
 	logger          *slog.Logger
-	metrics         *metrics.Metrics
+	observer        DNSObserver
 	shutdownTimeout time.Duration
 	direct          *net.Dialer // 直连本机解析器
 	live            LivePolicy
@@ -125,13 +145,17 @@ func New(opts Options) (*Server, error) {
 	if opts.ProxyDialer == nil {
 		return nil, errors.New("dnsgw: proxy dialer is required")
 	}
+	observer := opts.Observer
+	if observer == nil {
+		observer = NopObserver
+	}
 	s := &Server{
 		remote:          opts.Remote,
 		timeout:         opts.Timeout,
 		router:          opts.Router,
 		proxyDialer:     opts.ProxyDialer,
 		logger:          opts.Logger,
-		metrics:         opts.Metrics,
+		observer:        observer,
 		shutdownTimeout: opts.ShutdownTimeout,
 		live:            opts.Live,
 	}
@@ -341,27 +365,27 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 		return s.handleInvalid(logger, payload, err, start)
 	}
 
-	route := metrics.RouteProxy
+	route := core.RouteProxy
 	var (
 		resp     []byte
 		upstream string
 	)
 	if s.routerNow().Decide(q.name) == routing.Direct {
-		route = metrics.RouteDirect
+		route = core.RouteDirect
 		resp, upstream, err = s.queryLocal(ctx, q)
 	} else {
 		resp, upstream, err = s.queryRemote(ctx, q)
 	}
 
-	result := metrics.ResultOK
+	result := core.ResultOK
 	if err != nil {
-		result = metrics.ResultError
+		result = core.ResultError
 		logger.Warn("dns query failed",
 			"name", q.name, "qtype", typeName(q.qtype), "route", route, "error", err)
 		resp = errorResponseEcho(q, rcodeServerFail)
 	}
 	elapsed := time.Since(start)
-	s.metrics.ObserveDNS(route, result, elapsed)
+	s.observer.QueryDone(route, result, elapsed)
 	logger.Info("dns query completed",
 		"name", q.name,
 		"qtype", typeName(q.qtype),
@@ -378,8 +402,8 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 // handleInvalid 处理无法转发的报文：响应报文静默丢弃；其它按错误分类回
 // FORMERR / REFUSED，不计入解析器往返（routes=none）。
 func (s *Server) handleInvalid(logger *slog.Logger, payload []byte, err error, start time.Time) []byte {
-	result := metrics.ResultInvalid
-	defer func() { s.metrics.ObserveDNS(metrics.RouteNone, result, time.Since(start)) }()
+	result := ResultInvalid
+	defer func() { s.observer.QueryDone(core.RouteNone, result, time.Since(start)) }()
 
 	switch {
 	case errors.Is(err, errNotQuery):

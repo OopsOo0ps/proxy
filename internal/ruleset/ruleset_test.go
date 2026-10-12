@@ -6,17 +6,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
@@ -60,28 +57,60 @@ func (f *fakeTransport) requests() int {
 
 func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-func newURLProvider(t *testing.T, tr *fakeTransport, m *metrics.Metrics, interval time.Duration) *Provider {
+// fakeObserver 记录规则源发出的遥测事件（替代 prometheus registry，测试零构造）。
+type fakeObserver struct {
+	mu      sync.Mutex
+	results []string
+	rules   int
+}
+
+func (f *fakeObserver) Refresh(result string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.results = append(f.results, result)
+}
+
+func (f *fakeObserver) SetLastSuccess(time.Time) {}
+
+func (f *fakeObserver) SetRules(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rules = n
+}
+
+// refreshCount 返回某结果的刷新次数；rulesOf 返回最后上报的规则条数。
+func (f *fakeObserver) refreshCount(result string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, r := range f.results {
+		if r == result {
+			n++
+		}
+	}
+	return n
+}
+
+func (f *fakeObserver) rulesOf() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rules
+}
+
+func newURLProvider(t *testing.T, tr *fakeTransport, obs Observer, interval time.Duration) *Provider {
 	t.Helper()
 	p, err := New(Options{
 		URL:             "http://rules.test/rules.yaml",
 		RefreshInterval: interval,
 		Default:         routing.Proxy,
 		Logger:          discardLogger(),
-		Metrics:         m,
+		Observer:        obs,
 		fetchClient:     &http.Client{Transport: tr},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	return p
-}
-
-// scrapeMetrics 直接调用指标处理器（内存中渲染，不监听端口）。
-func scrapeMetrics(t *testing.T, m *metrics.Metrics) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	return rec.Body.String()
 }
 
 func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) {
@@ -125,12 +154,12 @@ func TestFileSourceLifecycle(t *testing.T) {
 	if err := os.WriteFile(rulesPath, []byte(rulesV1), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	m := metrics.New()
+	obs := &fakeObserver{}
 	p, err := New(Options{
 		FilePath: rulesPath,
 		Default:  routing.Proxy,
 		Logger:   discardLogger(),
-		Metrics:  m,
+		Observer: obs,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -170,8 +199,8 @@ func TestFileSourceLifecycle(t *testing.T) {
 	if got := p.Decide("a.example.net"); got != routing.Direct {
 		t.Fatalf("rules changed after failed recheck: decide = %v", got)
 	}
-	if body := scrapeMetrics(t, m); !strings.Contains(body, `ruleset_refreshes_total{result="error"} 1`) {
-		t.Fatalf("error not counted:\n%s", body)
+	if got := obs.refreshCount(RefreshError); got != 1 {
+		t.Fatalf("refresh error observed %d times, want 1", got)
 	}
 }
 
@@ -184,8 +213,8 @@ func TestFileSourceInitialFailureIsStrict(t *testing.T) {
 
 func TestURLSourceInitialLoadAndSpec(t *testing.T) {
 	tr := &fakeTransport{status: 200, body: rulesV1}
-	m := metrics.New()
-	p := newURLProvider(t, tr, m, 30*time.Minute)
+	obs := &fakeObserver{}
+	p := newURLProvider(t, tr, obs, 30*time.Minute)
 	if got := p.Decide("a.example.com"); got != routing.Direct {
 		t.Fatalf("decide = %v, want direct", got)
 	}
@@ -193,18 +222,18 @@ func TestURLSourceInitialLoadAndSpec(t *testing.T) {
 	if got := p.Spec(); got != want {
 		t.Fatalf("spec = %+v, want %+v", got, want)
 	}
-	if body := scrapeMetrics(t, m); !strings.Contains(body, `ruleset_refreshes_total{result="success"} 1`) {
-		t.Fatalf("success not counted:\n%s", body)
+	if got := obs.refreshCount(RefreshSuccess); got != 1 {
+		t.Fatalf("refresh success observed %d times, want 1", got)
 	}
-	if body := scrapeMetrics(t, m); !strings.Contains(body, "ruleset_rules 1") {
-		t.Fatalf("rules gauge missing:\n%s", body)
+	if got := obs.rulesOf(); got != 1 {
+		t.Fatalf("observed rules = %d, want 1", got)
 	}
 }
 
 func TestURLSourceInitialFailureWarnsAndRecovers(t *testing.T) {
 	tr := &fakeTransport{status: 500, body: "boom"}
-	m := metrics.New()
-	p := newURLProvider(t, tr, m, 10*time.Millisecond)
+	obs := &fakeObserver{}
+	p := newURLProvider(t, tr, obs, 10*time.Millisecond)
 
 	// 启动拉取失败：不返回错误，空规则（默认动作）继续，状态记录失败。
 	if got := p.Decide("a.example.com"); got != routing.Proxy {
@@ -214,8 +243,8 @@ func TestURLSourceInitialFailureWarnsAndRecovers(t *testing.T) {
 	if snap.Loaded || snap.LastError == "" {
 		t.Fatalf("unexpected snapshot after failed initial load: %+v", snap)
 	}
-	if body := scrapeMetrics(t, m); !strings.Contains(body, `ruleset_refreshes_total{result="error"} 1`) {
-		t.Fatalf("initial failure not counted:\n%s", body)
+	if got := obs.refreshCount(RefreshError); got != 1 {
+		t.Fatalf("initial failure observed %d times, want 1", got)
 	}
 
 	// 源恢复后周期刷新自动加载成功。
@@ -234,16 +263,15 @@ func TestURLSourceInitialFailureWarnsAndRecovers(t *testing.T) {
 
 func TestURLRefreshSwapsOnlyOnChange(t *testing.T) {
 	tr := &fakeTransport{status: 200, body: rulesV1}
-	m := metrics.New()
-	p := newURLProvider(t, tr, m, 10*time.Millisecond)
+	obs := &fakeObserver{}
+	p := newURLProvider(t, tr, obs, 10*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
 	defer p.Close()
 
-	changed := regexp.MustCompile(`ruleset_refreshes_total\{result="unchanged"\} [1-9]`)
 	waitFor(t, 3*time.Second, "unchanged refresh counted", func() bool {
-		return changed.MatchString(scrapeMetrics(t, m))
+		return obs.refreshCount(RefreshUnchanged) >= 1
 	})
 	if got := p.Decide("a.example.com"); got != routing.Direct {
 		t.Fatalf("rules changed without content change: decide = %v", got)
@@ -260,8 +288,8 @@ func TestURLRefreshSwapsOnlyOnChange(t *testing.T) {
 
 func TestURLRefreshFailureKeepsRules(t *testing.T) {
 	tr := &fakeTransport{status: 200, body: rulesV1}
-	m := metrics.New()
-	p := newURLProvider(t, tr, m, 10*time.Millisecond)
+	obs := &fakeObserver{}
+	p := newURLProvider(t, tr, obs, 10*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.Start(ctx)
@@ -270,7 +298,7 @@ func TestURLRefreshFailureKeepsRules(t *testing.T) {
 	// 刷新返回非法 YAML：保持现有规则，记录错误。
 	tr.set(200, "rules: [:::")
 	waitFor(t, 3*time.Second, "error counted", func() bool {
-		return strings.Contains(scrapeMetrics(t, m), `ruleset_refreshes_total{result="error"} 1`)
+		return obs.refreshCount(RefreshError) >= 1
 	})
 	if got := p.Decide("a.example.com"); got != routing.Direct {
 		t.Fatalf("rules lost after bad refresh: decide = %v", got)
@@ -283,7 +311,7 @@ func TestURLRefreshFailureKeepsRules(t *testing.T) {
 	// 刷新返回 500：同样保持规则。
 	tr.set(500, "boom")
 	waitFor(t, 3*time.Second, "second error counted", func() bool {
-		return strings.Contains(scrapeMetrics(t, m), `ruleset_refreshes_total{result="error"} 2`)
+		return obs.refreshCount(RefreshError) >= 2
 	})
 	if got := p.Decide("a.example.com"); got != routing.Direct {
 		t.Fatalf("rules lost after http failure: decide = %v", got)

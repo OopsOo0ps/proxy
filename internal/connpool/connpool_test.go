@@ -5,16 +5,12 @@ import (
 	"errors"
 	"io"
 	"net"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
 
 // fakeClock 是可手动推进的时钟。
@@ -135,11 +131,57 @@ func injectIdle(p *Pool, addr string, conn net.Conn, at time.Time) {
 	st.idle = append(st.idle, &idleConn{conn: conn, createdAt: at})
 }
 
-func metricsText(t *testing.T, m *metrics.Metrics) string {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	return rec.Body.String()
+// fakeObserver 记录池发出的遥测事件（替代 prometheus registry，测试零构造）。
+type fakeObserver struct {
+	mu        sync.Mutex
+	claims    map[string]int // key: "<node>/<result>"
+	idle      map[string]int
+	warmFails map[string]int
+}
+
+func newFakeObserver() *fakeObserver {
+	return &fakeObserver{
+		claims:    make(map[string]int),
+		idle:      make(map[string]int),
+		warmFails: make(map[string]int),
+	}
+}
+
+func (f *fakeObserver) ClaimResult(node, result string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.claims[node+"/"+result]++
+}
+
+func (f *fakeObserver) IdleSet(node string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.idle[node] = n
+}
+
+func (f *fakeObserver) WarmFailed(node string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.warmFails[node]++
+}
+
+// claimCount 返回某节点某结果的领取次数；idleOf 返回最后上报的空闲数。
+func (f *fakeObserver) claimCount(node, result string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.claims[node+"/"+result]
+}
+
+func (f *fakeObserver) idleOf(node string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.idle[node]
+}
+
+func (f *fakeObserver) warmFailCount(node string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.warmFails[node]
 }
 
 func TestWarmUpAndClaimHit(t *testing.T) {
@@ -167,12 +209,12 @@ func TestWarmUpAndClaimHit(t *testing.T) {
 	waitIdle(t, p, "n1", 2)
 }
 
-func TestClaimMissAndWarmFailureMetrics(t *testing.T) {
-	m := metrics.New()
+func TestClaimMissAndWarmFailureObserved(t *testing.T) {
+	obs := newFakeObserver()
 	n := &fakeNode{onDial: func() (net.Conn, error) {
 		return nil, errors.New("node unreachable")
 	}}
-	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1, Metrics: m})
+	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1, Observer: obs})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,25 +230,22 @@ func TestClaimMissAndWarmFailureMetrics(t *testing.T) {
 		t.Fatal("claim should miss when warm-up failed")
 	}
 
-	text := metricsText(t, m)
-	for _, want := range []string{
-		`upstream_pool_claims_total{node="n1",result="miss"} 1`,
-		`upstream_pool_idle_connections{node="n1"} 0`,
-	} {
-		if !strings.Contains(text, want) {
-			t.Fatalf("/metrics missing %q:\n%s", want, text)
-		}
+	if got := obs.claimCount("n1", ClaimMiss); got != 1 {
+		t.Fatalf("claim miss observed %d times, want 1", got)
 	}
-	if !strings.Contains(text, `upstream_pool_warm_failures_total{node="n1"}`) {
-		t.Fatalf("/metrics missing warm failures:\n%s", text)
+	if got := obs.idleOf("n1"); got != 0 {
+		t.Fatalf("idle observed = %d, want 0", got)
+	}
+	if obs.warmFailCount("n1") == 0 {
+		t.Fatal("warm dial failure not observed")
 	}
 }
 
 func TestClaimSkipsExpiredConn(t *testing.T) {
 	clock := newFakeClock()
-	m := metrics.New()
+	obs := newFakeObserver()
 	n := &fakeNode{}
-	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1, IdleTTL: time.Second, Now: clock.Now, Metrics: m})
+	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1, IdleTTL: time.Second, Now: clock.Now, Observer: obs})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,8 +266,8 @@ func TestClaimSkipsExpiredConn(t *testing.T) {
 	if _, err := server.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expired conn should be closed")
 	}
-	if !strings.Contains(metricsText(t, m), `upstream_pool_claims_total{node="n1",result="stale"} 1`) {
-		t.Fatalf("stale claim not counted:\n%s", metricsText(t, m))
+	if got := obs.claimCount("n1", ClaimStale); got != 1 {
+		t.Fatalf("stale claim observed %d times, want 1", got)
 	}
 }
 
@@ -516,9 +555,8 @@ func TestPruneKeepsFreshConns(t *testing.T) {
 
 func TestConcurrentClaims(t *testing.T) {
 	n := &fakeNode{}
-	m := metrics.New()
 	const maxIdle = 4
-	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: maxIdle, Metrics: m})
+	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: maxIdle})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,9 +610,9 @@ func TestNewValidation(t *testing.T) {
 }
 
 func TestDropNodeClosesIdleConnsAndPausesRefill(t *testing.T) {
-	m := metrics.New()
+	obs := newFakeObserver()
 	n1, n2 := &fakeNode{}, &fakeNode{}
-	p, err := New([]Node{n1.spec("n1"), n2.spec("n2")}, Options{MaxIdle: 2, IdleTTL: time.Minute, Metrics: m})
+	p, err := New([]Node{n1.spec("n1"), n2.spec("n2")}, Options{MaxIdle: 2, IdleTTL: time.Minute, Observer: obs})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,8 +647,8 @@ func TestDropNodeClosesIdleConnsAndPausesRefill(t *testing.T) {
 	if got := p.IdleCounts()["n1"]; got != 0 {
 		t.Fatalf("idle[n1] = %d, want 0（暂停补池期间不应回升）", got)
 	}
-	if !strings.Contains(metricsText(t, m), `upstream_pool_idle_connections{node="n1"} 0`) {
-		t.Fatalf("idle gauge should be 0 after drop:\n%s", metricsText(t, m))
+	if got := obs.idleOf("n1"); got != 0 {
+		t.Fatalf("observed idle[n1] = %d, want 0 after drop", got)
 	}
 
 	// 节点加回后收到真实领取：首次 miss（回退新建），随后自动恢复预热。

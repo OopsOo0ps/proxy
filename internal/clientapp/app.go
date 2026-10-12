@@ -168,7 +168,7 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 			// 拨号经 clientLive 读取当前快照：远程解析始终跟随热加载后的出口节点。
 			ProxyDialer:     clientLive{app: app},
 			Logger:          logger,
-			Metrics:         app.metrics,
+			Observer:        app.metrics,
 			ShutdownTimeout: cfg.Timeouts.Shutdown.Std(),
 			Live:            clientLive{app: app},
 		})
@@ -179,14 +179,14 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 	}
 
 	app.httpSrv = &httpproxy.Server{
-		Live:    clientLive{app: app},
-		Logger:  logger,
-		Metrics: app.metrics,
+		Live:      clientLive{app: app},
+		Logger:    logger,
+		Telemetry: app.metrics,
 	}
 	app.socksSrv = &socks5.Server{
-		Live:    clientLive{app: app},
-		Logger:  logger,
-		Metrics: app.metrics,
+		Live:      clientLive{app: app},
+		Logger:    logger,
+		Telemetry: app.metrics,
 	}
 	return app, nil
 }
@@ -200,7 +200,7 @@ func (a *App) Listen() error {
 			return fmt.Errorf("clientapp: listen http %s: %w", addr, err)
 		}
 		a.httpLn = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
-			a.metrics.ConnRejected(metrics.ProtoHTTP)
+			a.metrics.ConnRejected(core.ProtoHTTP)
 			httpproxy.WriteOverloaded(conn)
 		})
 	}
@@ -210,7 +210,7 @@ func (a *App) Listen() error {
 			return fmt.Errorf("clientapp: listen socks5 %s: %w", addr, err)
 		}
 		a.socksLn = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
-			a.metrics.ConnRejected(metrics.ProtoSOCKS5)
+			a.metrics.ConnRejected(core.ProtoSOCKS5)
 			socks5.WriteOverloadReply(conn)
 		})
 	}
@@ -361,8 +361,8 @@ func (a *App) healthChecks() []func() error {
 func (a *App) runtimeStats() status.Runtime {
 	rt := a.policy.load()
 	active := a.metrics.ActiveByProto()
-	httpConns := active[metrics.ProtoHTTP]
-	socksConns := active[metrics.ProtoSOCKS5]
+	httpConns := active[core.ProtoHTTP]
+	socksConns := active[core.ProtoSOCKS5]
 	out := status.Runtime{
 		Connections: status.Connections{
 			HTTP:   httpConns,
@@ -634,7 +634,7 @@ func (a *App) buildRuleset(cfg *config.Client, reuse *clientRuntime) (*ruleset.P
 		Default:         def,
 		PrivateDirect:   privateDirect,
 		Logger:          a.logger,
-		Metrics:         a.metrics,
+		Observer:        a.metrics,
 		OnChange:        a.dropForwardIdleConns,
 	})
 	if err != nil {
@@ -695,8 +695,8 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 	}
 	hc := cfg.HealthCheck
 	opts := nodes.Options{
-		Logger:  logger,
-		Metrics: m,
+		Logger:   logger,
+		Observer: m,
 		// 故障转移总预算：整条候选节点的等待上限（缺省 30s，可配置）。
 		FailoverBudget: cfg.Timeouts.Failover.Std(),
 		Health: nodes.HealthOptions{
@@ -768,10 +768,10 @@ func buildConnPool(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, 
 		})
 	}
 	connPool, err := connpool.New(specs, connpool.Options{
-		MaxIdle: maxIdle,
-		IdleTTL: cfg.Pool.EffectiveIdleTTL(),
-		Logger:  logger,
-		Metrics: m,
+		MaxIdle:  maxIdle,
+		IdleTTL:  cfg.Pool.EffectiveIdleTTL(),
+		Logger:   logger,
+		Observer: m,
 	})
 	if err != nil {
 		return nil, err
