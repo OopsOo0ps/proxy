@@ -155,7 +155,8 @@ type ClientConfig struct {
 }
 
 // Connect 建立到出口节点的 TCP 连接并完成 TLS 握手，但不发送 Trojan 请求。
-// 预热的空闲连接池用它提前完成握手（见 internal/connpool）；常规拨号见 Dial。
+// 供本包 Transport 实现 ConnectIdle（outbound.Prewarmer 的 connect 阶段）使用；
+// 作为包内实现细节保留导出，新代码请经 Transport 能力面触达。
 func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 10 * time.Second
@@ -192,6 +193,8 @@ func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 }
 
 // StartRequest 在已完成握手的隧道连接上向 target 写出 Trojan 请求。
+// 供本包 Transport 实现 Bind（outbound.Prewarmer 的 bind 阶段）使用；
+// 作为包内实现细节保留导出，新代码请经 Transport 能力面触达。
 // timeout 是写超时（<=0 时默认 10s）；写期限同时不晚于 ctx 的截止时间，
 // 保证故障转移总预算能覆盖请求写出阶段。成功后清除写期限，连接可直接用于转发。
 func StartRequest(ctx context.Context, conn net.Conn, passwordHash string, t core.Target, timeout time.Duration) error {
@@ -213,6 +216,8 @@ func StartRequest(ctx context.Context, conn net.Conn, passwordHash string, t cor
 }
 
 // Dial 建立到出口节点的 TLS 隧道，并向 target 发起 Trojan 请求。
+// 供本包 Transport 实现 DialTunnel（outbound.Transport）使用；
+// 作为包内实现细节保留导出，新代码请经 Transport 能力面触达。
 // 返回的连接已就绪，可直接转发目标协议的原始字节。
 func Dial(ctx context.Context, cfg ClientConfig, t core.Target) (net.Conn, error) {
 	conn, err := Connect(ctx, cfg)

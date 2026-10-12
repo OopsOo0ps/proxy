@@ -8,11 +8,11 @@
 // 整条故障转移链受一个总时间预算约束（Options.FailoverBudget，缺省 30s）：
 // 预算耗尽即停止尝试，已消耗的等待不会随节点数量线性放大。
 //
-// 主动健康检查（路线图 3.3）：按周期对节点做轻量探测（TCP+TLS 握手后立即
-// 关闭），连续失败达阈值后摘除该节点（硬摘除：不再参与任何尝试，真实流量
-// 也不再经过它）；摘除后继续探测，连续成功达阈值自动加回并清空被动失败
-// 计数与冷却。摘除状态只由探测更新，冷却状态只由真实拨号更新，二者独立
-// 但共同决定节点是否可接流量。
+// 主动健康检查（路线图 3.3）：按周期对节点做轻量探测（经节点传输的探测
+// 能力，如完成出口握手后立即关闭），连续失败达阈值后摘除该节点（硬摘除：
+// 不再参与任何尝试，真实流量也不再经过它）；摘除后继续探测，连续成功达
+// 阈值自动加回并清空被动失败计数与冷却。摘除状态只由探测更新，冷却状态
+// 只由真实拨号更新，二者独立但共同决定节点是否可接流量。
 package nodes
 
 import (
@@ -21,12 +21,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/outbound"
 )
 
 // 探测结果标签值：bool 结果的可读编码，供观测后端使用。
@@ -53,19 +53,21 @@ type nopObserver struct{}
 func (nopObserver) ProbeResult(string, bool)   {}
 func (nopObserver) HealthChanged(string, bool) {}
 
-// Node 描述一个出口节点（Trojan over TLS）。
-// 运行时模型与配置模式解耦：由组装根从 config.Node 映射而来，
-// 本包不反向依赖配置层。
+// Node 描述一个出口节点：地址与其出口传输能力。
+// 运行时模型与配置模式解耦：由组装根从 config.Node 映射而来，本包不反向
+// 依赖配置层。协议参数（口令、TLS 等）封闭在 Transport 实现内部、由组装根
+// 构造——本包彻底协议无关，混合协议节点天然可用（每节点各自的 Transport）。
 type Node struct {
-	Addr     string // host:port
-	Password string // 隧道口令
-	SNI      string // 可选：TLS SNI / 证书校验名
+	// Addr 是节点地址（host:port），日志与指标中标识该节点。
+	Addr string
+	// Transport 是该节点的出口隧道能力（outbound.Transport，必填）。
+	Transport outbound.Transport
 }
 
 // DialFunc 通过指定节点建立到目标的隧道连接。
 type DialFunc func(ctx context.Context, node Node, t core.Target) (net.Conn, error)
 
-// ProbeFunc 对节点做一次轻量健康探测（如 TCP+TLS 握手），失败时返回错误。
+// ProbeFunc 对节点做一次轻量健康探测（经节点传输的探测能力），失败时返回错误。
 type ProbeFunc func(ctx context.Context, node Node) error
 
 // ErrNoHealthyNodes 表示所有出口节点都被主动健康检查摘除。
@@ -487,11 +489,8 @@ func validateNode(n Node) error {
 	if _, _, err := net.SplitHostPort(n.Addr); err != nil {
 		return fmt.Errorf("invalid node addr %q: %w", n.Addr, err)
 	}
-	if n.Password == "" {
-		return errors.New("node password must not be empty")
-	}
-	if strings.ContainsAny(n.Password+n.SNI, "\r\n") {
-		return errors.New("node password/sni must not contain CR or LF")
+	if n.Transport == nil {
+		return fmt.Errorf("node %s: transport is required", n.Addr)
 	}
 	return nil
 }

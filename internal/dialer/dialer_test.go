@@ -23,6 +23,14 @@ func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 
+// stubTransport 是最小的出口传输实现，仅为满足 Node 的构造校验：
+// 池逻辑通过注入的拨号函数工作，自身不调用传输。
+type stubTransport struct{}
+
+func (stubTransport) DialTunnel(context.Context, core.Target) (net.Conn, error) {
+	return nil, errors.New("stub transport: dial tunnel not implemented")
+}
+
 func engine(t *testing.T, defaultAction routing.Action, privateDirect bool) *routing.Engine {
 	t.Helper()
 	e, err := routing.NewEngine(nil, routing.Options{Default: defaultAction, PrivateDirect: privateDirect})
@@ -63,7 +71,7 @@ func TestDialDirect(t *testing.T) {
 
 func TestDialProxy(t *testing.T) {
 	pool, err := nodes.New(
-		[]nodes.Node{{Addr: "node1.example.com:443", Password: "p"}},
+		[]nodes.Node{{Addr: "node1.example.com:443", Transport: stubTransport{}}},
 		func(context.Context, nodes.Node, core.Target) (net.Conn, error) { return nopConn{}, nil },
 		nodes.Options{},
 	)
@@ -107,7 +115,7 @@ func TestDialProxyWithoutNodesFails(t *testing.T) {
 func TestDialProxyKeepsDomainUnresolved(t *testing.T) {
 	var gotTarget core.Target
 	pool, err := nodes.New(
-		[]nodes.Node{{Addr: "node1.example.com:443", Password: "p"}},
+		[]nodes.Node{{Addr: "node1.example.com:443", Transport: stubTransport{}}},
 		func(_ context.Context, _ nodes.Node, t core.Target) (net.Conn, error) {
 			gotTarget = t
 			return nopConn{}, nil

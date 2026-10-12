@@ -1,13 +1,18 @@
 // Package connpool 维护“已握手、待领取”的上游隧道空闲连接池（预热池）。
 //
-// 为什么需要它：Trojan 协议一条隧道连接只服务一个目标，转发结束即关闭，
-// 无法“用完再复用”；可复用的只有已完成 TCP+TLS 握手、尚未发送 Trojan 请求
-// 的空闲连接。池在启动时为此类连接预热，请求到来时直接领取并补发请求，
-// 省去一次到出口节点的完整握手往返。
+// 为什么需要它：connect-then-bind 类出口协议（如 Trojan）一条隧道连接只服务
+// 一个目标，转发结束即关闭，无法“用完再复用”；可复用的只有已完成协议握手、
+// 尚未绑定目标的空闲连接。池在启动时为此类连接预热，请求到来时直接领取并
+// 补发绑定请求，省去一次到出口节点的完整握手往返。
+//
+// 预热契约（connect-then-bind）：池只认 Node.Dial（connect 阶段：建立已完成
+// 握手、未绑定目标的空闲连接）与 Node.Start（bind 阶段：在领取到的连接上补发
+// 绑定请求）两个函数，协议无关——组装根从节点传输的 Prewarmer 能力映射而来
+// （见 internal/outbound），不具备该能力的传输不进预热池。
 //
 // 设计要点：
 //   - 领取时做非阻塞存活探测（即时检查 + 一个探测窗口复核，见 probeAlive）：
-//     服务端已关闭、或已按握手超时回收并回放伪装响应的连接会被识别为失效并
+//     服务端已关闭、或已按握手超时回收并回放响应的连接会被识别为失效并
 //     丢弃，调用方回退新建，因此失效连接不会流入业务；探测不依赖读超时，
 //     协程被调度延迟也不会漏检；
 //   - 空闲连接受 IdleTTL 约束（默认 5s）。该值应明显小于服务端 handshake
@@ -58,14 +63,15 @@ func (nopObserver) ClaimResult(string, string) {}
 func (nopObserver) IdleSet(string, int)        {}
 func (nopObserver) WarmFailed(string)          {}
 
-// Node 描述一个可预热的上游节点。
+// Node 描述一个可预热的上游节点（connect-then-bind 契约，函数注入即协议无关）。
 type Node struct {
 	// Addr 是节点地址（host:port），在池内唯一标识该节点。
 	Addr string
-	// Dial 建立到节点的 TCP+TLS 连接（握手完成，未发送 Trojan 请求）。
+	// Dial 是 connect 阶段：建立到节点的已完成协议握手、未绑定目标的空闲连接。
 	Dial func(ctx context.Context) (net.Conn, error)
-	// Start 在领取到的连接上向目标发起 Trojan 请求；ctx 是本次领取的上下文
-	// （调用方可能带有故障转移总预算），实现应把请求写出的超时收敛到 ctx 截止时间内。
+	// Start 是 bind 阶段：在领取到的连接上向目标补发绑定请求；ctx 是本次领取
+	// 的上下文（调用方可能带有故障转移总预算），实现应把请求写出的超时收敛到
+	// ctx 截止时间内。
 	Start func(ctx context.Context, conn net.Conn, t core.Target) error
 }
 
@@ -212,7 +218,7 @@ func (p *Pool) Close() {
 }
 
 // Claim 尝试为 t 从 addr 节点的池中领取一条空闲连接。
-// 成功时连接已发送 Trojan 请求、可直接进入转发；失败返回 (nil, false)，
+// 成功时连接已补发绑定请求、可直接进入转发；失败返回 (nil, false)，
 // 调用方应回退新建连接。内部会跳过过期或失效的空闲连接。
 func (p *Pool) Claim(ctx context.Context, addr string, t core.Target) (net.Conn, bool) {
 	if !p.Enabled() || ctx.Err() != nil {

@@ -25,11 +25,19 @@ func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 
+// stubTransport 是最小的出口传输实现，仅为满足 Node 的构造校验：
+// 池逻辑通过注入的 DialFunc/ProbeFunc 工作自身不调用传输。
+type stubTransport struct{}
+
+func (stubTransport) DialTunnel(context.Context, core.Target) (net.Conn, error) {
+	return nil, errors.New("stub transport: dial tunnel not implemented")
+}
+
 func testNodes() []Node {
 	return []Node{
-		{Addr: "node1.example.com:443", Password: "p1"},
-		{Addr: "node2.example.com:443", Password: "p2"},
-		{Addr: "node3.example.com:443", Password: "p3"},
+		{Addr: "node1.example.com:443", Transport: stubTransport{}},
+		{Addr: "node2.example.com:443", Transport: stubTransport{}},
+		{Addr: "node3.example.com:443", Transport: stubTransport{}},
 	}
 }
 
@@ -334,11 +342,13 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(testNodes(), nil, Options{}); err == nil {
 		t.Fatal("nil dial should be rejected")
 	}
-	if _, err := New([]Node{{Addr: "no-port", Password: "x"}}, dial, Options{}); err == nil {
+	if _, err := New([]Node{{Addr: "no-port", Transport: stubTransport{}}}, dial, Options{}); err == nil {
 		t.Fatal("bad addr should be rejected")
 	}
-	if _, err := New([]Node{{Addr: "n.example.com:443", Password: ""}}, dial, Options{}); err == nil {
-		t.Fatal("empty password should be rejected")
+	// 口令非空等协议参数校验已随节点去协议化移出本包：
+	// 归 config 校验与协议传输构造器（internal/trojan.NewTransport）。
+	if _, err := New([]Node{{Addr: "n.example.com:443"}}, dial, Options{}); err == nil {
+		t.Fatal("nil transport should be rejected")
 	}
 }
 

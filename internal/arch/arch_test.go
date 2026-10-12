@@ -24,6 +24,9 @@ const wildcard = "*"
 // 阶段 2 落位：遥测解耦完成——组件经各自的 Observer 窄接口发出领域事件，
 // Prometheus 编码收敛到 metrics（L4 适配层）；L4 以下（含传递依赖）禁止
 // import metrics，无需暂缓名单，全部为硬约束（core 的 wildcard 已覆盖）。
+// 阶段 3 落位：outbound 传输契约落位——nodes 携带 outbound.Transport 实现
+// 协议无关（仍禁 trojan）；outbound 只依赖 core + stdlib；trojan 经编译期
+// 断言实现契约（协议实现可以 import 契约，反向不允许）。
 var forbidden = map[string][]string{
 	"internal/httpproxy": {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
 	"internal/socks5":    {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
@@ -34,11 +37,15 @@ var forbidden = map[string][]string{
 	"internal/ruleset":   {"metrics"},
 	"internal/dialer":    {"metrics"},
 	"internal/core":      {wildcard},
+	"internal/outbound":  {wildcard},
 }
 
 // allowAny 是 wildcard 规则的例外名单：键为包，值为其仍允许依赖的 internal 包。
 var allowAny = map[string][]string{
 	"internal/core": {"routing"}, // routing.Action 是共享词汇（L0 纯叶子包）
+	// outbound 契约消费 core.Target；routing 经 core 传递进入依赖闭包，
+	// 一并在例外中放行（outbound 自身不直接 import routing）。
+	"internal/outbound": {"core", "routing"},
 }
 
 // TestDependencyDirection 对矩阵中的每个包执行 go list -deps 并断言
