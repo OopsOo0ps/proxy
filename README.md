@@ -248,23 +248,32 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 │   └── controller/       #   proxy-controller（骨架）
 ├── configs/              # 示例配置（生产模板 + 本地三节点演示）
 ├── internal/
+│   ├── arch/             #   依赖方向守护测试（go list -deps 矩阵，make test 拦截）
 │   ├── auth/             #   凭据存储与常量时间校验
 │   ├── clientapp/        #   proxy-client 组装与端到端测试
 │   ├── config/           #   配置解析、默认值与校验
-│   ├── dialer/           #   路由感知的出站拨号
+│   ├── connlimit/        #   进程级并发连接上限（背压）
+│   ├── connpool/         #   上游隧道预热池（connect-then-bind 契约）
+│   ├── core/             #   核心契约（Target / Route / 拨号·认证·遥测接口）
+│   ├── dialer/           #   路由感知的出站拨号（实现 core.TargetDialer）
 │   ├── dnsgw/            #   可选 DNS 网关（分流感知的 DNS 转发）
 │   ├── httpproxy/        #   HTTP/HTTPS 入站（CONNECT + 转发）
 │   ├── logging/          #   slog 初始化、request_id 与运行期级别/格式切换
-│   ├── metrics/          #   Prometheus 指标
+│   ├── metrics/          #   Prometheus 指标（L4 适配层，实现各组件 Observer）
 │   ├── netutil/          #   网络小工具
-│   ├── nodes/            #   出口节点池（轮询/冷却/切换）
+│   ├── nodes/            #   出口节点池（轮询/冷却/切换；节点携带传输实现）
+│   ├── outbound/         #   出口传输契约（Transport/Prewarmer/Prober）与一致性验收
 │   ├── relay/            #   双向转发（半关闭/空闲超时）
 │   ├── routing/          #   分流规则引擎
 │   ├── ruleset/          #   规则源（本地文件 / 远程 URL）与定时刷新
 │   ├── serverapp/        #   proxy-server 组装
+│   ├── session/          #   入站 accept/drain 生命周期（socks5/trojan 共用）
+│   ├── shutdown/         #   优雅关停排空原语
 │   ├── socks5/           #   SOCKS5 入站与地址编码
+│   ├── sockswire/        #   SOCKS5 线格式编解码
+│   ├── status/           #   运行时状态快照（/stats）
 │   ├── testutil/         #   测试辅助（自签证书）
-│   └── trojan/           #   Trojan 协议（客户端握手 / 服务端）
+│   └── trojan/           #   Trojan 协议（客户端传输实现 / 服务端）
 ├── pkg/version/          #   版本信息（构建期注入）
 ├── test/integration/     #   黑盒集成测试（真实二进制端到端）
 ├── Dockerfile            # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
