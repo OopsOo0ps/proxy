@@ -27,6 +27,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
+	"github.com/OopsOo0ps/proxy/internal/outbound"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/ruleset"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
@@ -515,13 +516,8 @@ func (a *App) buildRuntime(cfg *config.Client, reuse *clientRuntime) (*clientRun
 		if err != nil {
 			return nil, err
 		}
-		connPool, err := buildConnPool(cfg, baseTLS, a.metrics, a.logger)
+		connPool, pool, err := buildUpstream(cfg, baseTLS, a.metrics, a.logger)
 		if err != nil {
-			return nil, err
-		}
-		pool, err := buildNodePool(cfg, baseTLS, connPool, a.metrics, a.logger)
-		if err != nil {
-			connPool.Close()
 			return nil, err
 		}
 		rt.connPool = connPool
@@ -664,34 +660,76 @@ func buildAuth(cfg *config.Client) (*auth.Store, error) {
 	return auth.NewStore(users)
 }
 
-// buildNodePool 构建出口节点池；未配置节点时返回 nil（仅直连）。
-// 拨号优先从预热连接池领取空闲隧道；未命中或领取失效时新建隧道。
-// 主动健康检查对节点做 TCP+TLS 握手探测（不发 Trojan 请求、不占预热池）；
-// 节点被摘除时立即清空其空闲预热连接。
-func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.Pool, m *metrics.Metrics, logger *slog.Logger) (*nodes.Pool, error) {
+// buildUpstream 依据配置构建出口链路（节点池 + 预热池）；未配置节点时返回
+// (nil, nil)（仅直连）。
+//
+// 每节点一个传输实例：协议参数（口令、TLS/SNI、超时）在 trojan.NewTransport
+// 构造时封闭，SHA-224 口令派生等线格式细节不出协议包；节点池只携带地址与
+// 传输能力（nodes 彻底协议无关）。预热池只对实现 outbound.Prewarmer 能力
+// （握手/绑定两阶段分离）的传输启用，混合协议节点天然各按其能力接入；
+// 拨号优先领取预热空闲隧道，未命中走节点自身传输；主动健康检查经 Prober
+// 能力探测，节点被摘除时立即清空其空闲预热连接。
+func buildUpstream(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, logger *slog.Logger) (*connpool.Pool, *nodes.Pool, error) {
 	if len(cfg.Nodes) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
-	// 配置模型 → 节点池运行时模型（nodes 包不反向依赖 config）。
+	// 配置模型 → 节点运行时模型（nodes 包不反向依赖 config）。
 	nodeCfgs := make([]nodes.Node, 0, len(cfg.Nodes))
-	for _, n := range cfg.Nodes {
-		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: n.Addr, Password: n.Password, SNI: n.SNI})
+	for i, n := range cfg.Nodes {
+		nodeTLS := baseTLS.Clone()
+		if n.SNI != "" {
+			nodeTLS.ServerName = n.SNI
+		}
+		tr, err := trojan.NewTransport(trojan.ClientConfig{
+			ServerAddr:       n.Addr,
+			Password:         n.Password,
+			TLSConfig:        nodeTLS,
+			DialTimeout:      cfg.Timeouts.Dial.Std(),
+			HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
+		})
+		if err != nil {
+			return nil, nil, fmt.Errorf("nodes[%d] (%s): %w", i, n.Addr, err)
+		}
+		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: n.Addr, Transport: tr})
 	}
+
+	// 预热池只对实现 Prewarmer 能力的传输启用；max_idle = 0 或无可用能力时
+	// 保持 nil（Claim 对 nil 接收者安全，恒回退新建）。
+	var connPool *connpool.Pool
+	if maxIdle := cfg.Pool.EffectiveMaxIdle(); maxIdle > 0 {
+		var specs []connpool.Node
+		for _, n := range nodeCfgs {
+			pw, ok := n.Transport.(outbound.Prewarmer)
+			if !ok {
+				continue
+			}
+			specs = append(specs, connpool.Node{
+				Addr: n.Addr,
+				// connect 阶段只完成协议握手；绑定请求在领取时补发（bind）。
+				Dial:  pw.ConnectIdle,
+				Start: pw.Bind,
+			})
+		}
+		if len(specs) > 0 {
+			var err error
+			connPool, err = connpool.New(specs, connpool.Options{
+				MaxIdle:  maxIdle,
+				IdleTTL:  cfg.Pool.EffectiveIdleTTL(),
+				Logger:   logger,
+				Observer: m,
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+
+	// 节点池拨号：预热领取未命中（或池未启用）时走节点自身传输。
 	dialFn := func(ctx context.Context, node nodes.Node, t core.Target) (net.Conn, error) {
 		if conn, ok := connPool.Claim(ctx, node.Addr, t); ok {
 			return conn, nil
 		}
-		nodeTLS := baseTLS.Clone()
-		if node.SNI != "" {
-			nodeTLS.ServerName = node.SNI
-		}
-		return trojan.Dial(ctx, trojan.ClientConfig{
-			ServerAddr:       node.Addr,
-			Password:         node.Password,
-			TLSConfig:        nodeTLS,
-			DialTimeout:      cfg.Timeouts.Dial.Std(),
-			HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
-		}, t)
+		return node.Transport.DialTunnel(ctx, t)
 	}
 	hc := cfg.HealthCheck
 	opts := nodes.Options{
@@ -711,72 +749,24 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 		},
 	}
 	if opts.Health.Interval > 0 {
-		probeTimeout := hc.EffectiveTimeout()
+		// 主动探测经 Prober 能力（传输构造时已含超时参数，期限由探测循环
+		// 按 Health.Timeout 收敛）；未声明探测能力的传输不做主动探测判定
+		//（恒成功），健康性交由被动冷却评估。
 		opts.Probe = func(ctx context.Context, node nodes.Node) error {
-			nodeTLS := baseTLS.Clone()
-			if node.SNI != "" {
-				nodeTLS.ServerName = node.SNI
-			}
-			conn, err := trojan.Connect(ctx, trojan.ClientConfig{
-				ServerAddr:       node.Addr,
-				Password:         node.Password,
-				TLSConfig:        nodeTLS,
-				DialTimeout:      probeTimeout,
-				HandshakeTimeout: probeTimeout,
-			})
-			if err != nil {
-				return err
-			}
-			return conn.Close()
-		}
-	}
-	return nodes.New(nodeCfgs, dialFn, opts)
-}
-
-// buildConnPool 构建上游空闲隧道连接池；未启用（max_idle = 0）或未配置节点时返回 nil。
-func buildConnPool(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, logger *slog.Logger) (*connpool.Pool, error) {
-	maxIdle := cfg.Pool.EffectiveMaxIdle()
-	if maxIdle <= 0 || len(cfg.Nodes) == 0 {
-		return nil, nil
-	}
-	specs := make([]connpool.Node, 0, len(cfg.Nodes))
-	for _, node := range cfg.Nodes {
-		node := node
-		nodeTLS := baseTLS.Clone()
-		if node.SNI != "" {
-			nodeTLS.ServerName = node.SNI
-		}
-		hash := auth.SHA224Hex(node.Password)
-		specs = append(specs, connpool.Node{
-			Addr: node.Addr,
-			// 预热只完成 TCP+TLS 握手；Trojan 请求在领取时补发（Start）。
-			Dial: func(ctx context.Context) (net.Conn, error) {
-				return trojan.Connect(ctx, trojan.ClientConfig{
-					ServerAddr:       node.Addr,
-					Password:         node.Password,
-					TLSConfig:        nodeTLS,
-					DialTimeout:      cfg.Timeouts.Dial.Std(),
-					HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
-				})
-			},
-			Start: func(ctx context.Context, conn net.Conn, t core.Target) error {
-				if err := trojan.StartRequest(ctx, conn, hash, t, cfg.Timeouts.Handshake.Std()); err != nil {
-					return fmt.Errorf("trojan: write request to %s: %w", node.Addr, err)
-				}
+			prober, ok := node.Transport.(outbound.Prober)
+			if !ok {
 				return nil
-			},
-		})
+			}
+			return prober.Probe(ctx)
+		}
 	}
-	connPool, err := connpool.New(specs, connpool.Options{
-		MaxIdle:  maxIdle,
-		IdleTTL:  cfg.Pool.EffectiveIdleTTL(),
-		Logger:   logger,
-		Observer: m,
-	})
+	pool, err := nodes.New(nodeCfgs, dialFn, opts)
 	if err != nil {
-		return nil, err
+		// 失败路径不产生外部副作用：释放已建预热池。
+		connPool.Close()
+		return nil, nil, err
 	}
-	return connPool, nil
+	return connPool, pool, nil
 }
 
 func buildClientTLS(cfg *config.Client) (*tls.Config, error) {
