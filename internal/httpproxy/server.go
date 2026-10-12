@@ -28,6 +28,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/session"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
 )
 
@@ -297,20 +298,12 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 		result = core.ResultError
 	}
 	elapsed := time.Since(start)
-	attrs := []any{
+	attrs := append([]any{
 		"method", "CONNECT",
 		"target", target,
 		"route", route.Action.String(),
 		"upstream", route.Label(),
-		"duration", elapsed.Round(time.Microsecond).String(),
-		"duration_ms", elapsed.Milliseconds(),
-		"bytes_up", stats.ClientToUpstream,
-		"bytes_down", stats.UpstreamToClient,
-		"result", result,
-	}
-	if relayErr != nil {
-		attrs = append(attrs, "error", relayErr.Error())
-	}
+	}, session.RelayAttrs(elapsed, stats.ClientToUpstream, stats.UpstreamToClient, result, relayErr)...)
 	logger.Info("request completed", attrs...)
 	h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), result, elapsed)
 }
