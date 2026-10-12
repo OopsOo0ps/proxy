@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
@@ -190,10 +191,10 @@ func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	return tconn, nil
 }
 
-// StartRequest 在已完成握手的隧道连接上向 target(host, port) 写出 Trojan 请求。
+// StartRequest 在已完成握手的隧道连接上向 target 写出 Trojan 请求。
 // timeout 是写超时（<=0 时默认 10s）；写期限同时不晚于 ctx 的截止时间，
 // 保证故障转移总预算能覆盖请求写出阶段。成功后清除写期限，连接可直接用于转发。
-func StartRequest(ctx context.Context, conn net.Conn, passwordHash, host string, port uint16, timeout time.Duration) error {
+func StartRequest(ctx context.Context, conn net.Conn, passwordHash string, t core.Target, timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
@@ -205,20 +206,20 @@ func StartRequest(ctx context.Context, conn net.Conn, passwordHash, host string,
 	if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		return fmt.Errorf("trojan: set write deadline: %w", err)
 	}
-	if err := WriteRequest(conn, passwordHash, host, port); err != nil {
+	if err := WriteRequest(conn, passwordHash, t.Host, t.Port); err != nil {
 		return err
 	}
 	return conn.SetWriteDeadline(time.Time{})
 }
 
-// Dial 建立到出口节点的 TLS 隧道，并向 target(host, port) 发起 Trojan 请求。
+// Dial 建立到出口节点的 TLS 隧道，并向 target 发起 Trojan 请求。
 // 返回的连接已就绪，可直接转发目标协议的原始字节。
-func Dial(ctx context.Context, cfg ClientConfig, host string, port uint16) (net.Conn, error) {
+func Dial(ctx context.Context, cfg ClientConfig, t core.Target) (net.Conn, error) {
 	conn, err := Connect(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := StartRequest(ctx, conn, auth.SHA224Hex(cfg.Password), host, port, cfg.HandshakeTimeout); err != nil {
+	if err := StartRequest(ctx, conn, auth.SHA224Hex(cfg.Password), t, cfg.HandshakeTimeout); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("trojan: write request to %s: %w", cfg.ServerAddr, err)
 	}

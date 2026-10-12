@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 )
@@ -264,7 +265,7 @@ func TestServerHappyPath(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "secret",
 		TLSConfig:  clientTLS,
-	}, host, uint16(port))
+	}, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}
@@ -311,7 +312,7 @@ func TestServerClientResetDuringRelayIsNotError(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "secret",
 		TLSConfig:  clientTLS,
-	}, host, uint16(port))
+	}, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}
@@ -371,7 +372,7 @@ func TestServerUpstreamResetDuringRelayIsNotError(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "secret",
 		TLSConfig:  clientTLS,
-	}, host, uint16(port))
+	}, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}
@@ -414,7 +415,7 @@ func TestServerAuthFailureServesDecoy(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "wrong-password",
 		TLSConfig:  clientTLS,
-	}, "example.com", 443)
+	}, core.Target{Host: "example.com", Port: 443})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}
@@ -484,7 +485,7 @@ func TestServerTargetDialFailureClosesSilently(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "secret",
 		TLSConfig:  clientTLS,
-	}, "example.com", 443)
+	}, core.Target{Host: "example.com", Port: 443})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}
@@ -569,7 +570,7 @@ func TestClientDialErrors(t *testing.T) {
 	}
 	closedAddr := ln.Addr().String()
 	_ = ln.Close()
-	if _, err := Dial(context.Background(), ClientConfig{ServerAddr: closedAddr, Password: "x"}, "example.com", 443); err == nil {
+	if _, err := Dial(context.Background(), ClientConfig{ServerAddr: closedAddr, Password: "x"}, core.Target{Host: "example.com", Port: 443}); err == nil {
 		t.Fatal("expected dial error for closed port")
 	}
 
@@ -588,7 +589,7 @@ func TestClientDialErrors(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
-	if _, err := Dial(context.Background(), ClientConfig{ServerAddr: plainLn.Addr().String(), Password: "x"}, "example.com", 443); err == nil {
+	if _, err := Dial(context.Background(), ClientConfig{ServerAddr: plainLn.Addr().String(), Password: "x"}, core.Target{Host: "example.com", Port: 443}); err == nil {
 		t.Fatal("expected TLS handshake error for plain TCP server")
 	}
 }
@@ -623,7 +624,7 @@ func TestConnectThenStartRequest(t *testing.T) {
 
 	// 领取路径：停留一段时间后（小于服务端握手超时）再补发 Trojan 请求。
 	time.Sleep(50 * time.Millisecond)
-	if err := StartRequest(context.Background(), conn, auth.SHA224Hex("secret"), host, uint16(port), time.Second); err != nil {
+	if err := StartRequest(context.Background(), conn, auth.SHA224Hex("secret"), core.Target{Host: host, Port: uint16(port)}, time.Second); err != nil {
 		t.Fatalf("StartRequest: %v", err)
 	}
 
@@ -799,7 +800,7 @@ func TestServerDrainsInflightTunnelOnShutdown(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "secret",
 		TLSConfig:  clientTLS,
-	}, host, uint16(port))
+	}, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}
@@ -847,7 +848,7 @@ func TestServerForceClosesTunnelAfterShutdownTimeout(t *testing.T) {
 		ServerAddr: nodeAddr,
 		Password:   "secret",
 		TLSConfig:  clientTLS,
-	}, host, uint16(port))
+	}, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("trojan.Dial: %v", err)
 	}

@@ -26,6 +26,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/clientapp"
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/internal/socks5"
@@ -1350,7 +1351,7 @@ func TestE2ETunnelOverloadRejectsAndRecovers(t *testing.T) {
 			ServerAddr: h.addr,
 			Password:   "node-secret",
 			TLSConfig:  &tls.Config{InsecureSkipVerify: true},
-		}, host, uint16(port))
+		}, core.Target{Host: host, Port: uint16(port)})
 	}
 
 	// 隧道 1 占满唯一名额，并确认转发可用。

@@ -20,6 +20,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/connpool"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/dnsgw"
 	"github.com/OopsOo0ps/proxy/internal/httpproxy"
@@ -91,12 +92,27 @@ func (p *livePolicy) load() *clientRuntime { return p.snap.Load() }
 
 // clientLive 把运行时快照适配为各组件需要的动态策略接口。
 // 单个适配器同时满足 httpproxy / socks5 / dnsgw 三份消费方接口（方法集是三者
-// 的并集；拨号返回类型经 dialer.Target 统一），新增热加载项只需维护这一处；
+// 的并集；返回类型锚定 core 契约），新增热加载项只需维护这一处；
 // 任意消费方接口增删方法都会让下方编译期断言失败，不会静默失配。
 type clientLive struct{ app *App }
 
-func (l clientLive) Auth() *auth.Store     { return l.app.policy.load().auth }
-func (l clientLive) Dialer() dialer.Target { return l.app.policy.load().dialer }
+// Auth 返回当前凭据校验能力；未配置认证时必须返回真正的 nil 接口——
+// 消费方以接口 == nil 判定“不校验”，nil *Store 装进接口会被误判为启用。
+func (l clientLive) Auth() core.Authenticator {
+	store := l.app.policy.load().auth
+	if store == nil {
+		return nil
+	}
+	return store
+}
+func (l clientLive) Dialer() core.TargetDialer { return l.app.policy.load().dialer }
+
+// DialProxy 实现 core.ProxyDialer：DNS 网关用它把远程解析固定送往当前
+// 快照的出口节点池，热加载语义与其余动态策略一致。
+func (l clientLive) DialProxy(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	return l.app.policy.load().dialer.DialProxy(ctx, t)
+}
+
 func (l clientLive) IdleTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Idle.Std()
 }
@@ -118,6 +134,7 @@ var (
 	_ httpproxy.LivePolicy = clientLive{}
 	_ socks5.LivePolicy    = clientLive{}
 	_ dnsgw.LivePolicy     = clientLive{}
+	_ core.ProxyDialer     = clientLive{}
 )
 
 // New 校验依赖并组装应用（不绑定端口）。
@@ -148,13 +165,8 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 			Local:      rt.dnsLocal,
 			Timeout:    rt.dnsTimeout,
 			Router:     rt.rules,
-			ProxyDial: func(ctx context.Context, host string, port uint16) (net.Conn, string, error) {
-				conn, route, err := app.policy.load().dialer.DialProxy(ctx, host, port)
-				if err != nil {
-					return nil, "", err
-				}
-				return conn, route.Label(), nil
-			},
+			// 拨号经 clientLive 读取当前快照：远程解析始终跟随热加载后的出口节点。
+			ProxyDialer:     clientLive{app: app},
 			Logger:          logger,
 			Metrics:         app.metrics,
 			ShutdownTimeout: cfg.Timeouts.Shutdown.Std(),
@@ -665,8 +677,8 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 	for _, n := range cfg.Nodes {
 		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: n.Addr, Password: n.Password, SNI: n.SNI})
 	}
-	dialFn := func(ctx context.Context, node nodes.Node, host string, port uint16) (net.Conn, error) {
-		if conn, ok := connPool.Claim(ctx, node.Addr, host, port); ok {
+	dialFn := func(ctx context.Context, node nodes.Node, t core.Target) (net.Conn, error) {
+		if conn, ok := connPool.Claim(ctx, node.Addr, t); ok {
 			return conn, nil
 		}
 		nodeTLS := baseTLS.Clone()
@@ -679,7 +691,7 @@ func buildNodePool(cfg *config.Client, baseTLS *tls.Config, connPool *connpool.P
 			TLSConfig:        nodeTLS,
 			DialTimeout:      cfg.Timeouts.Dial.Std(),
 			HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
-		}, host, port)
+		}, t)
 	}
 	hc := cfg.HealthCheck
 	opts := nodes.Options{
@@ -747,8 +759,8 @@ func buildConnPool(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, 
 					HandshakeTimeout: cfg.Timeouts.Handshake.Std(),
 				})
 			},
-			Start: func(ctx context.Context, conn net.Conn, host string, port uint16) error {
-				if err := trojan.StartRequest(ctx, conn, hash, host, port, cfg.Timeouts.Handshake.Std()); err != nil {
+			Start: func(ctx context.Context, conn net.Conn, t core.Target) error {
+				if err := trojan.StartRequest(ctx, conn, hash, t, cfg.Timeouts.Handshake.Std()); err != nil {
 					return fmt.Errorf("trojan: write request to %s: %w", node.Addr, err)
 				}
 				return nil

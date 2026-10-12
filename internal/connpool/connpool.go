@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
 
@@ -38,7 +39,7 @@ type Node struct {
 	Dial func(ctx context.Context) (net.Conn, error)
 	// Start 在领取到的连接上向目标发起 Trojan 请求；ctx 是本次领取的上下文
 	// （调用方可能带有故障转移总预算），实现应把请求写出的超时收敛到 ctx 截止时间内。
-	Start func(ctx context.Context, conn net.Conn, host string, port uint16) error
+	Start func(ctx context.Context, conn net.Conn, t core.Target) error
 }
 
 // Options 控制池行为。
@@ -180,10 +181,10 @@ func (p *Pool) Close() {
 	p.wg.Wait()
 }
 
-// Claim 尝试为 (host, port) 从 addr 节点的池中领取一条空闲连接。
+// Claim 尝试为 t 从 addr 节点的池中领取一条空闲连接。
 // 成功时连接已发送 Trojan 请求、可直接进入转发；失败返回 (nil, false)，
 // 调用方应回退新建连接。内部会跳过过期或失效的空闲连接。
-func (p *Pool) Claim(ctx context.Context, addr, host string, port uint16) (net.Conn, bool) {
+func (p *Pool) Claim(ctx context.Context, addr string, t core.Target) (net.Conn, bool) {
 	if !p.Enabled() || ctx.Err() != nil {
 		return nil, false
 	}
@@ -217,7 +218,7 @@ func (p *Pool) Claim(ctx context.Context, addr, host string, port uint16) (net.C
 			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)
 			continue
 		}
-		if err := st.spec.Start(ctx, ic.conn, host, port); err != nil {
+		if err := st.spec.Start(ctx, ic.conn, t); err != nil {
 			p.debug("failed to start trojan request on idle connection", addr, err)
 			_ = ic.conn.Close()
 			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)
