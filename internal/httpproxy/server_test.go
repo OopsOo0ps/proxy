@@ -13,14 +13,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
-	"github.com/OopsOo0ps/proxy/internal/dialer"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
@@ -65,16 +64,16 @@ func waitLogRecord(t *testing.T, buf *syncBuffer, substr string) map[string]any 
 
 // stubDialer 是可注入的 TargetDialer 测试桩。
 type stubDialer struct {
-	dial  func(ctx context.Context, host string, port uint16) (net.Conn, error)
+	dial  func(ctx context.Context, t core.Target) (net.Conn, error)
 	route routing.Action
 }
 
-func (d *stubDialer) DialTarget(ctx context.Context, host string, port uint16) (net.Conn, dialer.Route, error) {
+func (d *stubDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
 	if d.dial == nil {
-		return nil, dialer.Route{Action: d.route}, errors.New("stub: no dial")
+		return nil, core.Route{Action: d.route}, errors.New("stub: no dial")
 	}
-	conn, err := d.dial(ctx, host, port)
-	return conn, dialer.Route{Action: d.route}, err
+	conn, err := d.dial(ctx, t)
+	return conn, core.Route{Action: d.route}, err
 }
 
 func (d *stubDialer) RouteFor(string) routing.Action { return d.route }
@@ -128,8 +127,8 @@ func startEcho(t *testing.T) string {
 
 func echoDialer(t *testing.T) *stubDialer {
 	t.Helper()
-	return &stubDialer{route: routing.Direct, dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	return &stubDialer{route: routing.Direct, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+		return net.Dial("tcp", t.String())
 	}}
 }
 
@@ -362,7 +361,7 @@ func readAll(t *testing.T, r io.Reader) string {
 }
 
 func TestConnectDialFailure(t *testing.T) {
-	srv := &Server{Dialer: &stubDialer{route: routing.Proxy, dial: func(context.Context, string, uint16) (net.Conn, error) {
+	srv := &Server{Dialer: &stubDialer{route: routing.Proxy, dial: func(context.Context, core.Target) (net.Conn, error) {
 		return nil, errors.New("connection refused")
 	}}}
 	proxyAddr := startProxy(t, srv)
@@ -381,8 +380,8 @@ func TestForwardAbsoluteForm(t *testing.T) {
 	}))
 	defer target.Close()
 
-	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+		return net.Dial("tcp", t.String())
 	}}})
 
 	conn, err := net.Dial("tcp", proxyAddr)
@@ -437,7 +436,7 @@ func TestForwardRejectsRelativeForm(t *testing.T) {
 }
 
 func TestForwardUpstreamError(t *testing.T) {
-	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, string, uint16) (net.Conn, error) {
+	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, core.Target) (net.Conn, error) {
 		return nil, errors.New("boom")
 	}}})
 
@@ -682,7 +681,7 @@ func TestWriteOverloaded(t *testing.T) {
 // 建连 → 解析请求 → 出站拨号（内存管道上游）→ 200 响应 → 关闭。
 // 上游用内存管道隔离网络变量，度量代理自身处理开销；每次迭代会新建一条本机 TCP 连接。
 func BenchmarkConnectHandshake(b *testing.B) {
-	srv := &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, string, uint16) (net.Conn, error) {
+	srv := &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, core.Target) (net.Conn, error) {
 		upstream, peer := net.Pipe()
 		// 立即关闭对端：上游方向读到 EOF 后转发自然结束，不会因管道不可半关闭而死等。
 		_ = peer.Close()

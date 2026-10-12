@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
 
@@ -44,7 +45,7 @@ type fakeNode struct {
 	mu     sync.Mutex
 	peers  []net.Conn // 管道对端（测试侧），可用来模拟服务端行为
 	onDial func() (net.Conn, error)
-	start  func(ctx context.Context, conn net.Conn, host string, port uint16) error
+	start  func(ctx context.Context, conn net.Conn, t core.Target) error
 }
 
 func (n *fakeNode) dial(ctx context.Context) (net.Conn, error) {
@@ -59,9 +60,9 @@ func (n *fakeNode) dial(ctx context.Context) (net.Conn, error) {
 	return client, nil
 }
 
-func (n *fakeNode) startRequest(ctx context.Context, conn net.Conn, host string, port uint16) error {
+func (n *fakeNode) startRequest(ctx context.Context, conn net.Conn, t core.Target) error {
 	if n.start != nil {
-		return n.start(ctx, conn, host, port)
+		return n.start(ctx, conn, t)
 	}
 	n.started.Add(1)
 	return nil
@@ -154,7 +155,7 @@ func TestWarmUpAndClaimHit(t *testing.T) {
 
 	// 连续领取两条：都应命中，且领取后池应异步补齐回 MaxIdle。
 	for i := 0; i < 2; i++ {
-		conn, ok := p.Claim(context.Background(), "n1", "example.com", 443)
+		conn, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443})
 		if !ok {
 			t.Fatalf("claim %d should hit after warm-up", i+1)
 		}
@@ -183,7 +184,7 @@ func TestClaimMissAndWarmFailureMetrics(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("claim should miss when warm-up failed")
 	}
 
@@ -215,7 +216,7 @@ func TestClaimSkipsExpiredConn(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
 	injectIdle(p, "n1", client, clock.Now().Add(-2*time.Second)) // 已超过 IdleTTL
 
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("expired conn must not be claimed")
 	}
 	if got := p.IdleCounts()["n1"]; got != 0 {
@@ -249,7 +250,7 @@ func TestClaimSkipsClosedConn(t *testing.T) {
 	_ = client.SetReadDeadline(time.Time{})
 	injectIdle(p, "n1", client, time.Now())
 
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("closed conn must not be claimed")
 	}
 }
@@ -271,7 +272,7 @@ func TestClaimSkipsConnWithPendingData(t *testing.T) {
 		t.Fatalf("write decoy: %v", err)
 	}
 
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("conn with pending data must not be claimed")
 	}
 }
@@ -320,7 +321,7 @@ func TestClaimSkipsConnWhenProbeReadIsDelayed(t *testing.T) {
 		t.Fatalf("前提不成立：期限读应因调度延迟返回超时（漏检），got %v", err)
 	}
 
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("已回放伪装响应且探测被延迟的连接不得被领取")
 	}
 }
@@ -339,7 +340,7 @@ func TestClaimWithDelayedProbeKeepsHealthyConn(t *testing.T) {
 	conn := &delayedReadConn{Conn: client, delay: 5 * probeWindow}
 	injectIdle(p, "n1", conn, time.Now())
 
-	got, ok := p.Claim(context.Background(), "n1", "example.com", 443)
+	got, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443})
 	if !ok {
 		t.Fatal("healthy conn must be claimed even when probe reads would be delayed")
 	}
@@ -412,7 +413,7 @@ func TestProbeAliveTCP(t *testing.T) {
 }
 
 func TestClaimStartFailureDiscardsConn(t *testing.T) {
-	n := &fakeNode{start: func(context.Context, net.Conn, string, uint16) error {
+	n := &fakeNode{start: func(context.Context, net.Conn, core.Target) error {
 		return errors.New("write failed")
 	}}
 	p, err := New([]Node{n.spec("n1")}, Options{MaxIdle: 1})
@@ -425,7 +426,7 @@ func TestClaimStartFailureDiscardsConn(t *testing.T) {
 	t.Cleanup(func() { _ = client.Close() })
 	injectIdle(p, "n1", client, time.Now())
 
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("claim must fail when start fails")
 	}
 	_ = server.SetReadDeadline(time.Now().Add(time.Second))
@@ -445,7 +446,7 @@ func TestDisabledPoolDoesNothing(t *testing.T) {
 		t.Fatal("pool with MaxIdle=0 should be disabled")
 	}
 	p.Start(context.Background())
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("disabled pool must not claim")
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -474,7 +475,7 @@ func TestCloseClosesIdleConns(t *testing.T) {
 	if got := p.IdleCounts()["n1"]; got != 0 {
 		t.Fatalf("idle = %d after Close, want 0", got)
 	}
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("closed pool must not claim")
 	}
 	p.Close()
@@ -508,7 +509,7 @@ func TestPruneKeepsFreshConns(t *testing.T) {
 	if _, err := stalePeer.Read(make([]byte, 1)); err == nil {
 		t.Fatal("expired conn should be closed by prune")
 	}
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); !ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); !ok {
 		t.Fatal("fresh conn should still be claimable")
 	}
 }
@@ -533,7 +534,7 @@ func TestConcurrentClaims(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				conn, ok := p.Claim(context.Background(), "n1", "example.com", 443)
+				conn, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443})
 				if ok {
 					hits.Add(1)
 					_ = conn.Close()
@@ -559,8 +560,8 @@ func TestNewValidation(t *testing.T) {
 		t.Fatal("empty node list should fail")
 	}
 	dup := []Node{
-		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(context.Context, net.Conn, string, uint16) error { return nil }},
-		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(context.Context, net.Conn, string, uint16) error { return nil }},
+		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(context.Context, net.Conn, core.Target) error { return nil }},
+		{Addr: "n1", Dial: func(context.Context) (net.Conn, error) { return nil, nil }, Start: func(context.Context, net.Conn, core.Target) error { return nil }},
 	}
 	if _, err := New(dup, Options{}); err == nil {
 		t.Fatal("duplicate addr should fail")
@@ -613,7 +614,7 @@ func TestDropNodeClosesIdleConnsAndPausesRefill(t *testing.T) {
 	}
 
 	// 节点加回后收到真实领取：首次 miss（回退新建），随后自动恢复预热。
-	if _, ok := p.Claim(context.Background(), "n1", "example.com", 443); ok {
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
 		t.Fatal("claim should miss right after drop")
 	}
 	waitIdle(t, p, "n1", 2)
@@ -645,7 +646,7 @@ func BenchmarkClaimHit(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		injectIdle(p, "n1", conns[i%ring], p.opts.Now())
-		conn, ok := p.Claim(context.Background(), "n1", "example.com", 443)
+		conn, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443})
 		if !ok {
 			b.Fatal("claim miss in benchmark")
 		}

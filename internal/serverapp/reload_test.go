@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
@@ -90,7 +91,7 @@ func tunnelRoundTrip(t *testing.T, app *serverapp.App, password, target, payload
 		TLSConfig:        &tls.Config{InsecureSkipVerify: true},
 		DialTimeout:      3 * time.Second,
 		HandshakeTimeout: 3 * time.Second,
-	}, host, uint16(port))
+	}, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		t.Fatalf("trojan dial: %v", err)
 	}

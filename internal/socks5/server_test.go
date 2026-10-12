@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
-	"github.com/OopsOo0ps/proxy/internal/dialer"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
@@ -31,18 +31,18 @@ type stubDialer struct {
 	mu   sync.Mutex
 	host string
 	port uint16
-	dial func(ctx context.Context, host string, port uint16) (net.Conn, error)
+	dial func(ctx context.Context, t core.Target) (net.Conn, error)
 }
 
-func (d *stubDialer) DialTarget(ctx context.Context, host string, port uint16) (net.Conn, dialer.Route, error) {
+func (d *stubDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
 	d.mu.Lock()
-	d.host, d.port = host, port
+	d.host, d.port = t.Host, t.Port
 	d.mu.Unlock()
 	if d.dial == nil {
-		return nil, dialer.Route{}, errors.New("stub: no dial")
+		return nil, core.Route{}, errors.New("stub: no dial")
 	}
-	conn, err := d.dial(ctx, host, port)
-	return conn, dialer.Route{Action: routing.Direct}, err
+	conn, err := d.dial(ctx, t)
+	return conn, core.Route{Action: routing.Direct}, err
 }
 
 func (d *stubDialer) RouteFor(string) routing.Action { return routing.Direct }
@@ -184,8 +184,8 @@ func TestServerConnectNoAuth(t *testing.T) {
 	port := mustPort(t, portStr)
 
 	srv := &Server{
-		Dialer: &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-			return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+		Dialer: &stubDialer{dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+			return net.Dial("tcp", t.String())
 		}},
 	}
 	proxyAddr := startServer(t, srv)
@@ -224,8 +224,8 @@ func TestServerRequiresAuth(t *testing.T) {
 
 	srv := &Server{
 		Auth: store,
-		Dialer: &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-			return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+		Dialer: &stubDialer{dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+			return net.Dial("tcp", t.String())
 		}},
 	}
 	proxyAddr := startServer(t, srv)
@@ -256,7 +256,7 @@ func TestServerRequiresAuth(t *testing.T) {
 }
 
 func TestServerUnsupportedCommands(t *testing.T) {
-	srv := &Server{Dialer: &stubDialer{dial: func(context.Context, string, uint16) (net.Conn, error) {
+	srv := &Server{Dialer: &stubDialer{dial: func(context.Context, core.Target) (net.Conn, error) {
 		return nil, errors.New("should not be called")
 	}}}
 	proxyAddr := startServer(t, srv)
@@ -290,7 +290,7 @@ func TestServerUnsupportedCommands(t *testing.T) {
 }
 
 func TestServerDialFailure(t *testing.T) {
-	srv := &Server{Dialer: &stubDialer{dial: func(context.Context, string, uint16) (net.Conn, error) {
+	srv := &Server{Dialer: &stubDialer{dial: func(context.Context, core.Target) (net.Conn, error) {
 		return nil, errors.New("boom")
 	}}}
 	proxyAddr := startServer(t, srv)
@@ -329,8 +329,8 @@ func TestServerPassesTargetToDialer(t *testing.T) {
 	host, portStr, _ := net.SplitHostPort(echoAddr)
 	port := mustPort(t, portStr)
 
-	stub := &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	stub := &stubDialer{dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+		return net.Dial("tcp", t.String())
 	}}
 	srv := &Server{Dialer: stub}
 	proxyAddr := startServer(t, srv)
@@ -415,8 +415,8 @@ func TestServeDrainsInflightOnShutdown(t *testing.T) {
 	host, portStr, _ := net.SplitHostPort(echoAddr)
 	port := mustPort(t, portStr)
 
-	stub := &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	stub := &stubDialer{dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+		return net.Dial("tcp", t.String())
 	}}
 	proxyAddr, shutdown, finished := startServerControlled(t, &Server{
 		Dialer:          stub,
@@ -448,8 +448,8 @@ func TestServeForceClosesAfterShutdownTimeout(t *testing.T) {
 	host, portStr, _ := net.SplitHostPort(echoAddr)
 	port := mustPort(t, portStr)
 
-	stub := &stubDialer{dial: func(ctx context.Context, host string, port uint16) (net.Conn, error) {
-		return net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	stub := &stubDialer{dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+		return net.Dial("tcp", t.String())
 	}}
 	proxyAddr, shutdown, finished := startServerControlled(t, &Server{
 		Dialer:          stub,

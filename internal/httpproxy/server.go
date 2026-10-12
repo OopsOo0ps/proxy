@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
-	"github.com/OopsOo0ps/proxy/internal/dialer"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
@@ -33,15 +33,15 @@ import (
 )
 
 // TargetDialer 建立到目标的连接（由路由与出口节点决定直连或经隧道）。
-// 与 socks5 共用 dialer.Target：类型统一后，组装根可以用单个运行期适配器
-// 同时满足两边的策略接口（见 internal/clientapp 的 clientLive）。
-type TargetDialer = dialer.Target
+// 契约锚在消费方（core.TargetDialer）：本包不感知出站实现，组装根可以用
+// 单个运行期适配器同时满足两边的策略接口（见 internal/clientapp 的 clientLive）。
+type TargetDialer = core.TargetDialer
 
 // LivePolicy 提供配置热加载后的动态策略。
 // 为 nil 时使用 Server 的静态字段（测试与直接构造场景）。
 type LivePolicy interface {
-	// Auth 返回当前入站凭据存储；nil 表示不校验认证。
-	Auth() *auth.Store
+	// Auth 返回当前入站凭据校验能力；nil 表示不校验认证。
+	Auth() core.Authenticator
 	// Dialer 返回当前目标拨号器。
 	Dialer() TargetDialer
 	// IdleTimeout 返回隧道空闲回收超时。
@@ -193,7 +193,7 @@ func (h *handler) dialContext(ctx context.Context, _, addr string) (net.Conn, er
 	if err != nil || port == 0 {
 		return nil, fmt.Errorf("httpproxy: invalid port %q", portString)
 	}
-	conn, route, err := h.srv.dialerNow().DialTarget(ctx, host, uint16(port))
+	conn, route, err := h.srv.dialerNow().DialTarget(ctx, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +256,7 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	h.srv.Metrics.ConnOpened(metrics.ProtoHTTP)
 	defer h.srv.Metrics.ConnClosed(metrics.ProtoHTTP)
 
-	conn, route, err := h.srv.dialerNow().DialTarget(r.Context(), host, port)
+	conn, route, err := h.srv.dialerNow().DialTarget(r.Context(), core.Target{Host: host, Port: port})
 	if err != nil {
 		// 错误细节只进日志，对客户端统一 502。
 		logger.Warn("dial target failed", "target", target, "error", err)
@@ -472,10 +472,15 @@ func (h *handler) logger() *slog.Logger {
 	return h.srv.Logger
 }
 
-// authNow 返回当前生效的凭据存储：Live 存在时以热加载快照为准。
-func (s *Server) authNow() *auth.Store {
+// authNow 返回当前生效的凭据校验能力：Live 存在时以热加载快照为准；
+// nil 表示不校验认证。nil 的 *auth.Store 必须显式转成 nil 接口，
+// 否则装进接口后 != nil 会被误判为“启用认证”。
+func (s *Server) authNow() core.Authenticator {
 	if s.Live != nil {
 		return s.Live.Auth()
+	}
+	if s.Auth == nil {
+		return nil
 	}
 	return s.Auth
 }

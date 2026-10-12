@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 )
@@ -65,9 +66,16 @@ func startGateway(t *testing.T, opts Options) *gatewayHandle {
 	return &gatewayHandle{srv: srv, addr: ln.Addr().String()}
 }
 
-// dialThroughExit 返回一个“经隧道”的拨号函数：直连给定的上游 DNS 地址，
+// proxyDialerFunc 把函数适配为 core.ProxyDialer（测试桩用）。
+type proxyDialerFunc func(ctx context.Context, t core.Target) (net.Conn, core.Route, error)
+
+func (f proxyDialerFunc) DialProxy(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	return f(ctx, t)
+}
+
+// dialThroughExit 返回一个“经隧道”的拨号器：直连给定的上游 DNS 地址，
 // 并记录调用参数（测试中网关与上游同机，语义上是出口侧访问）。
-func dialThroughExit(t *testing.T, upstream string, calls *atomic.Int64) ProxyDialFunc {
+func dialThroughExit(t *testing.T, upstream string, calls *atomic.Int64) ProxyDialer {
 	t.Helper()
 	host, portString, err := net.SplitHostPort(upstream)
 	if err != nil {
@@ -77,17 +85,17 @@ func dialThroughExit(t *testing.T, upstream string, calls *atomic.Int64) ProxyDi
 	if err != nil {
 		t.Fatal(err)
 	}
-	return func(ctx context.Context, gotHost string, gotPort uint16) (net.Conn, string, error) {
+	return proxyDialerFunc(func(ctx context.Context, got core.Target) (net.Conn, core.Route, error) {
 		calls.Add(1)
-		if gotHost != host || int(gotPort) != wantPort {
-			return nil, "", errors.New("unexpected tunnel target " + gotHost + ":" + strconv.Itoa(int(gotPort)))
+		if got.Host != host || int(got.Port) != wantPort {
+			return nil, core.Route{}, errors.New("unexpected tunnel target " + got.String())
 		}
 		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
 		if err != nil {
-			return nil, "", err
+			return nil, core.Route{}, err
 		}
-		return conn, "test-node", nil
-	}
+		return conn, core.Route{Action: routing.Proxy, Upstream: "test-node"}, nil
+	})
 }
 
 func mustQuery(t *testing.T, addr, name string, id uint16) []byte {
@@ -123,10 +131,10 @@ func TestRemoteRouteGoesThroughExit(t *testing.T) {
 
 	var tunnelCalls atomic.Int64
 	gw := startGateway(t, Options{
-		Remote:    remote.Addr,
-		Local:     []string{local.Addr},
-		Timeout:   2 * time.Second,
-		ProxyDial: dialThroughExit(t, remote.Addr, &tunnelCalls),
+		Remote:      remote.Addr,
+		Local:       []string{local.Addr},
+		Timeout:     2 * time.Second,
+		ProxyDialer: dialThroughExit(t, remote.Addr, &tunnelCalls),
 	})
 
 	resp := mustQuery(t, gw.addr, "site.test", 0x1111)
@@ -167,10 +175,10 @@ func TestDirectRouteUsesLocalResolver(t *testing.T) {
 
 	var tunnelCalls atomic.Int64
 	gw := startGateway(t, Options{
-		Remote:    remote.Addr,
-		Local:     []string{local.Addr},
-		Timeout:   2 * time.Second,
-		ProxyDial: dialThroughExit(t, remote.Addr, &tunnelCalls),
+		Remote:      remote.Addr,
+		Local:       []string{local.Addr},
+		Timeout:     2 * time.Second,
+		ProxyDialer: dialThroughExit(t, remote.Addr, &tunnelCalls),
 	})
 
 	resp := mustQuery(t, gw.addr, "printer.lan", 0x2222)
@@ -201,9 +209,9 @@ func TestDirectTruncatedReplyFallsBackToTCP(t *testing.T) {
 	gw := startGateway(t, Options{
 		Local:   []string{local.Addr},
 		Timeout: 2 * time.Second,
-		ProxyDial: func(context.Context, string, uint16) (net.Conn, string, error) {
-			return nil, "", errors.New("tunnel must not be used for direct names")
-		},
+		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
+			return nil, core.Route{}, errors.New("tunnel must not be used for direct names")
+		}),
 	})
 
 	resp := mustQuery(t, gw.addr, "printer.lan", 0x3333)
@@ -228,10 +236,10 @@ func TestTCPClientTransport(t *testing.T) {
 	gw := startGateway(t, Options{
 		Remote:  remote.Addr,
 		Timeout: 2 * time.Second,
-		ProxyDial: func(ctx context.Context, host string, port uint16) (net.Conn, string, error) {
+		ProxyDialer: proxyDialerFunc(func(ctx context.Context, _ core.Target) (net.Conn, core.Route, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", remote.Addr)
-			return conn, "test-node", err
-		},
+			return conn, core.Route{Action: routing.Proxy, Upstream: "test-node"}, err
+		}),
 	})
 
 	conn, err := net.DialTimeout("tcp", gw.addr, 2*time.Second)
@@ -272,9 +280,9 @@ func TestTCPClientTransport(t *testing.T) {
 func TestMalformedQueryGetsFormErr(t *testing.T) {
 	gw := startGateway(t, Options{
 		Timeout: time.Second,
-		ProxyDial: func(context.Context, string, uint16) (net.Conn, string, error) {
-			return nil, "", errors.New("must not dial")
-		},
+		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
+			return nil, core.Route{}, errors.New("must not dial")
+		}),
 	})
 	resp, err := testutil.QueryUDP(gw.addr, []byte{0x12, 0x34, 0x01}, time.Second)
 	if err != nil {
@@ -288,9 +296,9 @@ func TestMalformedQueryGetsFormErr(t *testing.T) {
 func TestNonQueryIsDropped(t *testing.T) {
 	gw := startGateway(t, Options{
 		Timeout: time.Second,
-		ProxyDial: func(context.Context, string, uint16) (net.Conn, string, error) {
-			return nil, "", errors.New("must not dial")
-		},
+		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
+			return nil, core.Route{}, errors.New("must not dial")
+		}),
 	})
 	// 一条响应报文（QR=1）应被静默丢弃，避免转发环。
 	reply := testutil.BuildReply(testutil.BuildAQuery("x.test", 0x6666), 0, nil, false)
@@ -302,9 +310,9 @@ func TestNonQueryIsDropped(t *testing.T) {
 func TestUnsupportedOpcodeGetsRefused(t *testing.T) {
 	gw := startGateway(t, Options{
 		Timeout: time.Second,
-		ProxyDial: func(context.Context, string, uint16) (net.Conn, string, error) {
-			return nil, "", errors.New("must not dial")
-		},
+		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
+			return nil, core.Route{}, errors.New("must not dial")
+		}),
 	})
 	query := testutil.BuildAQuery("x.test", 0x7777)
 	query[2] |= 5 << 3 // opcode = UPDATE
@@ -329,13 +337,13 @@ func TestRemoteFailureReturnsServFail(t *testing.T) {
 	gw := startGateway(t, Options{
 		Remote:  deadAddr,
 		Timeout: time.Second,
-		ProxyDial: func(ctx context.Context, host string, port uint16) (net.Conn, string, error) {
+		ProxyDialer: proxyDialerFunc(func(ctx context.Context, _ core.Target) (net.Conn, core.Route, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", deadAddr)
 			if err != nil {
-				return nil, "", err
+				return nil, core.Route{}, err
 			}
-			return conn, "test-node", nil
-		},
+			return conn, core.Route{Action: routing.Proxy, Upstream: "test-node"}, nil
+		}),
 	})
 
 	resp := mustQuery(t, gw.addr, "unreachable.test", 0x8888)
@@ -391,9 +399,9 @@ func TestServeShutdown(t *testing.T) {
 	srv, err := New(Options{
 		Timeout: time.Second,
 		Router:  routerFunc(testAction),
-		ProxyDial: func(context.Context, string, uint16) (net.Conn, string, error) {
-			return nil, "", errors.New("must not dial")
-		},
+		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
+			return nil, core.Route{}, errors.New("must not dial")
+		}),
 	})
 	if err != nil {
 		t.Fatal(err)

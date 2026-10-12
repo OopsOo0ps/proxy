@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/OopsOo0ps/proxy/internal/core"
 )
 
 // nopConn 是最小的 net.Conn 实现，仅用于测试。
@@ -42,7 +44,7 @@ func newRecorder() *recorder {
 	return &recorder{calls: map[string]int{}, errs: map[string]error{}}
 }
 
-func (r *recorder) dial(_ context.Context, node Node, _ string, _ uint16) (net.Conn, error) {
+func (r *recorder) dial(_ context.Context, node Node, _ core.Target) (net.Conn, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls[node.Addr]++
@@ -68,7 +70,7 @@ func (r *recorder) setErr(addr string, err error) {
 // 模拟“TCP 可连但始终不完成握手”的半死节点。
 func blockingDial() (DialFunc, func() int) {
 	var calls atomic.Int64
-	dial := func(ctx context.Context, _ Node, _ string, _ uint16) (net.Conn, error) {
+	dial := func(ctx context.Context, _ Node, _ core.Target) (net.Conn, error) {
 		calls.Add(1)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -84,7 +86,7 @@ func TestDialFailoverBudgetExhausted(t *testing.T) {
 	}
 
 	start := time.Now()
-	_, _, err = pool.Dial(context.Background(), "example.com", 443)
+	_, _, err = pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -117,7 +119,7 @@ func TestDialParentDeadlineBeatsBudget(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, _, err = pool.Dial(ctx, "example.com", 443)
+	_, _, err = pool.Dial(ctx, core.Target{Host: "example.com", Port: 443})
 	elapsed := time.Since(start)
 
 	if err == nil {
@@ -145,7 +147,7 @@ func TestDialFailoverBudgetDoesNotBlockFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, node, err := pool.Dial(context.Background(), "example.com", 443)
+	_, node, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -164,7 +166,7 @@ func TestRoundRobinUsesAllNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 6; i++ {
-		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}
 	}
@@ -186,7 +188,7 @@ func TestFailoverToNextNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, node, err := pool.Dial(context.Background(), "example.com", 443)
+	_, node, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -210,14 +212,14 @@ func TestCooldownSkipsFailedNode(t *testing.T) {
 	}
 
 	// 第一次拨号会尝试 node1（失败）然后 node2（成功）。
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 		t.Fatal(err)
 	}
 	node1Calls := rec.callsFor("node1.example.com:443")
 
 	// 冷却期内多次拨号不应再触碰 node1。
 	for i := 0; i < 3; i++ {
-		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -230,7 +232,7 @@ func TestCooldownSkipsFailedNode(t *testing.T) {
 	now = now.Add(31 * time.Second)
 	retried := false
 	for i := 0; i < 4 && !retried; i++ {
-		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 			t.Fatal(err)
 		}
 		retried = rec.callsFor("node1.example.com:443") > node1Calls
@@ -273,11 +275,11 @@ func TestAllNodesCoolingStillAttempted(t *testing.T) {
 	}
 
 	// 第一轮：全部失败并进入冷却。
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err == nil {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err == nil {
 		t.Fatal("expected failure")
 	}
 	// 第二轮（全部冷却中）：仍应全量尝试，避免永久黑洞。
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err == nil {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err == nil {
 		t.Fatal("expected failure")
 	}
 	for _, n := range testNodes() {
@@ -296,7 +298,7 @@ func TestAllFailReturnsAggregatedError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _, err = pool.Dial(context.Background(), "example.com", 443)
+	_, _, err = pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -319,7 +321,7 @@ func TestContextCancelStopsDialing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := pool.Dial(ctx, "example.com", 443); err == nil {
+	if _, _, err := pool.Dial(ctx, core.Target{Host: "example.com", Port: 443}); err == nil {
 		t.Fatal("expected error for canceled context")
 	}
 }
@@ -366,7 +368,7 @@ func TestSnapshotReflectsFailuresAndCooldown(t *testing.T) {
 	}
 
 	// 一次拨号：node1 失败进入冷却（随后 node2 成功）。
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	snap = pool.Snapshot()
@@ -403,7 +405,7 @@ func TestAnyHealthyFalseWhenAllNodesCooling(t *testing.T) {
 	}
 
 	// 全部节点拨号失败后进入冷却。
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err == nil {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err == nil {
 		t.Fatal("expected dial error")
 	}
 	if pool.AnyHealthy() {
@@ -473,7 +475,7 @@ func TestHealthCheckRemovesThenRejoins(t *testing.T) {
 	t.Cleanup(pool.Close)
 
 	// 先用一次真实拨号失败制造被动冷却（node1 fails=1 且处于冷却中）。
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	rec.setErr("node1.example.com:443", nil)
@@ -493,7 +495,7 @@ func TestHealthCheckRemovesThenRejoins(t *testing.T) {
 	}
 	before := rec.callsFor("node1.example.com:443")
 	for i := 0; i < 6; i++ {
-		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 			t.Fatalf("dial %d after removal: %v", i, err)
 		}
 	}
@@ -522,7 +524,7 @@ func TestHealthCheckRemovesThenRejoins(t *testing.T) {
 	before = rec.callsFor("node1.example.com:443")
 	used := false
 	for i := 0; i < 3; i++ {
-		if _, _, err := pool.Dial(context.Background(), "example.com", 443); err != nil {
+		if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); err != nil {
 			t.Fatalf("dial %d after rejoin: %v", i, err)
 		}
 		if rec.callsFor("node1.example.com:443") > before {
@@ -595,7 +597,7 @@ func TestHealthCheckAllRemovedFailsFast(t *testing.T) {
 			t.Fatalf("snapshot = %+v, want 全部摘除", snap)
 		}
 	}
-	if _, _, err := pool.Dial(context.Background(), "example.com", 443); !errors.Is(err, ErrNoHealthyNodes) {
+	if _, _, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443}); !errors.Is(err, ErrNoHealthyNodes) {
 		t.Fatalf("Dial error = %v, want ErrNoHealthyNodes", err)
 	}
 	for _, n := range testNodes() {

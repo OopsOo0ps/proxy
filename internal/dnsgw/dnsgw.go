@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
@@ -71,9 +72,9 @@ type LivePolicy interface {
 	ShutdownTimeout() time.Duration
 }
 
-// ProxyDialFunc 强制经出口节点建立 TCP 连接，返回连接与命中的节点标签
-// （用于日志的 upstream 字段）。
-type ProxyDialFunc func(ctx context.Context, host string, port uint16) (net.Conn, string, error)
+// ProxyDialer 强制经出口节点建立 TCP 连接的拨号能力（core.ProxyDialer）；
+// 返回的 core.Route 供日志的 upstream 字段使用，本包不再自造标签词汇。
+type ProxyDialer = core.ProxyDialer
 
 // Options 是 Server 构造参数。
 type Options struct {
@@ -90,8 +91,8 @@ type Options struct {
 	ResolvConfPath string
 	// Router 分流引擎（必填）。
 	Router RouteDecider
-	// ProxyDial 经出口节点的拨号函数（必填）。
-	ProxyDial ProxyDialFunc
+	// ProxyDialer 经出口节点的拨号能力（必填）。
+	ProxyDialer ProxyDialer
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
 	// Metrics 指标；可为 nil。
@@ -108,7 +109,7 @@ type Server struct {
 	local           []string
 	timeout         time.Duration
 	router          RouteDecider
-	proxyDial       ProxyDialFunc
+	proxyDialer     ProxyDialer
 	logger          *slog.Logger
 	metrics         *metrics.Metrics
 	shutdownTimeout time.Duration
@@ -121,14 +122,14 @@ func New(opts Options) (*Server, error) {
 	if opts.Router == nil {
 		return nil, errors.New("dnsgw: router is required")
 	}
-	if opts.ProxyDial == nil {
-		return nil, errors.New("dnsgw: proxy dial func is required")
+	if opts.ProxyDialer == nil {
+		return nil, errors.New("dnsgw: proxy dialer is required")
 	}
 	s := &Server{
 		remote:          opts.Remote,
 		timeout:         opts.Timeout,
 		router:          opts.Router,
-		proxyDial:       opts.ProxyDial,
+		proxyDialer:     opts.ProxyDialer,
 		logger:          opts.Logger,
 		metrics:         opts.Metrics,
 		shutdownTimeout: opts.ShutdownTimeout,
@@ -435,10 +436,11 @@ func (s *Server) queryRemote(ctx context.Context, q query) ([]byte, string, erro
 	ctx, cancel := context.WithTimeout(ctx, s.timeoutNow())
 	defer cancel()
 
-	conn, label, err := s.proxyDial(ctx, host, uint16(port))
+	conn, route, err := s.proxyDialer.DialProxy(ctx, core.Target{Host: host, Port: uint16(port)})
 	if err != nil {
 		return nil, "", fmt.Errorf("dial remote resolver %s via exit node: %w", remote, err)
 	}
+	label := route.Label()
 	defer func() { _ = conn.Close() }()
 	setDeadlineFromCtx(conn, ctx, s.timeoutNow())
 

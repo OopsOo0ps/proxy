@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
 
@@ -39,7 +40,7 @@ type Node struct {
 }
 
 // DialFunc 通过指定节点建立到目标的隧道连接。
-type DialFunc func(ctx context.Context, node Node, host string, port uint16) (net.Conn, error)
+type DialFunc func(ctx context.Context, node Node, t core.Target) (net.Conn, error)
 
 // ProbeFunc 对节点做一次轻量健康探测（如 TCP+TLS 握手），失败时返回错误。
 type ProbeFunc func(ctx context.Context, node Node) error
@@ -207,7 +208,7 @@ func (p *Pool) AnyHealthy() bool {
 // 立即停止后续尝试，在途尝试随上下文取消，最坏等待从「节点数 × 单节点超时」
 // 收敛为预算上限。因预算或调用方取消（而非节点自身错误）中断的尝试不计入
 // 被动失败，避免把健康节点误送入冷却。
-func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, Node, error) {
+func (p *Pool) Dial(ctx context.Context, t core.Target) (net.Conn, Node, error) {
 	candidates := p.candidates()
 	if len(candidates) == 0 {
 		return nil, Node{}, ErrNoHealthyNodes
@@ -224,7 +225,7 @@ func (p *Pool) Dial(ctx context.Context, host string, port uint16) (net.Conn, No
 			break
 		}
 		tried++
-		conn, err := p.dial(chainCtx, st.cfg, host, port)
+		conn, err := p.dial(chainCtx, st.cfg, t)
 		if err == nil {
 			p.markSuccess(st)
 			return conn, st.cfg, nil

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
@@ -47,7 +48,7 @@ func TestDialDirect(t *testing.T) {
 	host, port := splitAddr(t, ln.Addr().String())
 	d := New(Options{Router: engine(t, routing.Proxy, true)})
 
-	conn, route, err := d.DialTarget(context.Background(), host, port)
+	conn, route, err := d.DialTarget(context.Background(), core.Target{Host: host, Port: port})
 	if err != nil {
 		t.Fatalf("DialTarget: %v", err)
 	}
@@ -63,7 +64,7 @@ func TestDialDirect(t *testing.T) {
 func TestDialProxy(t *testing.T) {
 	pool, err := nodes.New(
 		[]nodes.Node{{Addr: "node1.example.com:443", Password: "p"}},
-		func(context.Context, nodes.Node, string, uint16) (net.Conn, error) { return nopConn{}, nil },
+		func(context.Context, nodes.Node, core.Target) (net.Conn, error) { return nopConn{}, nil },
 		nodes.Options{},
 	)
 	if err != nil {
@@ -71,7 +72,7 @@ func TestDialProxy(t *testing.T) {
 	}
 	d := New(Options{Router: engine(t, routing.Proxy, false), Pool: pool})
 
-	_, route, err := d.DialTarget(context.Background(), "example.com", 443)
+	_, route, err := d.DialTarget(context.Background(), core.Target{Host: "example.com", Port: 443})
 	if err != nil {
 		t.Fatalf("DialTarget: %v", err)
 	}
@@ -88,7 +89,7 @@ func TestDialProxy(t *testing.T) {
 
 func TestDialProxyWithoutNodesFails(t *testing.T) {
 	d := New(Options{Router: engine(t, routing.Proxy, false)})
-	_, route, err := d.DialTarget(context.Background(), "example.com", 443)
+	_, route, err := d.DialTarget(context.Background(), core.Target{Host: "example.com", Port: 443})
 	if !errors.Is(err, ErrNoNodes) {
 		t.Fatalf("err = %v, want ErrNoNodes", err)
 	}
@@ -104,12 +105,11 @@ func TestDialProxyWithoutNodesFails(t *testing.T) {
 // 走代理的目标域名必须原样交给出口节点（客户端不做本地解析），
 // 否则 DNS 污染 / 泄漏会重新出现在代理路径上。
 func TestDialProxyKeepsDomainUnresolved(t *testing.T) {
-	var gotHost string
-	var gotPort uint16
+	var gotTarget core.Target
 	pool, err := nodes.New(
 		[]nodes.Node{{Addr: "node1.example.com:443", Password: "p"}},
-		func(_ context.Context, _ nodes.Node, host string, port uint16) (net.Conn, error) {
-			gotHost, gotPort = host, port
+		func(_ context.Context, _ nodes.Node, t core.Target) (net.Conn, error) {
+			gotTarget = t
 			return nopConn{}, nil
 		},
 		nodes.Options{},
@@ -121,19 +121,18 @@ func TestDialProxyKeepsDomainUnresolved(t *testing.T) {
 
 	// 该名字在本机不可解析（.invalid 保留域）；只要出口拨号函数收到的是
 	// 原始域名而非解析结果，就证明客户端未做本地解析。
-	if _, _, err := d.DialProxy(context.Background(), "remote-only.invalid", 8443); err != nil {
+	if _, _, err := d.DialProxy(context.Background(), core.Target{Host: "remote-only.invalid", Port: 8443}); err != nil {
 		t.Fatalf("DialProxy: %v", err)
 	}
-	if gotHost != "remote-only.invalid" || gotPort != 8443 {
-		t.Fatalf("exit dial target = %s:%d, want remote-only.invalid:8443（不得本地解析）", gotHost, gotPort)
+	if gotTarget.Host != "remote-only.invalid" || gotTarget.Port != 8443 {
+		t.Fatalf("exit dial target = %s, want remote-only.invalid:8443（不得本地解析）", gotTarget)
 	}
 
-	gotHost, gotPort = "", 0
-	if _, _, err := d.DialTarget(context.Background(), "also-remote-only.invalid", 443); err != nil {
+	if _, _, err := d.DialTarget(context.Background(), core.Target{Host: "also-remote-only.invalid", Port: 443}); err != nil {
 		t.Fatalf("DialTarget: %v", err)
 	}
-	if gotHost != "also-remote-only.invalid" || gotPort != 443 {
-		t.Fatalf("exit dial target = %s:%d, want also-remote-only.invalid:443", gotHost, gotPort)
+	if gotTarget.Host != "also-remote-only.invalid" || gotTarget.Port != 443 {
+		t.Fatalf("exit dial target = %s, want also-remote-only.invalid:443", gotTarget)
 	}
 }
 
