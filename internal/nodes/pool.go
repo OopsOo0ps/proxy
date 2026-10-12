@@ -27,8 +27,31 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
+
+// 探测结果标签值：bool 结果的可读编码，供观测后端使用。
+const (
+	ProbeSuccess = "success"
+	ProbeFailure = "failure"
+)
+
+// Observer 是节点池的遥测出口；*metrics.Metrics 适配实现（L4 单点）。
+// 事件词汇（success/failure）随事件归属本包，Prometheus 编码归 metrics。
+type Observer interface {
+	// ProbeResult 记录一次主动健康探测结果。
+	ProbeResult(addr string, ok bool)
+	// HealthChanged 记录节点可接流量状态变化（healthy = false 表示已被摘除）。
+	HealthChanged(addr string, healthy bool)
+}
+
+// NopObserver 是 Options 的缺省遥测出口：全部方法为空操作，
+// 组件测试零构造、无需 registry。
+var NopObserver Observer = nopObserver{}
+
+type nopObserver struct{}
+
+func (nopObserver) ProbeResult(string, bool)   {}
+func (nopObserver) HealthChanged(string, bool) {}
 
 // Node 描述一个出口节点（Trojan over TLS）。
 // 运行时模型与配置模式解耦：由组装根从 config.Node 映射而来，
@@ -85,8 +108,8 @@ type Options struct {
 	OnRejoin func(addr string)
 	// Logger 记录摘除/加回与探测失败；可为 nil。
 	Logger *slog.Logger
-	// Metrics 记录探测次数与节点健康状态；可为 nil。
-	Metrics *metrics.Metrics
+	// Observer 是遥测出口；nil 时使用 NopObserver。
+	Observer Observer
 }
 
 // Pool 是并发安全的出口节点池。
@@ -143,6 +166,9 @@ func New(cfgs []Node, dial DialFunc, opts Options) (*Pool, error) {
 	}
 	if opts.FailoverBudget <= 0 {
 		opts.FailoverBudget = DefaultFailoverBudget
+	}
+	if opts.Observer == nil {
+		opts.Observer = NopObserver
 	}
 	if opts.Health.Interval > 0 {
 		if opts.Probe == nil {
@@ -333,7 +359,7 @@ func (p *Pool) StartHealthChecks(ctx context.Context) {
 	// 初始状态：全部节点视为可接流量（除非已因历史拨号处于冷却）。
 	now := p.opts.Now()
 	for _, st := range p.nodes {
-		p.opts.Metrics.SetUpstreamHealthy(st.cfg.Addr, !st.removed && !now.Before(st.unhealthyUntil))
+		p.opts.Observer.HealthChanged(st.cfg.Addr, !st.removed && !now.Before(st.unhealthyUntil))
 	}
 	p.mu.Unlock()
 
@@ -429,10 +455,10 @@ func (p *Pool) recordProbe(st *state, err error) {
 	}
 	p.mu.Unlock()
 
-	p.opts.Metrics.HealthProbe(st.cfg.Addr, ok)
+	p.opts.Observer.ProbeResult(st.cfg.Addr, ok)
 	switch {
 	case removedNow:
-		p.opts.Metrics.SetUpstreamHealthy(st.cfg.Addr, false)
+		p.opts.Observer.HealthChanged(st.cfg.Addr, false)
 		if l := p.opts.Logger; l != nil {
 			l.Warn("exit node removed by active health check",
 				"node", st.cfg.Addr, "consecutive_probe_failures", probeFails)
@@ -441,7 +467,7 @@ func (p *Pool) recordProbe(st *state, err error) {
 			p.opts.OnRemove(st.cfg.Addr)
 		}
 	case rejoinedNow:
-		p.opts.Metrics.SetUpstreamHealthy(st.cfg.Addr, true)
+		p.opts.Observer.HealthChanged(st.cfg.Addr, true)
 		if l := p.opts.Logger; l != nil {
 			l.Info("exit node rejoined after passing health checks", "node", st.cfg.Addr)
 		}

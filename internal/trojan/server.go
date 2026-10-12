@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
@@ -73,8 +73,8 @@ type Server struct {
 	ShutdownTimeout time.Duration
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
-	// Metrics 指标；可为 nil。
-	Metrics *metrics.Metrics
+	// Telemetry 是遥测出口；nil 时使用 core.NopTelemetry。
+	Telemetry core.Telemetry
 }
 
 // Serve 在 ln 上接受并处理隧道连接；ctx 取消后优雅关停：
@@ -130,12 +130,12 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	reqID := logging.NewRequestID()
 	logger := s.logger().With("request_id", reqID, "proto", "tunnel", "client_ip", netutil.RemoteIP(conn.RemoteAddr()))
 
-	s.Metrics.ConnOpened(metrics.ProtoTunnel)
-	defer s.Metrics.ConnClosed(metrics.ProtoTunnel)
+	s.telemetryNow().ConnOpened(core.ProtoTunnel)
+	defer s.telemetryNow().ConnClosed(core.ProtoTunnel)
 
-	result := metrics.ResultError
+	result := core.ResultError
 	defer func() {
-		s.Metrics.Observe(metrics.ProtoTunnel, metrics.RouteDirect, result, time.Since(start))
+		s.telemetryNow().RequestDone(core.ProtoTunnel, core.RouteDirect, result, time.Since(start))
 	}()
 
 	_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout()))
@@ -171,7 +171,7 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	user, ok := s.verifierNow().VerifyTunnel(req.PasswordHash)
 	if !ok {
 		logger.Warn("tunnel authentication failed")
-		result = metrics.ResultAuthFail
+		result = core.ResultAuthFail
 		s.serveDecoy(conn)
 		return
 	}
@@ -188,7 +188,7 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	if err != nil {
 		// 与官方行为一致：目标不可达时静默关闭，不做区分响应。
 		logger.Warn("dial target failed", "target", target, "error", err)
-		result = metrics.ResultDialFail
+		result = core.ResultDialFail
 		return
 	}
 	defer func() { _ = upstream.Close() }()
@@ -196,15 +196,15 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 	clientConn := relay.PrefixConn(conn, br)
 	stats, relayErr := relay.BiCopy(relayCtx, clientConn, upstream, s.idleTimeout())
-	result = metrics.ResultOK
+	result = core.ResultOK
 	if relay.IsFailure(relayErr) {
-		result = metrics.ResultError
+		result = core.ResultError
 	}
 	elapsed := time.Since(start)
 	attrs := []any{
 		"user", user,
 		"target", target,
-		"route", metrics.RouteDirect,
+		"route", core.RouteDirect,
 		"upstream", target,
 		"duration", elapsed.Round(time.Microsecond).String(),
 		"duration_ms", elapsed.Milliseconds(),
@@ -245,6 +245,14 @@ func (s *Server) logger() *slog.Logger {
 		return slog.New(slog.DiscardHandler)
 	}
 	return s.Logger
+}
+
+// telemetryNow 返回当前遥测出口；未配置时使用 Nop（组件测试零构造）。
+func (s *Server) telemetryNow() core.Telemetry {
+	if s.Telemetry == nil {
+		return core.NopTelemetry
+	}
+	return s.Telemetry
 }
 
 // verifierNow 返回当前生效的口令校验器：Live 存在时以热加载快照为准。

@@ -16,7 +16,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
@@ -67,8 +66,8 @@ type Server struct {
 	Live LivePolicy
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
-	// Metrics 指标；可为 nil。
-	Metrics *metrics.Metrics
+	// Telemetry 是遥测出口；nil 时使用 core.NopTelemetry。
+	Telemetry core.Telemetry
 	// HandshakeTimeout 握手超时；<=0 时使用 10s。
 	HandshakeTimeout time.Duration
 	// IdleTimeout 连接空闲回收；<=0 时使用 90s。
@@ -134,13 +133,13 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	reqID := logging.NewRequestID()
 	logger := s.logger().With("request_id", reqID, "proto", "socks5", "client_ip", netutil.RemoteIP(raw.RemoteAddr()))
 
-	s.Metrics.ConnOpened(metrics.ProtoSOCKS5)
-	defer s.Metrics.ConnClosed(metrics.ProtoSOCKS5)
+	s.telemetryNow().ConnOpened(core.ProtoSOCKS5)
+	defer s.telemetryNow().ConnClosed(core.ProtoSOCKS5)
 
-	result := metrics.ResultError
-	route := metrics.RouteNone
+	result := core.ResultError
+	route := core.RouteNone
 	defer func() {
-		s.Metrics.Observe(metrics.ProtoSOCKS5, route, result, time.Since(start))
+		s.telemetryNow().RequestDone(core.ProtoSOCKS5, route, result, time.Since(start))
 	}()
 
 	_ = raw.SetDeadline(time.Now().Add(s.handshakeTimeout()))
@@ -148,7 +147,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	br := bufio.NewReader(raw)
 	if err := s.negotiate(br, raw); err != nil {
 		if errors.Is(err, errAuthFailed) || errors.Is(err, errNoAcceptableMethod) {
-			result = metrics.ResultAuthFail
+			result = core.ResultAuthFail
 			logger.Warn("socks5 authentication failed", "error", err)
 		} else {
 			logger.Debug("socks5 handshake failed", "error", err)
@@ -178,7 +177,7 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	conn, r, err := s.dialerNow().DialTarget(ctx, core.Target{Host: host, Port: port})
 	route = r.Action.String()
 	if err != nil {
-		result = metrics.ResultDialFail
+		result = core.ResultDialFail
 		logger.Warn("dial target failed", "target", target, "error", err)
 		reply := byte(ReplyGeneralFailure)
 		if errors.Is(err, syscall.ECONNREFUSED) {
@@ -196,9 +195,9 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	_ = raw.SetDeadline(time.Time{})
 
 	stats, relayErr := relay.BiCopy(ctx, relay.PrefixConn(raw, br), conn, s.idleTimeout())
-	result = metrics.ResultOK
+	result = core.ResultOK
 	if relay.IsFailure(relayErr) {
-		result = metrics.ResultError
+		result = core.ResultError
 	}
 	elapsed := time.Since(start)
 	attrs := []any{
@@ -314,6 +313,14 @@ func (s *Server) logger() *slog.Logger {
 		return slog.New(slog.DiscardHandler)
 	}
 	return s.Logger
+}
+
+// telemetryNow 返回当前遥测出口；未配置时使用 Nop（组件测试零构造）。
+func (s *Server) telemetryNow() core.Telemetry {
+	if s.Telemetry == nil {
+		return core.NopTelemetry
+	}
+	return s.Telemetry
 }
 
 // authNow 返回当前生效的凭据校验能力：Live 存在时以热加载快照为准；

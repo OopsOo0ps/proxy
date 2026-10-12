@@ -22,9 +22,36 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
+
+// 刷新结果标签值：成功加载并生效 / 内容未变只刷新成功状态 / 失败。
+const (
+	RefreshSuccess   = "success"
+	RefreshUnchanged = "unchanged"
+	RefreshError     = "error"
+)
+
+// Observer 是规则源的遥测出口；*metrics.Metrics 适配实现（L4 单点）。
+// 事件词汇（success/unchanged/error）随事件归属本包，Prometheus 编码归 metrics。
+type Observer interface {
+	// Refresh 记录一次规则加载 / 刷新尝试（result 取值 RefreshSuccess / RefreshUnchanged / RefreshError）。
+	Refresh(result string)
+	// SetLastSuccess 记录最近一次成功加载的时间戳；零值忽略。
+	SetLastSuccess(t time.Time)
+	// SetRules 记录当前生效的规则条数。
+	SetRules(n int)
+}
+
+// NopObserver 是 Options 的缺省遥测出口：全部方法为空操作，
+// 组件测试零构造、无需 registry。
+var NopObserver Observer = nopObserver{}
+
+type nopObserver struct{}
+
+func (nopObserver) Refresh(string)           {}
+func (nopObserver) SetLastSuccess(time.Time) {}
+func (nopObserver) SetRules(int)             {}
 
 // SourceKind 标识规则来源类型。
 type SourceKind uint8
@@ -94,8 +121,8 @@ type Options struct {
 	PrivateDirect bool
 	// Logger 记录加载与刷新结果；nil 时静默。
 	Logger *slog.Logger
-	// Metrics 指标；可为 nil。
-	Metrics *metrics.Metrics
+	// Observer 是遥测出口；nil 时使用 NopObserver。
+	Observer Observer
 	// Now 注入时钟（测试用），默认 time.Now。
 	Now func() time.Time
 	// OnChange 在生效引擎发生切换后调用（规则内容变化或 UpdateOptions 变更参数，
@@ -138,7 +165,7 @@ type Provider struct {
 
 	fetch fetchConfig
 	log   *slog.Logger
-	m     *metrics.Metrics
+	obs   Observer
 	now   func() time.Time
 
 	onChange func()
@@ -167,11 +194,15 @@ func New(opts Options) (*Provider, error) {
 	if now == nil {
 		now = time.Now
 	}
+	obs := opts.Observer
+	if obs == nil {
+		obs = NopObserver
+	}
 	p := &Provider{
 		spec:     SpecOf(opts.FilePath, opts.URL, opts.RefreshInterval),
 		opts:     routing.Options{Default: opts.Default, PrivateDirect: opts.PrivateDirect},
 		log:      logger,
-		m:        opts.Metrics,
+		obs:      obs,
 		now:      now,
 		onChange: opts.OnChange,
 		fetch:    resolveFetchConfig(opts),
@@ -350,15 +381,15 @@ func (p *Provider) attempt(ctx context.Context) error {
 		p.lastErr = ""
 		successAt := p.lastSuccess
 		p.mu.Unlock()
-		p.m.RulesetRefresh(metrics.RulesetUnchanged)
-		p.m.SetRulesetLastSuccess(successAt)
+		p.obs.Refresh(RefreshUnchanged)
+		p.obs.SetLastSuccess(successAt)
 		return nil
 	}
 	engine, err := routing.NewEngine(rules, p.opts)
 	if err != nil {
 		p.lastErr = err.Error()
 		p.mu.Unlock()
-		p.m.RulesetRefresh(metrics.RulesetError)
+		p.obs.Refresh(RefreshError)
 		return err
 	}
 	p.rules = rules
@@ -373,9 +404,9 @@ func (p *Provider) attempt(ctx context.Context) error {
 	// 先让调用方失效路由相关缓存（如转发路径空闲连接），再记录指标：
 	// 外部观察到 success 计数时，缓存失效已完成。
 	p.notifyChange()
-	p.m.RulesetRefresh(metrics.RulesetSuccess)
-	p.m.SetRulesetLastSuccess(successAt)
-	p.m.SetRulesetRules(count)
+	p.obs.Refresh(RefreshSuccess)
+	p.obs.SetLastSuccess(successAt)
+	p.obs.SetRules(count)
 	return nil
 }
 
@@ -386,12 +417,12 @@ func (p *Provider) notifyChange() {
 	}
 }
 
-// recordError 记录一次失败的读取 / 拉取（状态 + 指标）。
+// recordError 记录一次失败的读取 / 拉取（状态 + 遥测）。
 func (p *Provider) recordError(err error) {
 	p.mu.Lock()
 	p.lastErr = err.Error()
 	p.mu.Unlock()
-	p.m.RulesetRefresh(metrics.RulesetError)
+	p.obs.Refresh(RefreshError)
 }
 
 // read 读取规则源原始内容：本地文件直读，远程 URL 走 HTTP 拉取。

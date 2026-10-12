@@ -21,30 +21,24 @@ const wildcard = "*"
 // 阶段 1 落位：入站三包（httpproxy / socks5 / dnsgw）只经 core 契约触达
 // 出站能力；nodes / connpool 保持协议无关（不碰 trojan）且不反向依赖 config；
 // core 是只依赖 routing 的纯契约层。
+// 阶段 2 落位：遥测解耦完成——组件经各自的 Observer 窄接口发出领域事件，
+// Prometheus 编码收敛到 metrics（L4 适配层）；L4 以下（含传递依赖）禁止
+// import metrics，无需暂缓名单，全部为硬约束（core 的 wildcard 已覆盖）。
 var forbidden = map[string][]string{
 	"internal/httpproxy": {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
 	"internal/socks5":    {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
 	"internal/dnsgw":     {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
 	"internal/nodes":     {"metrics", "config", "trojan"},
 	"internal/connpool":  {"metrics", "config", "trojan", "nodes"},
+	"internal/trojan":    {"metrics"},
+	"internal/ruleset":   {"metrics"},
+	"internal/dialer":    {"metrics"},
 	"internal/core":      {wildcard},
 }
 
 // allowAny 是 wildcard 规则的例外名单：键为包，值为其仍允许依赖的 internal 包。
 var allowAny = map[string][]string{
 	"internal/core": {"routing"}, // routing.Action 是共享词汇（L0 纯叶子包）
-}
-
-// stage2Deferred 列出暂缓断言的 (包, 禁止项)：这些包当前仍直接消费
-// *metrics.Metrics（字段注入的运行期指标），等遥测解耦（设计文档阶段 2，
-// Observer 接口落地、L2/L3 删除 metrics import）完成后从本表移除并强制。
-// 每个条目必须同时出现在 forbidden 中（见 TestDeferredRulesAreGoverned）。
-var stage2Deferred = map[string][]string{
-	"internal/httpproxy": {"metrics"},
-	"internal/socks5":    {"metrics"},
-	"internal/dnsgw":     {"metrics"},
-	"internal/nodes":     {"metrics"},
-	"internal/connpool":  {"metrics"},
 }
 
 // TestDependencyDirection 对矩阵中的每个包执行 go list -deps 并断言
@@ -57,14 +51,13 @@ func TestDependencyDirection(t *testing.T) {
 	for pkg, rules := range forbidden {
 		t.Run(pkg, func(t *testing.T) {
 			allow := allowAny[pkg]
-			deferred := stage2Deferred[pkg]
 			self := strings.TrimPrefix(pkg, "internal/")
 			deps := internalDeps(t, root, module, pkg)
 
 			var violations []string
 			for _, dep := range deps {
 				switch {
-				case dep == self, slices.Contains(allow, dep), slices.Contains(deferred, dep):
+				case dep == self, slices.Contains(allow, dep):
 					continue
 				case slices.Contains(rules, dep) || slices.Contains(rules, wildcard):
 					violations = append(violations, dep)
@@ -84,19 +77,6 @@ func TestDependencyDirection(t *testing.T) {
 			}
 			t.Fatal(b.String())
 		})
-	}
-}
-
-// TestDeferredRulesAreGoverned 保证暂缓名单没有游离于矩阵之外：暂缓条目
-// 必须同时出现在 forbidden 里，否则它从未被治理——阶段 2 移除暂缓时会
-// 静默漏掉本应生效的规则。
-func TestDeferredRulesAreGoverned(t *testing.T) {
-	for pkg, rules := range stage2Deferred {
-		for _, dep := range rules {
-			if !slices.Contains(forbidden[pkg], dep) {
-				t.Errorf("%s defers %q, but forbidden[%s] does not list it", pkg, dep, pkg)
-			}
-		}
 	}
 }
 

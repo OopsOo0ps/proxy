@@ -16,6 +16,7 @@ import (
 	"context"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
@@ -85,3 +86,55 @@ type ProxyDialer interface {
 type Authenticator interface {
 	Verify(username, password string) bool
 }
+
+// —— 会话遥测词汇 ——
+
+// proto 标签值：RequestDone / Conn* 事件来自哪个会话服务组件。
+const (
+	// ProtoHTTP 是 HTTP 代理入站。
+	ProtoHTTP = "http"
+	// ProtoSOCKS5 是 SOCKS5 入站。
+	ProtoSOCKS5 = "socks5"
+	// ProtoTunnel 是 Trojan 隧道（服务端）。
+	ProtoTunnel = "tunnel"
+)
+
+// route 标签值：请求实际走过的路径（与 routing.Action 的字符串写法一致；
+// RouteNone 表示尚未形成路由决策即终止——认证失败、目标解析失败等）。
+const (
+	RouteDirect = "direct"
+	RouteProxy  = "proxy"
+	RouteNone   = "none"
+)
+
+// result 标签值：请求结果。
+const (
+	ResultOK       = "ok"
+	ResultAuthFail = "auth_fail"
+	ResultDialFail = "dial_fail"
+	ResultError    = "error"
+)
+
+// Telemetry 是会话服务组件（httpproxy / socks5 / trojan 服务端）的遥测出口；
+// *metrics.Metrics 适配实现（L4 单点）。标签词汇见上方 Proto* / Route* /
+// Result* 常量——事件词汇随契约归 core，Prometheus 编码归 metrics。
+type Telemetry interface {
+	// RequestDone 记录一次完成的请求（含失败），并观察其耗时。
+	RequestDone(proto, route, result string, d time.Duration)
+	// ConnOpened / ConnClosed 记录一个活跃连接的开始与结束。
+	ConnOpened(proto string)
+	ConnClosed(proto string)
+	// ConnRejected 记录一次因超过连接上限被拒绝的连接。
+	ConnRejected(proto string)
+}
+
+// NopTelemetry 是组件 Options 的缺省遥测出口：全部方法为空操作，
+// 组件测试零构造、无需 registry，nil 接口判断不再需要。
+var NopTelemetry Telemetry = nopTelemetry{}
+
+type nopTelemetry struct{}
+
+func (nopTelemetry) RequestDone(string, string, string, time.Duration) {}
+func (nopTelemetry) ConnOpened(string)                                 {}
+func (nopTelemetry) ConnClosed(string)                                 {}
+func (nopTelemetry) ConnRejected(string)                               {}

@@ -28,8 +28,35 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
-	"github.com/OopsOo0ps/proxy/internal/metrics"
 )
+
+// 领取结果标签值：命中 / 池内无可用连接 / 池内连接已失效。
+const (
+	ClaimHit   = "hit"
+	ClaimMiss  = "miss"
+	ClaimStale = "stale"
+)
+
+// Observer 是连接池的遥测出口；*metrics.Metrics 适配实现（L4 单点）。
+// 事件词汇（hit/miss/stale）随事件归属本包，Prometheus 编码归 metrics。
+type Observer interface {
+	// ClaimResult 记录一次空闲连接领取结果（result 取值 ClaimHit / ClaimMiss / ClaimStale）。
+	ClaimResult(node, result string)
+	// IdleSet 记录某节点当前的预热空闲连接数。
+	IdleSet(node string, n int)
+	// WarmFailed 记录一次后台预热拨号失败。
+	WarmFailed(node string)
+}
+
+// NopObserver 是 Options 的缺省遥测出口：全部方法为空操作，
+// 组件测试零构造、无需 registry。
+var NopObserver Observer = nopObserver{}
+
+type nopObserver struct{}
+
+func (nopObserver) ClaimResult(string, string) {}
+func (nopObserver) IdleSet(string, int)        {}
+func (nopObserver) WarmFailed(string)          {}
 
 // Node 描述一个可预热的上游节点。
 type Node struct {
@@ -52,8 +79,8 @@ type Options struct {
 	Now func() time.Time
 	// Logger 记录预热失败等调试信息；nil 时静默。
 	Logger *slog.Logger
-	// Metrics 指标；可为 nil。
-	Metrics *metrics.Metrics
+	// Observer 是遥测出口；nil 时使用 NopObserver。
+	Observer Observer
 }
 
 // Pool 是并发安全的预热连接池。
@@ -96,6 +123,9 @@ func New(nodes []Node, opts Options) (*Pool, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.Observer == nil {
+		opts.Observer = NopObserver
+	}
 	p := &Pool{opts: opts, nodes: make(map[string]*nodeState, len(nodes))}
 	for i, n := range nodes {
 		if n.Addr == "" {
@@ -113,7 +143,7 @@ func New(nodes []Node, opts Options) (*Pool, error) {
 	}
 	// 为每个节点预创建空闲数指标序列，使 /metrics 在预热完成前也能看到它们。
 	for _, st := range p.order {
-		opts.Metrics.SetPoolIdle(st.spec.Addr, 0)
+		p.opts.Observer.IdleSet(st.spec.Addr, 0)
 	}
 	return p, nil
 }
@@ -171,7 +201,7 @@ func (p *Pool) Close() {
 			conns = append(conns, ic.conn)
 		}
 		st.idle = nil
-		p.opts.Metrics.SetPoolIdle(st.spec.Addr, 0)
+		p.opts.Observer.IdleSet(st.spec.Addr, 0)
 	}
 	p.mu.Unlock()
 
@@ -202,29 +232,29 @@ func (p *Pool) Claim(ctx context.Context, addr string, t core.Target) (net.Conn,
 	for {
 		ic := p.popNewest(st)
 		if ic == nil {
-			p.opts.Metrics.PoolClaim(metrics.PoolClaimMiss, addr)
+			p.opts.Observer.ClaimResult(addr, ClaimMiss)
 			p.refill(st)
 			return nil, false
 		}
 		if !p.fresh(ic) {
 			// 超过 IdleTTL：直接淘汰，不再尝试复用。
 			_ = ic.conn.Close()
-			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)
+			p.opts.Observer.ClaimResult(addr, ClaimStale)
 			continue
 		}
 		if err := probeAlive(ic.conn); err != nil {
 			p.debug("idle connection failed liveness probe", addr, err)
 			_ = ic.conn.Close()
-			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)
+			p.opts.Observer.ClaimResult(addr, ClaimStale)
 			continue
 		}
 		if err := st.spec.Start(ctx, ic.conn, t); err != nil {
 			p.debug("failed to start trojan request on idle connection", addr, err)
 			_ = ic.conn.Close()
-			p.opts.Metrics.PoolClaim(metrics.PoolClaimStale, addr)
+			p.opts.Observer.ClaimResult(addr, ClaimStale)
 			continue
 		}
-		p.opts.Metrics.PoolClaim(metrics.PoolClaimHit, addr)
+		p.opts.Observer.ClaimResult(addr, ClaimHit)
 		p.refill(st)
 		return ic.conn, true
 	}
@@ -265,7 +295,7 @@ func (p *Pool) DropNode(addr string) {
 	st.idle = nil
 	p.mu.Unlock()
 
-	p.opts.Metrics.SetPoolIdle(addr, 0)
+	p.opts.Observer.IdleSet(addr, 0)
 	for _, c := range conns {
 		_ = c.Close()
 	}
@@ -284,7 +314,7 @@ func (p *Pool) popNewest(st *nodeState) *idleConn {
 	st.idle = st.idle[:last]
 	idle := len(st.idle)
 	p.mu.Unlock()
-	p.opts.Metrics.SetPoolIdle(st.spec.Addr, idle)
+	p.opts.Observer.IdleSet(st.spec.Addr, idle)
 	return ic
 }
 
@@ -344,11 +374,11 @@ func (p *Pool) warmDone(st *nodeState, conn net.Conn, err error) {
 		return
 	}
 	if err != nil {
-		p.opts.Metrics.PoolWarmFailed(st.spec.Addr)
+		p.opts.Observer.WarmFailed(st.spec.Addr)
 		p.debug("warm dial failed", st.spec.Addr, err)
 		return
 	}
-	p.opts.Metrics.SetPoolIdle(st.spec.Addr, idle)
+	p.opts.Observer.IdleSet(st.spec.Addr, idle)
 }
 
 // cleanLoop 周期清理超时空闲连接。
@@ -382,7 +412,7 @@ func (p *Pool) prune() {
 		}
 		clear(st.idle[len(kept):])
 		st.idle = kept
-		p.opts.Metrics.SetPoolIdle(st.spec.Addr, len(kept))
+		p.opts.Observer.IdleSet(st.spec.Addr, len(kept))
 	}
 	p.mu.Unlock()
 

@@ -1,4 +1,6 @@
-// Package metrics 提供 Prometheus 指标：请求计数、耗时、活跃连接与上游连接池。
+// Package metrics 是全部组件遥测的单点 Prometheus 适配层（L4）：
+// 组件定义各自的 Observer 窄接口并发出领域事件（词汇常量随事件归属组件
+// 与 core 契约），本包把它们编码为指标。
 //
 // 核心指标名与需求 1.7 / 2.3 一致：
 //   - requests_total（counter，标签 proto/route/result）
@@ -22,58 +24,30 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/connpool"
+	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/dnsgw"
+	"github.com/OopsOo0ps/proxy/internal/nodes"
+	"github.com/OopsOo0ps/proxy/internal/ruleset"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// 协议标签值。
-const (
-	ProtoHTTP   = "http"
-	ProtoSOCKS5 = "socks5"
-	ProtoTunnel = "tunnel"
-)
-
-// 路由标签值。
-const (
-	RouteDirect = "direct"
-	RouteProxy  = "proxy"
-	RouteNone   = "none"
-)
-
-// 结果标签值。
-const (
-	ResultOK       = "ok"
-	ResultAuthFail = "auth_fail"
-	ResultDialFail = "dial_fail"
-	ResultError    = "error"
-	// ResultInvalid：DNS 网关拒绝/丢弃的非法查询（未转发给任何上游）。
-	ResultInvalid = "invalid"
-)
-
-// 连接池领取结果标签值：命中 / 池内无可用连接 / 池内连接已失效。
-const (
-	PoolClaimHit   = "hit"
-	PoolClaimMiss  = "miss"
-	PoolClaimStale = "stale"
-)
-
-// 主动健康探测结果标签值。
-const (
-	ProbeSuccess = "success"
-	ProbeFailure = "failure"
-)
-
-// 配置热加载结果标签值。
+// 配置热加载结果标签值（ConfigReload 事件归属组装根本包层级，词汇随事件
+// 留在 metrics；其余事件词汇见各组件包与 core）。
 const (
 	ReloadSuccess = "success"
 	ReloadError   = "error"
 )
 
-// 规则集加载/刷新结果标签值。
-const (
-	RulesetSuccess   = "success"
-	RulesetUnchanged = "unchanged"
-	RulesetError     = "error"
+// 编译期断言：*Metrics 满足全部组件 Observer 契约（唯一 Prometheus 适配点）。
+// 换观测后端 = 写一个新适配器，L0–L3 组件零改动。
+var (
+	_ core.Telemetry    = (*Metrics)(nil)
+	_ dnsgw.DNSObserver = (*Metrics)(nil)
+	_ nodes.Observer    = (*Metrics)(nil)
+	_ connpool.Observer = (*Metrics)(nil)
+	_ ruleset.Observer  = (*Metrics)(nil)
 )
 
 // Metrics 聚合全部指标。请使用 New 构造；方法对 nil 接收者安全（no-op），
@@ -173,28 +147,28 @@ func New() *Metrics {
 // preInitialize 预创建常用标签组合，保证 /metrics 在启动后（无流量时）
 // 也能暴露 requests_total / request_duration_seconds / active_connections。
 func (m *Metrics) preInitialize() {
-	for _, proto := range []string{ProtoHTTP, ProtoSOCKS5, ProtoTunnel} {
+	for _, proto := range []string{core.ProtoHTTP, core.ProtoSOCKS5, core.ProtoTunnel} {
 		m.active.WithLabelValues(proto)
 		m.rejected.WithLabelValues(proto)
-		for _, route := range []string{RouteDirect, RouteProxy, RouteNone} {
+		for _, route := range []string{core.RouteDirect, core.RouteProxy, core.RouteNone} {
 			m.duration.WithLabelValues(proto, route)
-			for _, result := range []string{ResultOK, ResultAuthFail, ResultDialFail, ResultError} {
+			for _, result := range []string{core.ResultOK, core.ResultAuthFail, core.ResultDialFail, core.ResultError} {
 				m.requests.WithLabelValues(proto, route, result)
 			}
 		}
 	}
-	for _, route := range []string{RouteDirect, RouteProxy, RouteNone} {
-		for _, result := range []string{ResultOK, ResultError, ResultInvalid} {
+	for _, route := range []string{core.RouteDirect, core.RouteProxy, core.RouteNone} {
+		for _, result := range []string{core.ResultOK, core.ResultError, dnsgw.ResultInvalid} {
 			m.dnsQueries.WithLabelValues(route, result)
 		}
 	}
-	for _, route := range []string{RouteDirect, RouteProxy} {
+	for _, route := range []string{core.RouteDirect, core.RouteProxy} {
 		m.dnsDuration.WithLabelValues(route)
 	}
 	for _, result := range []string{ReloadSuccess, ReloadError} {
 		m.configReloads.WithLabelValues(result)
 	}
-	for _, result := range []string{RulesetSuccess, RulesetUnchanged, RulesetError} {
+	for _, result := range []string{ruleset.RefreshSuccess, ruleset.RefreshUnchanged, ruleset.RefreshError} {
 		m.rulesetRefreshes.WithLabelValues(result)
 	}
 }
@@ -233,8 +207,11 @@ func (m *Metrics) ActiveByProto() map[string]int64 {
 	return out
 }
 
-// Observe 记录一次完成的请求（含失败），并观察其耗时。
-func (m *Metrics) Observe(proto, route, result string, d time.Duration) {
+// —— core.Telemetry 适配（httpproxy / socks5 / trojan 服务端） ——
+
+// RequestDone 记录一次完成的请求（含失败），并观察其耗时。
+// proto/route/result 取 core 的遥测词汇常量。
+func (m *Metrics) RequestDone(proto, route, result string, d time.Duration) {
 	if m == nil {
 		return
 	}
@@ -258,44 +235,45 @@ func (m *Metrics) ConnClosed(proto string) {
 	m.active.WithLabelValues(proto).Dec()
 }
 
-// PoolClaim 记录一次空闲连接领取结果（hit / miss / stale）。
-func (m *Metrics) PoolClaim(result, node string) {
+// ConnRejected 记录一次因超过连接上限被拒绝的连接。
+func (m *Metrics) ConnRejected(proto string) {
 	if m == nil {
 		return
 	}
-	m.poolClaims.WithLabelValues(node, result).Inc()
+	m.rejected.WithLabelValues(proto).Inc()
 }
 
-// SetPoolIdle 记录某出口节点当前的预热空闲连接数。
-func (m *Metrics) SetPoolIdle(node string, n int) {
+// —— dnsgw.DNSObserver 适配 ——
+
+// QueryDone 记录一次 DNS 网关查询（含失败与被拒绝的非法查询）。
+// route 取 core 的遥测词汇（direct / proxy / none）；耗时直方图只按
+// 实际转发路径统计。
+func (m *Metrics) QueryDone(route, result string, d time.Duration) {
 	if m == nil {
 		return
 	}
-	m.poolIdle.WithLabelValues(node).Set(float64(n))
+	m.dnsQueries.WithLabelValues(route, result).Inc()
+	if route == core.RouteDirect || route == core.RouteProxy {
+		m.dnsDuration.WithLabelValues(route).Observe(d.Seconds())
+	}
 }
 
-// PoolWarmFailed 记录一次后台预热拨号失败。
-func (m *Metrics) PoolWarmFailed(node string) {
-	if m == nil {
-		return
-	}
-	m.poolWarmFails.WithLabelValues(node).Inc()
-}
+// —— nodes.Observer 适配 ——
 
-// HealthProbe 记录一次主动健康探测结果（ok 为 true 表示成功）。
-func (m *Metrics) HealthProbe(node string, ok bool) {
+// ProbeResult 记录一次主动健康探测结果（ok 为 true 表示成功）。
+func (m *Metrics) ProbeResult(node string, ok bool) {
 	if m == nil {
 		return
 	}
-	result := ProbeFailure
+	result := nodes.ProbeFailure
 	if ok {
-		result = ProbeSuccess
+		result = nodes.ProbeSuccess
 	}
 	m.healthProbes.WithLabelValues(node, result).Inc()
 }
 
-// SetUpstreamHealthy 记录节点当前是否可接流量（1 = 可接，0 = 已被主动摘除）。
-func (m *Metrics) SetUpstreamHealthy(node string, healthy bool) {
+// HealthChanged 记录节点当前是否可接流量（1 = 可接，0 = 已被主动摘除）。
+func (m *Metrics) HealthChanged(node string, healthy bool) {
 	if m == nil {
 		return
 	}
@@ -306,54 +284,64 @@ func (m *Metrics) SetUpstreamHealthy(node string, healthy bool) {
 	m.upstreamAlive.WithLabelValues(node).Set(v)
 }
 
-// ConnRejected 记录一次因超过连接上限被拒绝的连接。
-func (m *Metrics) ConnRejected(proto string) {
+// —— connpool.Observer 适配 ——
+
+// ClaimResult 记录一次空闲连接领取结果（result 取 connpool 的 Claim* 词汇）。
+func (m *Metrics) ClaimResult(node, result string) {
 	if m == nil {
 		return
 	}
-	m.rejected.WithLabelValues(proto).Inc()
+	m.poolClaims.WithLabelValues(node, result).Inc()
 }
 
-// ObserveDNS 记录一次 DNS 网关查询（含失败与被拒绝的非法查询）。
-// route 取值 direct / proxy / none；耗时直方图只按实际转发路径统计。
-func (m *Metrics) ObserveDNS(route, result string, d time.Duration) {
+// IdleSet 记录某出口节点当前的预热空闲连接数。
+func (m *Metrics) IdleSet(node string, n int) {
 	if m == nil {
 		return
 	}
-	m.dnsQueries.WithLabelValues(route, result).Inc()
-	if route == RouteDirect || route == RouteProxy {
-		m.dnsDuration.WithLabelValues(route).Observe(d.Seconds())
-	}
+	m.poolIdle.WithLabelValues(node).Set(float64(n))
 }
 
-// ConfigReload 记录一次配置热加载尝试（result 取值 success / error）。
-func (m *Metrics) ConfigReload(result string) {
+// WarmFailed 记录一次后台预热拨号失败。
+func (m *Metrics) WarmFailed(node string) {
 	if m == nil {
 		return
 	}
-	m.configReloads.WithLabelValues(result).Inc()
+	m.poolWarmFails.WithLabelValues(node).Inc()
 }
 
-// RulesetRefresh 记录一次规则集加载 / 刷新尝试（result 取值 success / unchanged / error）。
-func (m *Metrics) RulesetRefresh(result string) {
+// —— ruleset.Observer 适配 ——
+
+// Refresh 记录一次规则集加载 / 刷新尝试（result 取 ruleset 的 Refresh* 词汇）。
+func (m *Metrics) Refresh(result string) {
 	if m == nil {
 		return
 	}
 	m.rulesetRefreshes.WithLabelValues(result).Inc()
 }
 
-// SetRulesetLastSuccess 记录最近一次成功加载规则的时间戳（Unix 秒）；零值忽略。
-func (m *Metrics) SetRulesetLastSuccess(t time.Time) {
+// SetLastSuccess 记录最近一次成功加载规则的时间戳（Unix 秒）；零值忽略。
+func (m *Metrics) SetLastSuccess(t time.Time) {
 	if m == nil || t.IsZero() {
 		return
 	}
 	m.rulesetLastSuccess.Set(float64(t.Unix()))
 }
 
-// SetRulesetRules 记录当前生效的规则条数。
-func (m *Metrics) SetRulesetRules(n int) {
+// SetRules 记录当前生效的规则条数。
+func (m *Metrics) SetRules(n int) {
 	if m == nil {
 		return
 	}
 	m.rulesetRules.Set(float64(n))
+}
+
+// —— 组装根直接使用（不经过 Observer 契约） ——
+
+// ConfigReload 记录一次配置热加载尝试（result 取值 ReloadSuccess / ReloadError）。
+func (m *Metrics) ConfigReload(result string) {
+	if m == nil {
+		return
+	}
+	m.configReloads.WithLabelValues(result).Inc()
 }

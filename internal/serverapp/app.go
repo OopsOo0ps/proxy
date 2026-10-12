@@ -19,6 +19,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
@@ -127,8 +128,8 @@ func New(cfg *config.Server, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 			dialer := &net.Dialer{Timeout: app.policy.load().cfg.Timeouts.Dial.Std()}
 			return dialer.DialContext(ctx, "tcp", addr)
 		},
-		Logger:  logger,
-		Metrics: app.metrics,
+		Logger:    logger,
+		Telemetry: app.metrics,
 	}
 	return app, nil
 }
@@ -141,7 +142,7 @@ func (a *App) Listen() error {
 		return fmt.Errorf("serverapp: listen %s: %w", cfg.Listen, err)
 	}
 	ln = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
-		a.metrics.ConnRejected(metrics.ProtoTunnel)
+		a.metrics.ConnRejected(core.ProtoTunnel)
 		a.logTunnelReject(conn)
 		_ = conn.Close()
 	})
@@ -340,7 +341,7 @@ func (a *App) buildRuntime(cfg *config.Server) (*serverRuntime, error) {
 
 // runtimeStats 组装 /stats 快照：隧道活跃连接数。
 func (a *App) runtimeStats() status.Runtime {
-	tunnel := a.metrics.ActiveByProto()[metrics.ProtoTunnel]
+	tunnel := a.metrics.ActiveByProto()[core.ProtoTunnel]
 	rt := status.Runtime{
 		Connections: status.Connections{Tunnel: tunnel, Total: tunnel},
 	}
