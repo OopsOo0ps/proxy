@@ -303,7 +303,7 @@ func scanExportedInterfaces(t *testing.T, root string) []string {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", ".bin", "bin", "var", "testdata":
+			case ".git", ".bin", ".gocache", ".gopath", "bin", "var", "testdata":
 				return filepath.SkipDir
 			}
 			return nil
@@ -397,7 +397,7 @@ func seedTestCacheInputs(t *testing.T, root string) {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", ".bin", "bin", "var", "testdata":
+			case ".git", ".bin", ".gocache", ".gopath", "bin", "var", "testdata":
 				return filepath.SkipDir
 			}
 			return nil
