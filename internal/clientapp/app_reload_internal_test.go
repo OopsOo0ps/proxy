@@ -1,8 +1,13 @@
 package clientapp
 
 import (
+	"context"
+	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -11,6 +16,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/config"
+	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"gopkg.in/yaml.v3"
@@ -283,5 +289,179 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 	rt3 := app.live.Load()
 	if rt3.pool == rt2.pool {
 		t.Fatal("上游变更必须重建节点池（指纹应变化）")
+	}
+}
+
+// —— switchTo 阶段绑定失败 → 回滚（restore）路径 ——
+
+// rollbackCfg 构造显式端口的 HTTP 入站配置（回滚重绑按显式地址恢复原端口）：
+// 无出口节点，私网直连保持缺省开启——环回目标经代理可直达本地 httptest 站点。
+func rollbackCfg(httpListen string) *config.Config {
+	return &config.Config{
+		Inbounds: []config.Inbound{{Type: config.TypeHTTP, Listen: httpListen}},
+		Routing:  &config.Routing{},
+		Timeouts: config.Timeouts{
+			Dial:      config.Duration(3 * time.Second),
+			Handshake: config.Duration(3 * time.Second),
+			Idle:      config.Duration(30 * time.Second),
+			Shutdown:  config.Duration(3 * time.Second),
+		},
+	}
+}
+
+// freeLoopbackAddr 返回一个当前空闲的环回地址（探测监听随即释放）。
+func freeLoopbackAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return addr
+}
+
+// holdLoopbackListener 绑定并持有占用一个环回地址的监听（制造绑定冲突，
+// 由测试全程持有，不依赖竞态窗口）。
+func holdLoopbackListener(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return ln.Addr().String()
+}
+
+// startServingApp 启动 Serve 循环并等待其上线（serving 置位：此后 Reload
+// 失败时 restore 会以新代际恢复服务）。返回 Serve 的退出错误通道。
+func startServingApp(t *testing.T, app *App) <-chan error {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	exited := make(chan struct{})
+	go func() {
+		served <- app.Serve(ctx)
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for !app.serving.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("app did not start serving")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return served
+}
+
+// proxyGet 经 HTTP 代理入站以绝对地址 GET 请求 target。
+func proxyGet(t *testing.T, proxyAddr, target string) *http.Response {
+	t.Helper()
+	u, err := url.Parse("http://" + proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
+	resp, err := client.Get(target)
+	if err != nil {
+		t.Fatalf("GET via proxy: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// TestReloadSwitchBindFailureRollsBackOldListeners 验证回滚成功路径：
+// 新配置的入站监听与测试持有的端口冲突 → switchTo 绑新失败 → restore 重建
+// 旧监听：旧端点仍正常服务、Reload 返回错误、运行时未切换。
+func TestReloadSwitchBindFailureRollsBackOldListeners(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("rollback-ok"))
+	}))
+	t.Cleanup(target.Close)
+
+	oldAddr := freeLoopbackAddr(t)
+	cfg := rollbackCfg(oldAddr)
+	app, err := New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := startServingApp(t, app)
+
+	// 切换阶段绑定失败：新监听端口被测试全程持有（确定性冲突）。
+	next := rollbackCfg(holdLoopbackListener(t))
+	if err := app.Reload(next); err == nil {
+		t.Fatal("reload with conflicting listener must fail")
+	} else if !strings.Contains(err.Error(), "bind new configuration") {
+		t.Fatalf("reload error should report the switch-stage bind failure: %v", err)
+	}
+
+	// 旧监听被恢复：地址不变，运行时未切换（cfg 指针一致）。
+	if got := app.HTTPAddr(); got != oldAddr {
+		t.Fatalf("old listener not restored: addr = %q, want %q", got, oldAddr)
+	}
+	if rt := app.live.Load(); rt.cfg != cfg {
+		t.Fatal("runtime switched despite failed reload")
+	}
+
+	// Serve 未被一次回滚成功的失败重载终止。
+	select {
+	case err := <-served:
+		t.Fatalf("Serve exited on a rolled-back reload: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// 旧端点仍正常服务：经代理请求环回目标（私网直连，无需出口节点）。
+	resp := proxyGet(t, app.HTTPAddr(), target.URL)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "rollback-ok" {
+		t.Fatalf("old endpoint after rollback: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+// TestReloadRollbackFailureFailsClosed 验证回滚失败 → fail-closed：
+// 注入 restore 的绑定失败（旧监听无法重建）后，Reload 返回错误且 Serve
+// 退出并上报该错误——进程不以零监听状态静默存活，交由进程管理器重启。
+// 构造方式：bind 闭包只被重载重绑路径调用，正常运行不经它，因此把旧运行时
+// 入站的 bind 换成必定失败的实现即可确定性地令 restore 失败（无竞态窗口）。
+func TestReloadRollbackFailureFailsClosed(t *testing.T) {
+	cfg := rollbackCfg(freeLoopbackAddr(t))
+	app, err := New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := startServingApp(t, app)
+
+	// 注入点：旧运行时入站的重绑闭包直接失败。
+	cur := app.live.Load()
+	cur.Inbounds[0].bind = func(*connlimit.Limiter, string) (inboundBound, error) {
+		return inboundBound{}, errors.New("injected: restore bind failure")
+	}
+
+	// 绑新同样失败（端口被测试持有）：进入 restore，而 restore 注入失败。
+	next := rollbackCfg(holdLoopbackListener(t))
+	if err := app.Reload(next); err == nil || !strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("reload must report the rollback failure: %v", err)
+	}
+
+	// fail-closed：Serve 退出且错误上报（fail → appCancel → firstErr）。
+	select {
+	case serr := <-served:
+		if serr == nil || !strings.Contains(serr.Error(), "rollback") {
+			t.Fatalf("Serve error should surface the rollback failure: %v", serr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not exit after failed rollback; process would linger with zero listeners")
 	}
 }

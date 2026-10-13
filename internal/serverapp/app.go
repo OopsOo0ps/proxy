@@ -704,6 +704,9 @@ func (a *App) switchTo(cur, next *Runtime) error {
 		next.closeListeners()
 		if rerr := a.restore(cur); rerr != nil {
 			a.b.logger.Error("reload rollback failed; previous listeners could not be rebound", "error", rerr)
+			// Fail-closed：与 clientapp 相同——零监听存活是不可服务状态，
+			// 记录首个致命错误并触发应用级关停，Serve 返回、进程退出重启。
+			a.fail(fmt.Errorf("serverapp: reload rollback failed: %w", rerr))
 			return fmt.Errorf("serverapp: bind new configuration: %v; rollback failed: %w", err, rerr)
 		}
 		return fmt.Errorf("serverapp: bind new configuration: %w", err)

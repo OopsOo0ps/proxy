@@ -49,7 +49,10 @@ func NewTransport(cfg ClientConfig) (*Transport, error) {
 // 包住已完成 TLS 握手、尚未绑定目标的空闲连接，对预热池不透明。
 type idleConn struct{ net.Conn }
 
-// Discard 释放底层连接（池在 TTL 淘汰、节点摘除或关停时调用）。
+// Discard 释放底层连接。当前实现与 Close 等价：预热池在 TTL 淘汰、节点
+// 摘除或关停时直接 Close 底层连接，不经过 Discard；全仓唯一的 Discard
+// 调用点是 nodes.prewarmNode 的句柄类型断言失败分支。保留为未来非 Close
+// 等价释放的扩展点。
 func (c idleConn) Discard() { _ = c.Close() }
 
 // DialTunnel 实现 outbound.Transport：建立绑定到 target 的就绪隧道，

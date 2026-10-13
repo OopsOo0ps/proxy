@@ -1095,8 +1095,8 @@ func (a *App) MetricsAddr() string {
 // 全部成功后原子切换（先停旧监听再绑新监听，见 switchTo），旧快照排空。
 // 任何失败都返回错误并保持旧配置在原端口继续服务——配置错误不会波及线上。
 //
-// 生效边界为“新连接”：切换瞬间已在处理的请求继续使用旧快照收尾，
-// 之后到达的连接使用新快照。
+// 生效边界为“新拨号”：a.live 是全局原子快照，切换对新拨号立即生效，包括
+// 被替换世代在途请求的后续拨号；请求级快照冻结不是本模型的语义。
 func (a *App) Reload(next *config.Config) (err error) {
 	a.reloadMu.Lock()
 	defer a.reloadMu.Unlock()
@@ -1144,7 +1144,8 @@ func (a *App) shuttingDown() bool {
 //     机械会自行关闭监听并排空存量），再同步关闭旧监听释放端口；
 //  2. 绑新：旧监听已停，同端口可重绑；任何失败回滚——关闭新运行时刚绑定
 //     的监听与新建资源，用旧运行时保存的入站配置重建旧监听并恢复服务
-//     （最终效果：reload 失败时旧配置仍在原端口继续服务）；
+//     （最终效果：reload 失败时旧配置仍在原端口继续服务）；回滚也失败时
+//     fail-closed（fail → 应用级关停，Serve 返回，进程交由进程管理器重启）；
 //  3. 提交：新快照上线（新代际），被替换的旧资源释放，旧存量连接排空。
 func (a *App) switchTo(cur, next *Runtime) error {
 	if gen := a.gen.Load(); gen != nil && gen.rt == cur {
@@ -1157,6 +1158,10 @@ func (a *App) switchTo(cur, next *Runtime) error {
 		next.closeOwned(cur)
 		if rerr := a.restore(cur); rerr != nil {
 			a.b.logger.Error("reload rollback failed; previous listeners could not be rebound", "error", rerr)
+			// Fail-closed：零监听存活是不可服务状态——记录首个致命错误并触发
+			// 应用级关停，Serve 随之返回、进程按现有关停流程退出，交由进程
+			// 管理器重启。
+			a.fail(fmt.Errorf("clientapp: reload rollback failed: %w", rerr))
 			return fmt.Errorf("clientapp: bind new configuration: %v; rollback failed: %w", err, rerr)
 		}
 		return fmt.Errorf("clientapp: bind new configuration: %w", err)
