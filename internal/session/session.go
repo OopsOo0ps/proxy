@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
 )
 
@@ -47,8 +48,8 @@ type Options struct {
 	// Logger 关停日志；为 nil 时静默。
 	Logger *slog.Logger
 	// DrainTimeout 返回关停排空期限（热加载可变，故为 getter）。
-	// 为 nil 时使用 shutdown.DefaultTimeout；非 nil 时返回值原样生效
-	// （组件的默认值解析与校验在各自 getter 内完成，本包不做二次钳制）。
+	// 为 nil 时使用 defaults.DrainTimeout（L0 常量单点）；非 nil 时返回值
+	// 原样生效（组件的默认值解析与校验在各自 getter 内完成，本包不做二次钳制）。
 	DrainTimeout func() time.Duration
 	// DrainedMessage 是排空完成日志的文案；现有文案逐字保留
 	// （通用入站为 connections，隧道服务端为 tunnels），为空时使用默认文案。
@@ -101,7 +102,7 @@ func Serve(serveCtx context.Context, ln net.Listener, h ConnHandler, opts Option
 // drain 排空存量连接；超过排空期限后强制中断仍阻塞的连接。
 // 两条关停日志（started/drained 或 timeout）的文案与字段由各入站逐字保留。
 func drain(o Options, wg *sync.WaitGroup, forceCancel context.CancelFunc) {
-	timeout := shutdown.DefaultTimeout
+	timeout := defaults.DrainTimeout
 	if o.DrainTimeout != nil {
 		timeout = o.DrainTimeout()
 	}

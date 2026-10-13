@@ -81,7 +81,7 @@ type Server struct {
 	IdleTimeout time.Duration
 	// ReadHeaderTimeout 请求头读取超时，默认 defaults.HandshakeTimeout。
 	ReadHeaderTimeout time.Duration
-	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 shutdown.DefaultTimeout（同源 defaults.DrainTimeout）。
+	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 defaults.DrainTimeout。
 	ShutdownTimeout time.Duration
 
 	handlerMu sync.Mutex
@@ -608,7 +608,7 @@ func (s *Server) shutdownTimeout() time.Duration {
 		return s.Live.ShutdownTimeout()
 	}
 	if s.ShutdownTimeout <= 0 {
-		return shutdown.DefaultTimeout
+		return defaults.DrainTimeout
 	}
 	return s.ShutdownTimeout
 }

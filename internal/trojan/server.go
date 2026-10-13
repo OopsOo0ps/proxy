@@ -15,7 +15,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/session"
-	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
@@ -319,7 +318,7 @@ func (s *Server) shutdownTimeout() time.Duration {
 		return s.Live.ShutdownTimeout()
 	}
 	if s.ShutdownTimeout <= 0 {
-		return shutdown.DefaultTimeout
+		return defaults.DrainTimeout
 	}
 	return s.ShutdownTimeout
 }

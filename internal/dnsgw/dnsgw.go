@@ -709,7 +709,7 @@ func (s *Server) shutdownTimeoutOrDefault() time.Duration {
 		}
 	}
 	if s.shutdownTimeout <= 0 {
-		return shutdown.DefaultTimeout
+		return defaults.DrainTimeout
 	}
 	return s.shutdownTimeout
 }

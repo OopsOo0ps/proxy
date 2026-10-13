@@ -18,7 +18,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/session"
-	"github.com/OopsOo0ps/proxy/internal/shutdown"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
@@ -72,7 +71,7 @@ type Server struct {
 	HandshakeTimeout time.Duration
 	// IdleTimeout 连接空闲回收；<=0 时使用 defaults.IdleTimeout。
 	IdleTimeout time.Duration
-	// ShutdownTimeout 关停时等待存量连接结束的最长时间；<=0 时使用 shutdown.DefaultTimeout（同源 defaults.DrainTimeout）。
+	// ShutdownTimeout 关停时等待存量连接结束的最长时间；<=0 时使用 defaults.DrainTimeout。
 	ShutdownTimeout time.Duration
 }
 
@@ -381,7 +380,7 @@ func (s *Server) shutdownTimeout() time.Duration {
 		return s.Live.ShutdownTimeout()
 	}
 	if s.ShutdownTimeout <= 0 {
-		return shutdown.DefaultTimeout
+		return defaults.DrainTimeout
 	}
 	return s.ShutdownTimeout
 }
