@@ -78,6 +78,7 @@ type builder struct {
 	logger        *slog.Logger
 	metrics       *metrics.Metrics
 	limiter       *connlimit.Limiter
+	dnsLimiter    *connlimit.Limiter
 	version       string
 	start         time.Time
 	logCtrl       *logging.Control
@@ -95,9 +96,14 @@ func newBuilder(opts BuildOptions, live *atomic.Pointer[Runtime]) builder {
 		m = metrics.New(nil)
 	}
 	return builder{
-		logger:        logger,
-		metrics:       m,
-		limiter:       opts.Limiter,
+		logger:  logger,
+		metrics: m,
+		limiter: opts.Limiter,
+		// DNS 用独立于进程全局闸的专用查询闸（上限与全局闸同源复用
+		// limits.max-connections，不新增配置字段）：UDP 在途查询不是连接，
+		// 不适合计入全局连接闸；且 DNS 洪水不应级联拒掉 HTTP/SOCKS5 的
+		// 新连接。UDP 与 TCP 双栈共用这一份预算。
+		dnsLimiter:    connlimit.New(opts.Limiter.Max()),
 		version:       opts.Version,
 		start:         time.Now(),
 		logCtrl:       opts.LogCtrl,
@@ -316,6 +322,7 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 			Logger:          b.logger,
 			Observer:        b.metrics,
 			ShutdownTimeout: rt.cfg.Timeouts.EffectiveShutdown(),
+			QueryLimiter:    b.dnsLimiter,
 			Live:            b.liveViewShared(),
 		})
 		if err != nil {
@@ -327,6 +334,15 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 			if err != nil {
 				return inboundBound{}, fmt.Errorf("clientapp: listen dns %s: %w", ic.Listen, err)
 			}
+			// TCP 侧包装专用查询闸（UDP 侧闸在 dnsgw 包内，经 QueryLimiter 生效）。
+			// 过载拒绝也是一次 accept 后的终态：先开后拒，保持 active 口径平衡；
+			// 拒绝动作读首帧查询回 REFUSED。dnsgw.serveTCP 识别已包装监听，
+			// 不会对同一份预算二次占用名额。
+			ln.TCP = connlimit.WrapListener(ln.TCP, b.dnsLimiter, func(conn net.Conn) {
+				b.metrics.ConnOpened(core.ProtoDNS)
+				b.metrics.ConnRejected(core.ProtoDNS, core.ResultOverload)
+				dnsgw.RejectOverload(conn)
+			})
 			return inboundBound{
 				listener: ln.TCP,
 				serve:    func(ctx context.Context) error { return srv.Serve(ctx, ln) },
@@ -1117,6 +1133,8 @@ func (a *App) Reload(next *config.Config) (err error) {
 	}
 
 	a.b.limiter.SetMax(next.Limits.EffectiveMaxConnections())
+	// DNS 专用查询闸与全局闸同源：热加载时同步调整上限。
+	a.b.dnsLimiter.SetMax(next.Limits.EffectiveMaxConnections())
 	if a.b.logCtrl != nil {
 		a.b.logCtrl.SetLevel(next.Log.Level)
 		a.b.logCtrl.SetFormat(next.Log.Format)

@@ -220,12 +220,20 @@ func TestQueryDoneRoutes(t *testing.T) {
 	m.QueryDone(core.RouteProxy.String(), core.ResultOK, 10*time.Millisecond)
 	m.QueryDone(core.RouteDirect.String(), core.ResultOK, 20*time.Millisecond)
 	m.QueryDone("", dnsgw.ResultInvalid, 5*time.Millisecond)
+	// UDP 查询闸超限丢弃：route 留空、result=overloaded。
+	m.QueryDone("", core.ResultOverload, 0)
 
 	if got := testutil.ToFloat64(m.dnsQueries.WithLabelValues(core.RouteProxy.String(), core.ResultOK)); got != 1 {
 		t.Fatalf("dns_queries_total{proxy,ok} = %v, want 1", got)
 	}
 	if got := testutil.ToFloat64(m.dnsQueries.WithLabelValues("", dnsgw.ResultInvalid)); got != 1 {
 		t.Fatalf("dns_queries_total{\"\",invalid} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.dnsQueries.WithLabelValues("", core.ResultOverload)); got != 1 {
+		t.Fatalf("dns_queries_total{\"\",overloaded} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.dnsQueries.WithLabelValues("", core.ResultError)); got != 0 {
+		t.Fatalf("dns_queries_total{\"\",error} = %v, want 0（preInitialize 预建序列不得被污染）", got)
 	}
 	rec := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
@@ -235,6 +243,11 @@ func TestQueryDoneRoutes(t *testing.T) {
 	}
 	if strings.Contains(body, `dns_query_duration_seconds_sum{route=""}`) {
 		t.Fatalf("invalid queries must not be timed:\n%s", body)
+	}
+	// preInitialize 预建 reject/denied 精确序列（恒成对出现，不全叉积），
+	// 未发生拒绝时值保持 0，启动后 /metrics 无序列空洞。
+	if !strings.Contains(body, `dns_queries_total{result="denied",route="reject"} 0`) {
+		t.Fatalf("/metrics missing preinitialized reject/denied series:\n%s", body)
 	}
 }
 
