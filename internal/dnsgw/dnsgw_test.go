@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -457,5 +458,145 @@ func TestNewRequiresContractDialers(t *testing.T) {
 	}
 	if _, err := New(Options{Router: routeFunc(testAction), Direct: dialDirectUDP()}); err == nil || !strings.Contains(err.Error(), "proxy") {
 		t.Fatalf("err = %v, want proxy dialer required", err)
+	}
+}
+
+// —— 观测契约组件层（§8.4 测试纪律：记录器假件 + 事件序列断言）——
+
+// queryEvent 是一条 QueryDone 观测事件的形状（route/result 词汇）。
+type queryEvent struct {
+	route  string
+	result string
+}
+
+// recQueryObserver 记录 DNSObserver 的全部事件（记录器假件）。
+type recQueryObserver struct {
+	mu     sync.Mutex
+	events []queryEvent
+}
+
+func (r *recQueryObserver) QueryDone(route, result string, _ time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, queryEvent{route: route, result: result})
+}
+
+func (r *recQueryObserver) snapshot() []queryEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]queryEvent(nil), r.events...)
+}
+
+// TestObserverQueryEventSequence 钉住查询的观测事件序列与 result 词汇。
+// dnsgw 的观测契约是 DNSObserver（§8.4 事件归属：查询结果），一次查询
+// 恰好一条 QueryDone；route 取 core.RouteAction 的观测写法（非法报文留空），
+// result 取 core.Result*（ok/error/denied）与 ResultInvalid。按顺序发起：
+// 代理路由成功 → 直连路由成功 → 代理上游失败 → 分流拒绝 → 非法报文，
+// 事件序列必须一一对应（查询逐条等待响应，事件顺序确定）。
+func TestObserverQueryEventSequence(t *testing.T) {
+	remote, err := testutil.StartDNSServer(func(q []byte, network string) []byte {
+		if network != "tcp" {
+			t.Errorf("remote resolver queried over %s, want tcp", network)
+		}
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("10.0.0.1")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(remote.Close)
+	local, err := testutil.StartDNSServer(func(q []byte, network string) []byte {
+		if network != "udp" {
+			t.Errorf("local resolver queried over %s, want udp", network)
+		}
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("192.168.1.1")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(local.Close)
+
+	// 代理剪枝：首次拨通远端解析器，之后出口“宕机”（拨号失败分支）。
+	var exitDown atomic.Bool
+	proxy := dialerFunc(func(ctx context.Context, got core.Target) (net.Conn, core.Route, error) {
+		if exitDown.Load() {
+			return nil, core.Route{Action: core.RouteProxy}, errors.New("exit node down")
+		}
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", remote.Addr)
+		if err != nil {
+			return nil, core.Route{Action: core.RouteProxy}, err
+		}
+		exitDown.Store(true)
+		return conn, core.Route{Action: core.RouteProxy, Label: "test-node"}, nil
+	})
+
+	obs := &recQueryObserver{}
+	gw := startGateway(t, Options{
+		Router: routeFunc(func(host string) core.RouteAction {
+			if strings.HasPrefix(host, "reject.") {
+				return core.RouteReject
+			}
+			return testAction(host)
+		}),
+		Remote:   remote.Addr,
+		Local:    []string{local.Addr},
+		Timeout:  2 * time.Second,
+		Direct:   dialDirectUDP(),
+		Proxy:    proxy,
+		Observer: obs,
+	})
+
+	// 1. 代理路由成功。
+	if resp := mustQuery(t, gw.addr, "one.proxy.test", 0x0101); testutil.DNSRcode(resp) != 0 {
+		t.Fatalf("proxy query rcode = %d, want 0", testutil.DNSRcode(resp))
+	}
+	// 2. 直连路由成功（*.lan 走本地解析器）。
+	if resp := mustQuery(t, gw.addr, "two.lan", 0x0102); testutil.DNSRcode(resp) != 0 {
+		t.Fatalf("direct query rcode = %d, want 0", testutil.DNSRcode(resp))
+	}
+	// 3. 代理路由，上游失败（SERVFAIL）。
+	if resp := mustQuery(t, gw.addr, "three.proxy.test", 0x0103); testutil.DNSRcode(resp) != 2 {
+		t.Fatalf("failed proxy query rcode = %d, want 2 (SERVFAIL)", testutil.DNSRcode(resp))
+	}
+	// 4. 分流拒绝（REFUSED，不发给任何上游）。
+	if resp := mustQuery(t, gw.addr, "reject.four.test", 0x0104); testutil.DNSRcode(resp) != 5 {
+		t.Fatalf("rejected query rcode = %d, want 5 (REFUSED)", testutil.DNSRcode(resp))
+	}
+	// 5. 非法报文（FORMERR 响应，不转发给任何上游）。
+	{
+		conn, err := net.Dial("udp", gw.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte{0x12, 0x34}); err != nil {
+			t.Fatal(err)
+		}
+		buf := make([]byte, 512)
+		if _, err := conn.Read(buf); err != nil {
+			t.Fatalf("read malformed-query response: %v", err)
+		}
+	}
+
+	want := []queryEvent{
+		{route: "proxy", result: core.ResultOK},
+		{route: "direct", result: core.ResultOK},
+		{route: "proxy", result: core.ResultError},
+		{route: "reject", result: core.ResultDenied},
+		{route: "", result: ResultInvalid},
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if got := obs.snapshot(); len(got) == len(want) {
+			for i := range want {
+				if got[i] != want[i] {
+					t.Fatalf("events[%d] = %+v, want %+v（全部事件 = %+v）", i, got[i], want[i], got)
+				}
+			}
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("events = %+v, want %+v", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
