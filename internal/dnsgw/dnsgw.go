@@ -28,6 +28,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/logging"
@@ -50,6 +51,10 @@ const (
 
 	// maxUDPPayload 是收发的 UDP 报文上限（覆盖 EDNS0 常用缓冲 4096）。
 	maxUDPPayload = 4096
+
+	// rejectReadTimeout 是过载拒绝路径读取首帧（并写回 REFUSED）的期限：
+	// 慢客户端 / 洪水连接不得卡住拒绝路径，超时后直接关闭。
+	rejectReadTimeout = 2 * time.Second
 )
 
 // RouteDecider 返回一次查询的分流判定（消费方锚点接口，设计文档 §4.1）：
@@ -123,6 +128,10 @@ type Options struct {
 	Observer DNSObserver
 	// ShutdownTimeout 关停时等待存量查询结束的最长时间，缺省 15s。
 	ShutdownTimeout time.Duration
+	// QueryLimiter 是查询闸（TCP 每连接一个名额、UDP 每条在途查询一个名额，
+	// 两栈共用同一份预算）；nil 表示不限制。UDP 超限静默丢弃，TCP 超限由
+	// 组装根（或 RejectOverload）回 REFUSED。
+	QueryLimiter *connlimit.Limiter
 	// Live 提供热加载后的动态解析策略；非 nil 时优先于上方静态选项。
 	Live LivePolicy
 }
@@ -139,6 +148,7 @@ type Server struct {
 	logger          *slog.Logger
 	observer        DNSObserver
 	shutdownTimeout time.Duration
+	queryLimiter    *connlimit.Limiter // 查询闸：TCP 连接与 UDP 在途查询共用
 	live            LivePolicy
 }
 
@@ -166,6 +176,7 @@ func New(opts Options) (*Server, error) {
 		logger:          opts.Logger,
 		observer:        observer,
 		shutdownTimeout: opts.ShutdownTimeout,
+		queryLimiter:    opts.QueryLimiter,
 		live:            opts.Live,
 	}
 	if s.remote == "" {
@@ -305,11 +316,20 @@ func (s *Server) serveUDP(ctx context.Context, pc *net.UDPConn, wg *sync.WaitGro
 			}
 			return fmt.Errorf("dnsgw: read udp: %w", err)
 		}
+		// UDP 查询闸：每条在途查询占一个名额，与 TCP 连接共用同一份预算；
+		// 超限静默丢弃（不回包，避免为洪水放大反射面），仅记遥测（route 维度
+		// 留空：查询未转发给任何上游）。
+		if !s.queryLimiter.TryAcquire() {
+			s.observer.QueryDone("", core.ResultOverload, 0)
+			continue
+		}
 		payload := make([]byte, n)
 		copy(payload, buf[:n])
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// 名额覆盖 handleQuery + 写回全程：查询完全结束才归还。
+			defer s.queryLimiter.Release()
 			resp := s.handleQuery(ctx, payload, net.UDPAddrFromAddrPort(from))
 			if resp == nil {
 				return
@@ -322,6 +342,12 @@ func (s *Server) serveUDP(ctx context.Context, pc *net.UDPConn, wg *sync.WaitGro
 
 // serveTCP 接受 TCP 连接；每条连接可顺序承载多条查询（RFC 1035 长度前缀）。
 func (s *Server) serveTCP(ctx context.Context, ln net.Listener, wg *sync.WaitGroup) error {
+	// TCP 查询闸：Accept 阶段占名额，超限连接读首帧回 REFUSED 后关闭。
+	// 组装根可能已用同一份预算包装过监听（为补发协议级遥测），此时不得
+	// 二次包装——否则同一条连接会占用两个名额，且外层名额随拒绝路径泄漏。
+	if _, limited := ln.(*connlimit.Listener); !limited {
+		ln = connlimit.WrapListener(ln, s.queryLimiter, RejectOverload)
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -360,6 +386,24 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 			return
 		}
 	}
+}
+
+// RejectOverload 对因查询闸被拒绝的 TCP 连接读取首帧查询并回 REFUSED 后
+// 关闭（形状对齐 httpproxy.WriteOverloaded）。读帧 / 解析任一失败（包括
+// 超时）直接静默关闭，不发遥测——遥测由拒绝动作的调用方（组装根）补发。
+func RejectOverload(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetReadDeadline(time.Now().Add(rejectReadTimeout))
+	payload, err := readFrame(bufio.NewReader(conn))
+	if err != nil {
+		return
+	}
+	q, err := parseQuery(payload)
+	if err != nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(rejectReadTimeout))
+	_ = writeFrame(conn, errorResponseEcho(q, rcodeRefused))
 }
 
 // handleQuery 处理一条查询并返回响应报文；resp 为 nil 表示不响应（静默丢弃）。

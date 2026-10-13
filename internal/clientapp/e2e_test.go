@@ -1693,3 +1693,142 @@ func TestFailoverBudgetCapsHalfDeadNodes(t *testing.T) {
 		t.Fatalf("request failed after %v; expected to wait for the budget", elapsed)
 	}
 }
+
+// TestE2EDNSOverloadRejectsAndRecovers 端到端验证 DNS 查询闸的背压语义：
+// max-connections=1 + dns 入站 + 阻塞型本地解析器占满唯一名额后——
+// TCP 第二条连接收 REFUSED（遥测补发 ConnOpened+ConnRejected），
+// UDP 第二条查询被静默丢弃（计入 dns_queries_total{result="overloaded"}）；
+// 名额释放后两条栈都恢复正常服务。
+func TestE2EDNSOverloadRejectsAndRecovers(t *testing.T) {
+	// “出口侧”解析器（本用例不触达，仅保证配置完整可构建）。
+	remoteDNS, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("10.10.10.10")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(remoteDNS.Close)
+
+	// 阻塞型本地解析器：收到查询先登记，等待放行后才应答。
+	gate := make(chan struct{})
+	got := make(chan struct{}, 4)
+	localDNS, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		got <- struct{}{}
+		<-gate
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("192.168.1.10")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(localDNS.Close)
+
+	h := startServer(t, "node-secret", nil, false)
+
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	if err := os.WriteFile(rulesPath, []byte("rules:\n  - action: direct\n    match: [\"*.lan\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
+	cfg.Limits = config.Limits{MaxConnections: intPtr(1)}
+	cfg.Routing = &config.Routing{
+		PrivateDirect: boolPtr(false),
+		Rulesets: []config.Ruleset{{
+			Name: "local",
+			Type: "file",
+			Path: rulesPath,
+		}},
+		DNS: &config.DNSRouting{
+			Remote:  remoteDNS.Addr,
+			Local:   []string{localDNS.Addr},
+			Timeout: config.Duration(5 * time.Second),
+		},
+	}
+	cfg.API.Listen = "127.0.0.1:0"
+	cfg.Inbounds = append(cfg.Inbounds, config.Inbound{Type: config.TypeDNS, Listen: "127.0.0.1:0"})
+	app := startClient(t, cfg, nil)
+
+	// 第一条 UDP 查询占满 DNS 查询闸的唯一名额（解析器阻塞，查询在途）。
+	hold, err := net.Dial("udp", app.DNSAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = hold.Close() }()
+	if _, err := hold.Write(testutil.BuildAQuery("hold.lan", 0x0101)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blocking resolver never received the first query")
+	}
+	_ = hold.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	// TCP 第二条连接：查询闸超限，读首帧后回 REFUSED（ID 回填）。
+	rejectConn, err := net.Dial("tcp", app.DNSAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rejectConn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := testutil.WriteDNSFrame(rejectConn, testutil.BuildAQuery("over.lan", 0x0202)); err != nil {
+		t.Fatal(err)
+	}
+	rejected, err := testutil.ReadDNSFrame(rejectConn)
+	if err != nil {
+		t.Fatalf("read dns overload response: %v", err)
+	}
+	if gotID := testutil.DNSID(rejected); gotID != 0x0202 {
+		t.Fatalf("overload response id = %#x, want 0x202", gotID)
+	}
+	if gotRcode := testutil.DNSRcode(rejected); gotRcode != 5 {
+		t.Fatalf("overload rcode = %d, want 5 (REFUSED)", gotRcode)
+	}
+	_ = rejectConn.Close()
+
+	// UDP 第二条查询：查询闸超限，静默丢弃（客户端侧表现为超时）。
+	dropped, err := testutil.QueryUDP(app.DNSAddr(), testutil.BuildAQuery("drop.lan", 0x0303), 500*time.Millisecond)
+	if err == nil {
+		t.Fatalf("over-limit udp query got a response (rcode=%d), want silent drop", testutil.DNSRcode(dropped))
+	}
+
+	// 遥测：TCP 拒绝补发连接级序列，UDP 丢弃计入 overloaded。
+	waitForMetric(t, app.MetricsAddr(), `connections_rejected_total{proto="dns"} 1`)
+	waitForMetric(t, app.MetricsAddr(), `dns_queries_total{result="overloaded",route=""} 1`)
+
+	// 释放名额后两条栈都恢复：UDP 查询得答，TCP 查询也得答。
+	close(gate)
+	// UDP 报文按 datagram 整体到达，单次 Read 即可取回应答（ReadFull 会因
+	// 应答短于缓冲而阻塞到第二个报文超时）。
+	holdReply := make([]byte, 512)
+	n, err := hold.Read(holdReply)
+	if err != nil {
+		t.Fatalf("first query did not complete after release: %v", err)
+	}
+	if gotRcode := testutil.DNSRcode(holdReply[:n]); gotRcode != 0 {
+		t.Fatalf("hold rcode = %d, want 0", gotRcode)
+	}
+	resp, err := testutil.QueryUDP(app.DNSAddr(), testutil.BuildAQuery("after.lan", 0x0404), 5*time.Second)
+	if err != nil {
+		t.Fatalf("udp query after release: %v", err)
+	}
+	if gotRcode := testutil.DNSRcode(resp); gotRcode != 0 {
+		t.Fatalf("udp rcode after release = %d, want 0", gotRcode)
+	}
+	tcpConn, err := net.Dial("tcp", app.DNSAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tcpConn.Close() }()
+	_ = tcpConn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := testutil.WriteDNSFrame(tcpConn, testutil.BuildAQuery("tcp.lan", 0x0505)); err != nil {
+		t.Fatal(err)
+	}
+	tcpResp, err := testutil.ReadDNSFrame(tcpConn)
+	if err != nil {
+		t.Fatalf("tcp query after release: %v", err)
+	}
+	if gotRcode := testutil.DNSRcode(tcpResp); gotRcode != 0 {
+		t.Fatalf("tcp rcode after release = %d, want 0", gotRcode)
+	}
+}

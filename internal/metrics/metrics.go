@@ -168,10 +168,14 @@ func (m *Metrics) preInitialize(enabledProtos []string) {
 	}
 	if slices.Contains(enabledProtos, core.ProtoDNS) {
 		for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String(), ""} {
-			for _, result := range []string{core.ResultOK, core.ResultError, dnsgw.ResultInvalid} {
+			// overloaded：UDP 查询闸超限丢弃（route 维度留空）。
+			for _, result := range []string{core.ResultOK, core.ResultError, dnsgw.ResultInvalid, core.ResultOverload} {
 				m.dnsQueries.WithLabelValues(route, result)
 			}
 		}
+		// reject/denied：路由拒绝（REFUSED，不发给上游）恒成对出现，单列精确序列，
+		// 避免全叉积造出 reject×ok 等永不出现的空序列。
+		m.dnsQueries.WithLabelValues(core.RouteReject.String(), core.ResultDenied)
 		for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String()} {
 			m.dnsDuration.WithLabelValues(route)
 		}

@@ -3,6 +3,7 @@ package dnsgw
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 )
@@ -598,5 +600,217 @@ func TestObserverQueryEventSequence(t *testing.T) {
 			t.Fatalf("events = %+v, want %+v", got, want)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// —— 查询闸（背压）：UDP 静默丢弃 / TCP REFUSED / nil 不限 ——
+
+// waitForActive 轮询直到 limiter 活跃占用达到 want（跨 goroutine 的确定性同步）。
+func waitForActive(t *testing.T, limiter *connlimit.Limiter, want int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if limiter.Active() == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("limiter active = %d, want %d", limiter.Active(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// waitOverloadEvent 轮询直到观测记录中出现 route 为空、result 为 want 的事件。
+func waitOverloadEvent(t *testing.T, obs *recQueryObserver, want string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		for _, ev := range obs.snapshot() {
+			if ev.route == "" && ev.result == want {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("observer events = %+v, want a {route:\"\", result:%q} event", obs.snapshot(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestUDPQueryGateDropsAndRecovers 钉住 UDP 查询闸语义：每条在途查询占一个
+// 名额，超限查询静默丢弃（不回包）并记 QueryDone("", overloaded, 0)；
+// 名额释放后立即恢复服务。
+func TestUDPQueryGateDropsAndRecovers(t *testing.T) {
+	gate := make(chan struct{}) // 阻塞型本地解析器：收到查询后等待放行
+	got := make(chan struct{}, 4)
+	local, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		got <- struct{}{}
+		<-gate
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("192.168.1.1")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(local.Close)
+
+	limiter := connlimit.New(1)
+	obs := &recQueryObserver{}
+	gw := startGateway(t, Options{
+		Local:        []string{local.Addr},
+		Timeout:      5 * time.Second,
+		Direct:       dialDirectUDP(),
+		Proxy:        noDial("unexpected tunnel dial"),
+		Observer:     obs,
+		QueryLimiter: limiter,
+	})
+
+	// Q1 占满唯一名额（解析器阻塞，查询在途）。
+	respCh := make(chan []byte, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := testutil.QueryUDP(gw.addr, testutil.BuildAQuery("one.lan", 0x0101), 5*time.Second)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+	<-got
+	waitForActive(t, limiter, 1)
+
+	// Q2 超限：静默丢弃，客户端等待超时。
+	if _, err := testutil.QueryUDP(gw.addr, testutil.BuildAQuery("two.lan", 0x0202), 300*time.Millisecond); err == nil {
+		t.Fatal("over-limit UDP query got a response, want silent drop (timeout)")
+	}
+	waitOverloadEvent(t, obs, core.ResultOverload)
+
+	// 放行 Q1：得到正常应答。
+	close(gate)
+	select {
+	case resp := <-respCh:
+		if testutil.DNSRcode(resp) != 0 {
+			t.Fatalf("q1 rcode = %d, want 0", testutil.DNSRcode(resp))
+		}
+	case err := <-errCh:
+		t.Fatalf("q1 failed: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("q1 did not complete")
+	}
+	waitForActive(t, limiter, 0)
+
+	// Q3：名额已归还，服务恢复。
+	resp := mustQuery(t, gw.addr, "three.lan", 0x0303)
+	if testutil.DNSRcode(resp) != 0 {
+		t.Fatalf("q3 rcode = %d, want 0", testutil.DNSRcode(resp))
+	}
+}
+
+// TestUDPQueryGateNilUnlimited 钉住缺省语义：不设 QueryLimiter 时并发查询
+// 全部处理，不受任何闸约束。
+func TestUDPQueryGateNilUnlimited(t *testing.T) {
+	local, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("192.168.1.1")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(local.Close)
+
+	gw := startGateway(t, Options{
+		Local:   []string{local.Addr},
+		Timeout: 3 * time.Second,
+		Direct:  dialDirectUDP(),
+		Proxy:   noDial("unexpected tunnel dial"),
+	})
+
+	const n = 3
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, err := testutil.QueryUDP(gw.addr, testutil.BuildAQuery(fmt.Sprintf("host%d.lan", i), uint16(0x10+i)), 3*time.Second)
+			if err == nil && testutil.DNSRcode(resp) != 0 {
+				err = fmt.Errorf("rcode = %d, want 0", testutil.DNSRcode(resp))
+			}
+			errs[i] = err
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("query %d: %v", i, err)
+		}
+	}
+}
+
+// TestTCPRejectOverloadRefused 钉住 TCP 查询闸语义：连接占名额、超限连接
+// 读首帧查询回 REFUSED（ID 回填），名额释放后恢复服务。
+func TestTCPRejectOverloadRefused(t *testing.T) {
+	local, err := testutil.StartDNSServer(func(q []byte, _ string) []byte {
+		return testutil.BuildReply(q, 0, []netip.Addr{netip.MustParseAddr("192.168.1.1")}, false)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(local.Close)
+
+	limiter := connlimit.New(1)
+	gw := startGateway(t, Options{
+		Local:        []string{local.Addr},
+		Timeout:      5 * time.Second,
+		Direct:       dialDirectUDP(),
+		Proxy:        noDial("unexpected tunnel dial"),
+		QueryLimiter: limiter,
+	})
+
+	// 连接 1 占满唯一名额（不发帧，停留在读首帧）。
+	conn1, err := net.Dial("tcp", gw.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn1.Close() }()
+	waitForActive(t, limiter, 1)
+
+	// 连接 2 超限：发出合法查询，应收到 REFUSED 且 ID 回填。
+	conn2, err := net.Dial("tcp", gw.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn2.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := testutil.WriteDNSFrame(conn2, testutil.BuildAQuery("two.lan", 0x0202)); err != nil {
+		t.Fatal(err)
+	}
+	resp2, err := testutil.ReadDNSFrame(conn2)
+	if err != nil {
+		t.Fatalf("read overload response: %v", err)
+	}
+	if got := testutil.DNSID(resp2); got != 0x0202 {
+		t.Fatalf("overload response id = %#x, want 0x202（ID 应回填）", got)
+	}
+	if got := testutil.DNSRcode(resp2); got != rcodeRefused {
+		t.Fatalf("overload rcode = %d, want %d (REFUSED)", got, rcodeRefused)
+	}
+	_ = conn2.Close()
+
+	// 释放名额后连接 3 正常得答。
+	_ = conn1.Close()
+	waitForActive(t, limiter, 0)
+	conn3, err := net.Dial("tcp", gw.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn3.Close() }()
+	_ = conn3.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := testutil.WriteDNSFrame(conn3, testutil.BuildAQuery("three.lan", 0x0303)); err != nil {
+		t.Fatal(err)
+	}
+	resp3, err := testutil.ReadDNSFrame(conn3)
+	if err != nil {
+		t.Fatalf("read response after recovery: %v", err)
+	}
+	if got := testutil.DNSRcode(resp3); got != 0 {
+		t.Fatalf("recovered rcode = %d, want 0", got)
 	}
 }
