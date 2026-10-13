@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15378/badge)](https://www.bestpractices.dev/projects/15378)
 
-Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
+Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署**，追求轻量、干净、长期可演进。
 
 当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点轮询 + 主动健康检查摘除 / 自动加回 + 失败冷却转移）、域名分流（本地规则文件 / 远程 URL 动态加载）、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
 
@@ -204,6 +204,23 @@ limits:
 
 入口校验：http / socks5 监听非环回地址时必须配置 `auth`，否则启动直接报错。
 
+### 配置热加载语义
+
+收到 `SIGHUP` 后按「先构建、后切换」执行：读取并严格解析配置 → 完整构建新运行时 → 全部成功后原子切换 → 旧快照排空。配置面没有静默角落，每个字段的热更路径显式分为三类：
+
+| 热更路径 | 覆盖字段 | 语义 |
+| --- | --- | --- |
+| **快照重建**（默认） | 其余全部字段 | 全量构建新运行时后原子切换——任何字段改动都会在新快照中生效（不存在「需重启字段」这一分类）。注意：节点池重建会**重置冷却与摘除状态**（旧探测循环停止、旧空闲连接关闭） |
+| **运行期热更** | 规则表、日志级别 | 经 `livePolicy` 原子指针独立生效（无需等到重载）；重载发生时**以配置文件为准**，覆盖运行期改动（如 `PUT /log/level` 的切级、规则源重检结果） |
+| **复用保状态** | 上游栈未变时的节点池 / 预热池、规则源 Provider | 对相关配置子树计算指纹：未变 → 复用实例并触发一次重检（预热连接与冷却 / 摘除状态保留）；指纹内任一字段变更 → 重建（状态重置） |
+
+两条兜底语义：
+
+- **关停期拒绝重载**：排空已开始时收到 `SIGHUP`，明确拒绝（`shutting down; reload ignored`），不启动半死的新运行时。
+- **重载失败回滚保旧**：构建或切换的任何一步失败，旧配置继续在原端口服务；切换阶段（先停旧监听再绑新监听）若同端口重绑冲突，同样回滚到旧监听恢复服务。
+
+生效边界为「新连接」：切换瞬间已在处理的请求继续使用旧快照收尾，之后到达的连接使用新快照。
+
 进一步的主题：
 
 - [Wiki：分流与规则](https://github.com/OopsOo0ps/proxy/wiki/分流与规则) — 规则语法（内联 `rules` 与规则源 `rulesets`）、内网直连、远程规则定时刷新。
@@ -245,7 +262,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 - **remote DNS 的前提**：应用需把域名交给代理（CONNECT / `socks5h`）或经 DNS 网关解析；应用自行解析后连 IP 时，域名分流与防污染均不适用。
 - **健康检查不校验隧道口令**：口令错误等隧道层问题由真实流量的被动冷却兜底；摘除判定按探测周期累计（默认最坏约 30s，期间少量请求可能失败）。
 - **连接池存在回收窗口**：空闲连接可能被服务端按握手超时回收；请保持 `outbound.pool.prewarm.ttl` 明显小于服务端 `timeouts.handshake`。
-- **热加载不覆盖监听地址**：`inbound.*` / `listen` 等变更会被明确拒绝并提示重启。
+- **指标口径**：`requests_total` 的 `route` 标签取值为 `direct` / `proxy` / `reject`（路由动作），另有 `pool` 表示终态时节点池尚未确定具体出口（如拨号中途失败或上游连接复用）；`active_connections` 口径为**在服务的请求 / 连接数**（`ConnOpened − (ConnDone + ConnRejected)`），非 TCP socket 数。
 - 生产目标平台为 Ubuntu 22.04，尚未提供发行包（deb / apt 源）与集中配置下发。
 
 完整清单（连接上限语义、远程规则边界、收尾中止不可区分等）见 [Wiki：限制与边界](https://github.com/OopsOo0ps/proxy/wiki/限制与边界)。
@@ -262,52 +279,58 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 
 ## 项目结构
 
+包结构按 L0–L5 分层（层号登记在 `internal/arch/layering.go`），依赖方向严格单向
+（只允许依赖更低层 + 少量显式登记的同层边），由 `internal/arch` 守护测试以
+`go list -deps` 矩阵强制（`make test` 拦截违规；新包未登记分层即编译失败）。
+
 ```text
-├── cmd/                  # 可执行入口（两个独立二进制）
-│   ├── server/           #   proxy-server（远端出口）
-│   └── client/           #   proxy-client（本机入口）
-├── configs/              # 示例配置（生产模板 + 本地三节点演示）
-├── internal/
-│   ├── arch/             #   依赖方向守护测试（go list -deps 矩阵，make test 拦截）
-│   ├── auth/             #   凭据存储与常量时间校验
-│   ├── clientapp/        #   proxy-client 组装与端到端测试
-│   ├── config/           #   配置解析、默认值与校验
-│   ├── connlimit/        #   进程级并发连接上限（背压）
-│   ├── connpool/         #   上游隧道预热池（connect-then-bind 契约）
-│   ├── core/             #   核心契约（Target / Route / 拨号·认证·遥测接口）
-│   ├── dialer/           #   路由感知的出站拨号（实现 core.TargetDialer）
-│   ├── dnsgw/            #   可选 DNS 网关（分流感知的 DNS 转发）
-│   ├── httpproxy/        #   HTTP/HTTPS 入站（CONNECT + 转发）
-│   ├── logging/          #   slog 初始化、request_id 与运行期级别/格式切换
-│   ├── metrics/          #   Prometheus 指标（L4 适配层，实现各组件 Observer）
-│   ├── netutil/          #   网络小工具
-│   ├── nodes/            #   出口节点池（轮询/冷却/切换；节点携带传输实现）
-│   ├── outbound/         #   出口传输契约（Transport/Prewarmer/Prober）与一致性验收
-│   ├── relay/            #   双向转发（半关闭/空闲超时）
-│   ├── routing/          #   分流规则引擎
-│   ├── ruleset/          #   规则源（本地文件 / 远程 URL）与定时刷新
-│   ├── serverapp/        #   proxy-server 组装
-│   ├── session/          #   入站 accept/drain 生命周期（socks5/trojan 共用）
-│   ├── shutdown/         #   优雅关停排空原语
-│   ├── socks5/           #   SOCKS5 入站与地址编码
-│   ├── sockswire/        #   SOCKS5 线格式编解码
-│   ├── status/           #   运行时状态快照（/stats）
-│   ├── testutil/         #   测试辅助（自签证书）
-│   ├── trojan/           #   Trojan 协议（客户端传输实现 / 服务端）
-│   └── version/          #   版本信息（构建期 ldflags 注入）
-├── test/integration/     #   黑盒集成测试（真实二进制端到端）
-├── Dockerfile            # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
-├── deploy/systemd/       # systemd 单元（Ubuntu 22.04，含沙箱配置）
-├── Makefile              # 开发入口（build / test / cover / lint ...）
-└── .github/workflows/    # CI（构建 + 测试 + golangci-lint + Docker 镜像）
+├── cmd/                      # 可执行入口（两个独立二进制）
+│   ├── client/               #   proxy-client（本机入口）        [L5]
+│   └── server/               #   proxy-server（远端出口）        [L5]
+├── configs/                  # 示例配置（生产模板 + 本地三节点演示）
+├── internal/                 # 28 个包，按层组织
+│   ├── relay/                #   [L0 纯原语] 双向转发（半关闭 / 空闲超时 / 缓冲复用）
+│   ├── sockswire/            #   [L0] SOCKS5 线格式编解码
+│   ├── netutil/              #   [L0] 网络小工具
+│   ├── logging/              #   [L0] slog JSON 日志（request_id 与运行期级别切换）
+│   ├── shutdown/             #   [L0] 优雅关停排空原语（停止 accept → 排空 → 强切）
+│   ├── connlimit/            #   [L0] 进程级并发连接上限（背压闸）
+│   ├── auth/                 #   [L0] 凭据存储与常量时间校验
+│   ├── defaults/             #   [L0] 全部文档化数值缺省的唯一来源（纯常量）
+│   ├── version/              #   [L0] 版本信息（构建期 ldflags 注入）
+│   ├── core/                 #   [L1 核心契约] Target / Route / 拨号·认证·遥测接口
+│   ├── outbound/             #   [L1] 出口能力契约（Transport / Prewarmer / Prober）与一致性验收
+│   ├── session/              #   [L1] 入站 accept 机械（双 ctx 生命周期，零 core 依赖）
+│   ├── dialer/               #   [L2 领域引擎] TargetDialer 组合树（路由分派 + 直连 + 节点池）
+│   ├── routing/              #   [L2] 分流规则引擎（纯函数判定）
+│   ├── ruleset/              #   [L2] 规则源（本地文件 / 远程 URL）与定时刷新
+│   ├── nodes/                #   [L2] 出口节点池（轮询 / 健康 / 冷却 / 故障转移预算；预热池自持）
+│   ├── connpool/             #   [L2] 上游隧道预热池（connect-then-bind，TTL 失效回退）
+│   ├── httpproxy/            #   [L3 协议端点] HTTP/HTTPS 入站（CONNECT + 绝对地址）
+│   ├── socks5/               #   [L3] SOCKS5 入站（TCP CONNECT）
+│   ├── dnsgw/                #   [L3] 可选 DNS 网关（分流感知的 DNS 转发）
+│   ├── trojan/               #   [L3] Trojan 协议（客户端传输 + 服务端接受器）
+│   ├── config/               #   [L4 组装/面] 严格 YAML 配置（判别字段 + 协议 params）
+│   ├── clientapp/            #   [L4] proxy-client 组装根（快照构建 / 热加载 / 重载语义）
+│   ├── serverapp/            #   [L4] proxy-server 组装根（trojan 服务端 + 直连出站特化）
+│   ├── metrics/              #   [L4] Prometheus 指标适配（实现各组件 Observer）
+│   ├── status/               #   [L4] 运维端点（/health /stats /log/level）
+│   ├── testutil/             #   [L4] 测试地基 + 入站一致性套件（C1–C10）
+│   └── arch/                 #   [L4] 依赖方向守护测试（go list -deps 矩阵，make test 拦截）
+├── test/integration/         # 黑盒集成与混沌测试 [L5]（构建并启动真实二进制）
+├── Dockerfile                # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
+├── deploy/systemd/           # systemd 单元（Ubuntu 22.04，含沙箱配置）
+├── Makefile                  # 开发入口（build / test / cover / bench / lint ...）
+└── .github/workflows/        # CI（构建 + 测试 + golangci-lint + Docker 镜像）
 ```
 
 ## 开发
 
-- `make build`：构建三个二进制到 `bin/`（自动注入版本信息）
+- `make build`：构建两个二进制到 `bin/`（自动注入版本信息）
 - `make version`：打印两个二进制的版本信息
 - `make test`：运行全部单元测试（含端到端、黑盒集成与混沌用例，不依赖外部网络）
 - `make cover`：运行测试并打印总覆盖率
+- `make bench`：运行热路径基准测试（`go test -bench`，只跑 `internal/`，不含集成测试）
 - `make lint`：静态检查（golangci-lint v2，首次自动下载）
 - `make demo`：一条命令跑通本地三节点演示；分步使用 `make demo-up` / `make demo-check` / `make demo-down`
 - `make run-server` / `make run-client`：前台运行（`SERVER_CONFIG` / `CLIENT_CONFIG` 指定配置）
