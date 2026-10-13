@@ -33,8 +33,10 @@ type Transport interface {
 
 // Prepared 是两阶段预热的中间句柄（协议包自定义的值，对池不透明）。
 type Prepared interface {
-	// Discard 释放底层资源：池在 TTL 淘汰、节点摘除或关停时调用。
-	// 实现必须可安全重复调用。
+	// Discard 释放句柄持有的底层资源，实现必须可安全重复调用。
+	// 当前预热池以等价 Close 释放底层连接（句柄对池不透明，释放不经句柄）；
+	// Discard 是为首个非 Close 等价释放（如记账/回池）的出口协议预留的
+	// 扩展点：该类协议出现时，池应改为经句柄调用 Discard。
 	Discard()
 }
 
