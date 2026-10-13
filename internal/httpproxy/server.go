@@ -24,6 +24,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
@@ -76,11 +77,11 @@ type Server struct {
 	Logger *slog.Logger
 	// Telemetry 是遥测出口；nil 时使用 core.NopTelemetry。
 	Telemetry core.Telemetry
-	// IdleTimeout 隧道空闲回收，默认 90s。
+	// IdleTimeout 隧道空闲回收，默认 defaults.IdleTimeout。
 	IdleTimeout time.Duration
-	// ReadHeaderTimeout 请求头读取超时，默认 10s。
+	// ReadHeaderTimeout 请求头读取超时，默认 defaults.HandshakeTimeout。
 	ReadHeaderTimeout time.Duration
-	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 15s。
+	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 shutdown.DefaultTimeout（同源 defaults.DrainTimeout）。
 	ShutdownTimeout time.Duration
 
 	handlerMu sync.Mutex
@@ -597,7 +598,7 @@ func (s *Server) readHeaderTimeout() time.Duration {
 		return s.Live.ReadHeaderTimeout()
 	}
 	if s.ReadHeaderTimeout <= 0 {
-		return 10 * time.Second
+		return defaults.HandshakeTimeout
 	}
 	return s.ReadHeaderTimeout
 }
@@ -632,7 +633,7 @@ func (s *Server) idleTimeout() time.Duration {
 		return s.Live.IdleTimeout()
 	}
 	if s.IdleTimeout <= 0 {
-		return 90 * time.Second
+		return defaults.IdleTimeout
 	}
 	return s.IdleTimeout
 }

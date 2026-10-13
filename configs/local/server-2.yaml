@@ -1,17 +1,19 @@
 # 本地演示节点 2（监听 18444）。
-listen: "127.0.0.1:18444"
-
-tls:
-  cert_file: var/dev-cert.pem
-  key_file: var/dev-key.pem
-
-users:
-  - username: alice
-    password: local-node-2
-
-metrics:
-  listen: "127.0.0.1:19202"
+# 证书由 make dev-cert 生成到 var/（make demo-up 会自动执行）。
 
 log:
   level: info
   format: json
+
+api:
+  listen: "127.0.0.1:19202"
+
+inbounds:
+  - type: trojan
+    listen: "127.0.0.1:18444"
+    params:
+      cert-file: var/dev-cert.pem
+      key-file: var/dev-key.pem
+      users:
+        - username: alice
+          password: local-node-2

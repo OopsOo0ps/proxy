@@ -7,10 +7,13 @@ package shutdown
 import (
 	"sync"
 	"time"
+
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 )
 
 // DefaultTimeout 是关停排空的默认超时（可被配置覆盖）。
-const DefaultTimeout = 15 * time.Second
+// 与配置层文档化缺省同源（internal/defaults.DrainTimeout）。
+const DefaultTimeout = defaults.DrainTimeout
 
 // Wait 等待 wg 归零，返回是否在 timeout 内自然排空。
 //

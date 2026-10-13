@@ -21,15 +21,18 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/core"
 )
 
-// ParseAction 解析配置中的动作字符串（direct / proxy，大小写不敏感）。
+// ParseAction 解析配置中的动作字符串（direct / proxy / reject，大小写不敏感）。
+// 词汇与 core.RouteAction 同源：reject 是路由拒绝（入站按协议回拒绝响应）。
 func ParseAction(s string) (core.RouteAction, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "direct":
 		return core.RouteDirect, nil
 	case "proxy":
 		return core.RouteProxy, nil
+	case "reject":
+		return core.RouteReject, nil
 	default:
-		return 0, fmt.Errorf("invalid routing action %q: want direct or proxy", s)
+		return 0, fmt.Errorf("invalid routing action %q: want direct, proxy or reject", s)
 	}
 }
 
@@ -94,21 +97,39 @@ func NewEngine(rules *Rules, opts Options) (*Engine, error) {
 
 // Decide 返回 host（域名或 IP 字面量，不含端口）的分流动作。
 func (e *Engine) Decide(host string) core.RouteAction {
+	h := normalizeHost(host)
+	if e.privateDirect && IsLocalTarget(h) {
+		return core.RouteDirect
+	}
+	if action, ok := e.MatchRule(h); ok {
+		return action
+	}
+	return e.def
+}
+
+// MatchRule 只按规则表匹配（不含私网直连前置与缺省动作）：命中返回动作与
+// true。导出给组装根组合多个规则源时复用同一匹配实现（匹配顺序 = 规则
+// 声明顺序，见设计文档 §5.3 的组合树）。
+func (e *Engine) MatchRule(host string) (core.RouteAction, bool) {
 	host = normalizeHost(host)
 	if host == "" {
-		return e.def
-	}
-	if e.privateDirect && isLocalTarget(host) {
-		return core.RouteDirect
+		return 0, false
 	}
 	for _, rule := range e.rules {
 		for _, m := range rule.matchers {
 			if m.match(host) {
-				return rule.action
+				return rule.action, true
 			}
 		}
 	}
-	return e.def
+	return 0, false
+}
+
+// IsLocalTarget 判断主机名或 IP 是否属于本机 / 内网 / 特殊地址段
+// （判定前规范化大小写、方括号与末尾点）。私网直连是组合树的硬规则
+// （规则不可覆盖），导出给组装根在组合多个规则源时复用同一判定。
+func IsLocalTarget(host string) bool {
+	return isLocalTarget(normalizeHost(host))
 }
 
 // normalizeHost 统一小写、去掉首尾空白、IPv6 方括号与 FQDN 末尾的点。

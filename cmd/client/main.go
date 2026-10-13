@@ -1,5 +1,5 @@
 // Command proxy-client 是本机代理入口：
-// 提供 HTTP/HTTPS 与 SOCKS5 入站，按规则直连或经出口节点隧道转发。
+// 提供 HTTP/HTTPS 与 SOCKS5 入站（可选 DNS 网关），按规则直连或经出口节点隧道转发。
 package main
 
 import (
@@ -32,7 +32,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	cfg, err := config.LoadClient(*configPath)
+	cfg, err := config.Load(*configPath, clientapp.KnownProtocols)
 	if err != nil {
 		fatal(err)
 	}
@@ -48,22 +48,19 @@ func main() {
 		"platform", info.Platform,
 	)
 
+	// New 完成完整组装（含监听绑定）：任何失败在此暴露，旧状态不存在。
 	app, err := clientapp.New(cfg, logger, logCtrl)
 	if err != nil {
-		fatal(err)
-	}
-	if err := app.Listen(); err != nil {
 		fatal(err)
 	}
 	fields := []any{
 		"http", app.HTTPAddr(),
 		"socks5", app.SOCKS5Addr(),
 		"metrics", app.MetricsAddr(),
-		"nodes", len(cfg.Nodes),
-		"routing_default", cfg.Routing.Default,
+		"nodes", len(nodesOf(cfg)),
 	}
 	if addr := app.DNSAddr(); addr != "" {
-		fields = append(fields, "dns", addr, "dns_remote", cfg.DNS.EffectiveRemote())
+		fields = append(fields, "dns", addr)
 	}
 	logger.Info("listening", fields...)
 
@@ -92,6 +89,14 @@ func main() {
 		fatal(err)
 	}
 	logger.Info("shutdown complete")
+}
+
+// nodesOf 返回出口节点列表（未配置出站侧时为 nil）。
+func nodesOf(cfg *config.Config) []config.Node {
+	if cfg.Outbound == nil {
+		return nil
+	}
+	return cfg.Outbound.Nodes
 }
 
 func fatal(err error) {

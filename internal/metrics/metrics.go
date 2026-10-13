@@ -23,6 +23,7 @@ package metrics
 
 import (
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/connpool"
@@ -74,7 +75,10 @@ type Metrics struct {
 }
 
 // New 创建独立的指标集合（使用私有 registry，不污染全局默认值）。
-func New() *Metrics {
+// enabledProtos 是组装根传入的已启用入站协议集合（core.Proto* 常量）：
+// 常用标签组合按集合预初始化，零流量时 /metrics 也有时间序列
+// （client 传实际启用的入站，server 传 {core.ProtoTunnel}）。
+func New(enabledProtos []string) *Metrics {
 	m := &Metrics{
 		registry: prometheus.NewRegistry(),
 		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -141,14 +145,16 @@ func New() *Metrics {
 		}),
 	}
 	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.healthProbes, m.upstreamAlive, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads, m.rulesetRefreshes, m.rulesetLastSuccess, m.rulesetRules)
-	m.preInitialize()
+	m.preInitialize(enabledProtos)
 	return m
 }
 
 // preInitialize 预创建常用标签组合，保证 /metrics 在启动后（无流量时）
 // 也能暴露 requests_total / request_duration_seconds / active_connections。
-func (m *Metrics) preInitialize() {
-	for _, proto := range []string{core.ProtoHTTP, core.ProtoSOCKS5, core.ProtoTunnel} {
+// proto 集合来自组装根（按配置的入站集合）；DNS 网关序列仅在启用 dns 入站时
+// 预初始化；重载与规则源序列与协议无关，恒初始化。
+func (m *Metrics) preInitialize(enabledProtos []string) {
+	for _, proto := range enabledProtos {
 		m.active.WithLabelValues(proto)
 		m.rejected.WithLabelValues(proto)
 		for _, route := range []string{
@@ -160,13 +166,15 @@ func (m *Metrics) preInitialize() {
 			}
 		}
 	}
-	for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String(), ""} {
-		for _, result := range []string{core.ResultOK, core.ResultError, dnsgw.ResultInvalid} {
-			m.dnsQueries.WithLabelValues(route, result)
+	if slices.Contains(enabledProtos, core.ProtoDNS) {
+		for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String(), ""} {
+			for _, result := range []string{core.ResultOK, core.ResultError, dnsgw.ResultInvalid} {
+				m.dnsQueries.WithLabelValues(route, result)
+			}
 		}
-	}
-	for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String()} {
-		m.dnsDuration.WithLabelValues(route)
+		for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String()} {
+			m.dnsDuration.WithLabelValues(route)
+		}
 	}
 	for _, result := range []string{ReloadSuccess, ReloadError} {
 		m.configReloads.WithLabelValues(result)

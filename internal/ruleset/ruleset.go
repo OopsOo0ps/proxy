@@ -256,6 +256,34 @@ func (p *Provider) Decide(host string) core.RouteAction {
 	return engine.Decide(host)
 }
 
+// MatchRule 只按当前生效的规则表匹配（不含私网直连前置与缺省动作）：
+// 命中返回动作与 true。导出给组装根组合多个规则源时复用同一匹配实现
+// （组合表的匹配顺序 = 各源声明顺序）。
+func (p *Provider) MatchRule(host string) (core.RouteAction, bool) {
+	if p == nil {
+		return 0, false
+	}
+	engine := p.engine.Load()
+	if engine == nil {
+		return 0, false
+	}
+	return engine.MatchRule(host)
+}
+
+// DocDefault 返回规则文档指定的缺省动作（文档未指定或尚未成功加载时 ok=false）。
+// 组装根组合多规则源时用它计算组合表的最终缺省动作（文档 default 优先）。
+func (p *Provider) DocDefault() (core.RouteAction, bool) {
+	if p == nil {
+		return 0, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rules == nil || p.rules.Default == nil {
+		return 0, false
+	}
+	return *p.rules.Default, true
+}
+
 // UpdateOptions 更新引擎参数（默认动作 / 私网直连），基于最近一次成功解析的
 // 规则重新编译并原子切换；不触发任何网络或文件访问，参数未变化时不动作。
 func (p *Provider) UpdateOptions(def core.RouteAction, privateDirect bool) {

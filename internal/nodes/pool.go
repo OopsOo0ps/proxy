@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/outbound"
 )
 
@@ -74,8 +75,8 @@ type ProbeFunc func(ctx context.Context, node Node) error
 var ErrNoHealthyNodes = errors.New("nodes: all exit nodes removed by health check")
 
 // DefaultFailoverBudget 是单次 Dial 在全部候选节点上的缺省总时间预算。
-// 与 config.defaultFailoverBudget（配置层缺省 30s）保持一致。
-const DefaultFailoverBudget = 30 * time.Second
+// 与配置层文档化缺省同源（internal/defaults.FailoverBudget）。
+const DefaultFailoverBudget = defaults.FailoverBudget
 
 // HealthOptions 是主动健康检查参数；Interval <= 0 时关闭主动探测。
 type HealthOptions struct {

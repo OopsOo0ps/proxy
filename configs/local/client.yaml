@@ -1,42 +1,65 @@
 # 本机三节点演示配置（make demo-up / make run-* 使用，配合 configs/local/server-*.yaml）。
 # 演示命令见 README「本地三节点演示」。
 
-inbound:
-  http: "127.0.0.1:18080"
-  socks5: "127.0.0.1:11080"
-  auth:
-    - username: alice
-      password: change-me
-
-nodes:
-  - addr: "127.0.0.1:18443"
-    password: local-node-1
-  - addr: "127.0.0.1:18444"
-    password: local-node-2
-  - addr: "127.0.0.1:18445"
-    password: local-node-3
-
-# 演示：每个节点预热 2 条空闲隧道（默认值，可在 /metrics 观察 upstream_pool_* 指标）。
-pool:
-  max_idle: 2
-  idle_ttl: 5s
-
-tls:
-  insecure_skip_verify: true  # 本机自签证书演示
-
-routing:
-  default: proxy
-  private_direct: false  # 演示：本机/内网目标也走节点，便于观察隧道流量
-
-# 可选 DNS 网关（Wiki「DNS-策略」）：本机 DNS 查询按分流规则转发，
-# 代理名字经出口节点远程解析（DNS over TCP 走隧道）。演示命令见 README。
-dns:
-  listen: "127.0.0.1:1053"
-  remote: "1.1.1.1:53"   # 应选择从出口可达、支持 TCP 的解析器
-
-metrics:
-  listen: "127.0.0.1:19100"
-
 log:
   level: info
   format: json
+
+api:
+  listen: "127.0.0.1:19100"
+
+inbounds:
+  - type: http
+    listen: "127.0.0.1:18080"
+    auth:
+      users:
+        - username: alice
+          password: change-me
+  - type: socks5
+    listen: "127.0.0.1:11080"
+    auth:
+      users:
+        - username: alice
+          password: change-me
+  # 可选 DNS 网关（Wiki「DNS-策略」）：本机 DNS 查询按分流规则转发，
+  # 代理名字经出口节点远程解析（DNS over TCP 走隧道）。演示命令见 README。
+  - type: dns
+    listen: "127.0.0.1:1053"
+
+outbound:
+  nodes:
+    - name: local-node-1
+      protocol: trojan
+      params:
+        addr: "127.0.0.1:18443"
+        password: local-node-1
+        insecure-skip-verify: true   # 本机自签证书演示
+    - name: local-node-2
+      protocol: trojan
+      params:
+        addr: "127.0.0.1:18444"
+        password: local-node-2
+        insecure-skip-verify: true
+    - name: local-node-3
+      protocol: trojan
+      params:
+        addr: "127.0.0.1:18445"
+        password: local-node-3
+        insecure-skip-verify: true
+  pool:
+    # 演示：每个节点预热 2 条空闲隧道（默认值，可在 /metrics 观察 upstream_pool_* 指标）。
+    prewarm:
+      size: 2
+      ttl: 5s
+
+routing:
+  private-direct: false   # 演示：本机/内网目标也走节点，便于观察隧道流量
+  rules:
+    - { default: proxy }
+  rulesets:
+    # 本地规则文件（构建期严格读取；演示从仓库根运行，路径相对仓库根）。
+    - name: local
+      type: file
+      path: configs/example-rules.yaml
+  dns:
+    remote: "1.1.1.1:53"   # 应选择从出口可达、支持 TCP 的解析器

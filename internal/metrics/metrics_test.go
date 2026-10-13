@@ -12,13 +12,18 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// clientProtos 是 clientapp 组装根会传入的入站集合（三入站全启用）。
+func clientProtos() []string {
+	return []string{core.ProtoHTTP, core.ProtoSOCKS5, core.ProtoTunnel}
+}
+
 // attrsOf 是构造 ConnAttrs 的便捷函数（零值补默认结果）。
 func attrsOf(proto string, route core.Route, result string, d time.Duration) core.ConnAttrs {
 	return core.ConnAttrs{Proto: proto, Route: route, Result: result, Duration: d}
 }
 
 func TestConnDoneRequestsAndGauge(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	// active 口径：active = ConnOpened − (ConnDone+ConnRejected)。
 	m.ConnOpened(core.ProtoHTTP)
 	m.ConnOpened(core.ProtoHTTP)
@@ -55,7 +60,7 @@ func TestConnDoneRequestsAndGauge(t *testing.T) {
 // （标签 proto；拒绝原因不扩维），且不产生 requests_total 记录——未发生
 // 拨号的终态不会把零值 Route 伪造成真实路径。
 func TestConnRejectedCounter(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ConnOpened(core.ProtoSOCKS5)
 	m.ConnRejected(core.ProtoSOCKS5, core.ResultDenied)
 
@@ -73,7 +78,7 @@ func TestConnRejectedCounter(t *testing.T) {
 // TestConnDoneRouteRejectShape 钉住路由拒绝的观测形状：Route 是权威判定，
 // 计入 requests_total{route="reject", result="denied"}。
 func TestConnDoneRouteRejectShape(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ConnDone(attrsOf(core.ProtoHTTP, core.Route{Action: core.RouteReject}, core.ResultDenied, time.Millisecond))
 
 	rec := httptest.NewRecorder()
@@ -89,7 +94,7 @@ func TestConnDoneRouteRejectShape(t *testing.T) {
 // 单条请求路径不可判定的场景）：入站以 Route{Proxy, "pool"} 标记，
 // route 维度记 "pool"，绝不落入 direct / proxy 的虚假计数。
 func TestConnDonePoolLabelShape(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ConnDone(attrsOf(core.ProtoHTTP, core.Route{Action: core.RouteProxy, Label: "pool"}, core.ResultOK, time.Millisecond))
 
 	if RouteLabel(core.Route{}) != "direct" {
@@ -111,7 +116,7 @@ func TestConnDonePoolLabelShape(t *testing.T) {
 }
 
 func TestHandlerExposesRequiredMetricNames(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ConnDone(attrsOf(core.ProtoTunnel, core.Route{Action: core.RouteDirect}, core.ResultOK, 10*time.Millisecond))
 	m.ConnOpened(core.ProtoTunnel)
 	defer m.ConnDone(attrsOf(core.ProtoTunnel, core.Route{Action: core.RouteDirect}, core.ResultOK, time.Millisecond))
@@ -137,7 +142,7 @@ func TestHandlerExposesRequiredMetricNames(t *testing.T) {
 func TestHandlerExposesNamesWithoutTraffic(t *testing.T) {
 	// 无任何流量时也应看到三个核心指标名（预初始化）。
 	rec := httptest.NewRecorder()
-	New().Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	New(clientProtos()).Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	body := rec.Body.String()
 	for _, name := range []string{"requests_total", "request_duration_seconds", "active_connections"} {
 		if !strings.Contains(body, name) {
@@ -163,7 +168,7 @@ func TestNilMetricsSafe(t *testing.T) {
 }
 
 func TestProbeResultMetrics(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ProbeResult("n1", true)
 	m.ProbeResult("n1", false)
 	m.ProbeResult("n1", false)
@@ -186,7 +191,7 @@ func TestProbeResultMetrics(t *testing.T) {
 }
 
 func TestActiveByProtoSnapshot(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ConnOpened(core.ProtoHTTP)
 	m.ConnOpened(core.ProtoHTTP)
 	m.ConnOpened(core.ProtoSOCKS5)
@@ -211,7 +216,7 @@ func TestActiveByProtoSnapshot(t *testing.T) {
 // TestQueryDoneRoutes 钉住 DNS 查询口径：direct/proxy 记查询与耗时，
 // 非法查询路由维度留空且不计耗时。
 func TestQueryDoneRoutes(t *testing.T) {
-	m := New()
+	m := New([]string{core.ProtoDNS})
 	m.QueryDone(core.RouteProxy.String(), core.ResultOK, 10*time.Millisecond)
 	m.QueryDone(core.RouteDirect.String(), core.ResultOK, 20*time.Millisecond)
 	m.QueryDone("", dnsgw.ResultInvalid, 5*time.Millisecond)
@@ -234,7 +239,7 @@ func TestQueryDoneRoutes(t *testing.T) {
 }
 
 func TestPoolMetrics(t *testing.T) {
-	m := New()
+	m := New(clientProtos())
 	m.ClaimResult("n1", connpool.ClaimHit)
 	m.ClaimResult("n1", connpool.ClaimHit)
 	m.ClaimResult("n1", connpool.ClaimMiss)

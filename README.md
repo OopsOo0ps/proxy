@@ -49,7 +49,7 @@ flowchart LR
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超时强制断开剩余连接 |
 | 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误并计入 `connections_rejected_total` |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
-| 规则集动态加载 | 本地 `rules_file` 或远程 `rules_url` 二选一；周期刷新、失败保持现有规则、SIGHUP 立即重拉 |
+| 规则集动态加载 | 规则源 `rulesets`（远程 url 或本地 file）；周期刷新、失败保持现有规则、SIGHUP 立即重拉 |
 | DNS 处理 | **remote DNS（默认）**：域名随隧道到出口解析；**可选 DNS 网关**：本机环回监听，按同一分流规则转发查询 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration`；级别可运行时切换 |
@@ -119,76 +119,100 @@ make run-client CLIENT_CONFIG=configs/example-client.yaml   # 本机入口
 
 配置为 YAML 且严格解析：**未知字段会直接导致启动失败**，避免拼写错误被静默忽略。核心字段（完整字段与语义见 [Wiki：配置参考](https://github.com/OopsOo0ps/proxy/wiki/配置参考)）：
 
+配置形状镜像运行时名词：**入站与出口节点都是带判别字段的列表**，协议专属
+参数与校验归协议所有（`params` 块由协议包的结构体严格解码）。
+
 ```yaml
 # proxy-client（本机入口）；完整注释版见 configs/example-client.yaml。
-inbound:
-  http: "127.0.0.1:8080"     # HTTP/HTTPS 入站（CONNECT + 绝对地址请求）
-  socks5: "127.0.0.1:1080"   # SOCKS5 入站（TCP CONNECT）
-  auth:                      # 入站认证；监听非环回地址时必填
-    - username: alice
-      password: change-me
+log:
+  level: info                # debug | info | warn | error
+  format: json               # json | text
 
-nodes:                       # 出口节点（Trojan over TLS），建议 ≥3
-  - addr: "node1.example.com:443"
-    password: node1-token
-    sni: www.example.com     # 可选：TLS SNI / 证书校验名
+api:
+  listen: "127.0.0.1:9100"   # /metrics、/health、/stats、/log/level；默认仅允许环回，非环回需 allow-remote: true
+
+inbounds:                    # 入站端点列表（判别字段 type：http | socks5 | dns）
+  - type: http
+    listen: "127.0.0.1:8080" # HTTP/HTTPS 入站（CONNECT + 绝对地址请求）
+    auth:                    # 入站认证（共性机制）；监听非环回地址时必填
+      users:
+        - username: alice
+          password: change-me
+  - type: socks5
+    listen: "127.0.0.1:1080" # SOCKS5 入站（TCP CONNECT）
+    auth:
+      users:
+        - username: alice
+          password: change-me
+
+outbound:
+  nodes:                     # 出口节点（判别字段 protocol），建议 ≥3
+    - name: edge-1
+      protocol: trojan
+      params:                # trojan 自有参数（协议校验在协议构造器）
+        addr: "node1.example.com:443"
+        password: node1-token
+        sni: www.example.com # 可选：TLS SNI / 证书校验名
+  pool:                      # 节点池策略（协议无关）
+    prewarm:
+      size: 2                # 上游空闲隧道连接池（预热复用）；0 = 关闭
+      ttl: 5s                # 应明显小于服务端 timeouts.handshake
+    health:                  # 出口节点主动健康检查（故障自愈）
+      interval: 10s          # 0 = 关闭
+      failures: 3            # 连续失败 N 次摘除
+      successes: 2           # 摘除后连续成功 M 次自动加回
+    failover-budget: 30s     # 出口节点故障转移总预算（全部候选节点合计）
 
 routing:
-  default: proxy             # direct | proxy
-  rules_file: ""             # 规则源二选一：本地 rules_file 或远程 rules_url
-  private_direct: true       # 环回 / 私网 / 链路本地目标一律直连
-
-pool:                        # 上游空闲隧道连接池（预热复用；0 = 关闭）
-  max_idle: 2
-  idle_ttl: 5s               # 应明显小于服务端 timeouts.handshake
-
-health_check:                # 出口节点主动健康检查（故障自愈）
-  interval: 10s              # 0 = 关闭
-  failures: 3                # 连续失败 N 次摘除
-  successes: 2               # 摘除后连续成功 M 次自动加回
+  private-direct: true       # 环回 / 私网 / 链路本地目标一律直连（硬规则）
+  rules:                     # 内联规则（按顺序匹配；match 词表见 Wiki）
+    - { match: domain-suffix, value: cn, action: direct }
+    - { match: cidr, value: 10.0.0.0/8, action: direct }
+    - { default: proxy }     # 缺省动作（direct | proxy | reject）
+  # rulesets:                # 规则源（来源可替换：url 定时刷新 / file 本地文件）
+  #   - { name: cn-list, url: "https://…", interval: 24h }
 
 timeouts:                    # 纯数字按秒解释
   dial: 10s                  # 建立目标 / 节点连接
   handshake: 10s             # 隧道握手（TLS + Trojan）
-  failover: 30s              # 出口节点故障转移总预算（全部候选节点合计）
+  idle: 90s                  # 连接空闲回收
   shutdown: 15s              # 优雅关停排空期限
 
 limits:
-  max_connections: 1024      # 进程级并发上限（HTTP + SOCKS5 合计）；0 = 不限制
-
-metrics:
-  listen: "127.0.0.1:9100"   # /metrics、/health、/stats；默认仅允许环回，非环回需 allow_remote: true
-log:
-  level: info                # debug | info | warn | error
-  format: json               # json | text
+  max-connections: 1024      # 进程级并发上限（全部入站合计）；0 = 不限制
 ```
 
 ```yaml
 # proxy-server（远端出口）；完整注释版见 configs/example-server.yaml。
-listen: "0.0.0.0:8443"       # Trojan over TLS 隧道
-tls:
-  cert_file: server.crt
-  key_file: server.key
-users:                       # 每个客户端分配独立凭据
-  - username: alice
-    password: change-me-alice
-limits:
-  max_connections: 1024      # 进程级并发隧道上限
-metrics:
+# 服务端 = trojan 隧道入站 + 直连出站的特化：没有 routing / ruleset / 节点池。
+api:
   listen: "127.0.0.1:9200"
+
+inbounds:
+  - type: trojan
+    listen: "0.0.0.0:8443"   # Trojan over TLS 隧道
+    params:                  # trojan 服务端自有参数
+      cert-file: server.crt
+      key-file: server.key
+      users:                 # 每个客户端分配独立凭据（服务端只存 SHA-224 摘要）
+        - username: alice
+          password: change-me-alice
+
+limits:
+  max-connections: 1024      # 进程级并发隧道上限
 ```
 
-入口校验：监听非环回地址时必须配置 `inbound.auth`，否则启动直接报错。
+入口校验：http / socks5 监听非环回地址时必须配置 `auth`，否则启动直接报错。
 
 进一步的主题：
 
-- [Wiki：分流与规则](https://github.com/OopsOo0ps/proxy/wiki/分流与规则) — `rules_file` 语法、内网直连、远程规则定时刷新。
+- [Wiki：分流与规则](https://github.com/OopsOo0ps/proxy/wiki/分流与规则) — 规则语法（内联 `rules` 与规则源 `rulesets`）、内网直连、远程规则定时刷新。
 - [Wiki：DNS-策略](https://github.com/OopsOo0ps/proxy/wiki/DNS-策略) — remote DNS 默认行为与可选 DNS 网关。
 - [Wiki：运行时语义](https://github.com/OopsOo0ps/proxy/wiki/运行时语义) — 配置热加载（SIGHUP）、优雅关闭、过载保护。
 
 ## 可观测性
 
-配置 `metrics.listen` 后，同一端口暴露四个端点：
+配置 `api.listen` 后，同一端口暴露四个端点：
 
 | 端点 | 用途 |
 | --- | --- |
@@ -205,14 +229,14 @@ curl -s http://127.0.0.1:9100/stats | python3 -m json.tool
 curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 ```
 
-指标全表、日志字段、出口节点健康检查（主动探测 + 被动冷却）与 `/stats` 完整字段见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。运维端点默认仅允许绑定环回地址；确需远程只读访问时可显式设置 `metrics.allow_remote: true`（仍不做鉴权，请配合防火墙）。`PUT /log/level` 是状态变更，永远只接受环回来源，不受该开关影响。
+指标全表、日志字段、出口节点健康检查（主动探测 + 被动冷却）与 `/stats` 完整字段见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。运维端点默认仅允许绑定环回地址；确需远程只读访问时可显式设置 `api.allow-remote: true`（仍不做鉴权，请配合防火墙）。`PUT /log/level` 是状态变更，永远只接受环回来源，不受该开关影响。
 
 ## 安全
 
 - 入站代理支持用户名/密码认证（HTTP `Proxy-Authorization` / SOCKS5 RFC 1929）；监听非环回地址时**强制**要求认证。
 - 隧道凭据以 SHA-224 摘要形式在 TLS 内传输；服务端凭据存储只保留摘要，比较全部使用常量时间实现，避免时序侧信道。
-- 失败响应不泄露信息：入站统一回标准 407 / SOCKS5 通用失败码（固定文案）；隧道层对认证失败与非协议流量返回中性伪装网页（可用 `decoy_file` 自定义），与普通 Web 服务无法区分。
-- 出口节点证书校验默认开启；`insecure_skip_verify` 仅供自签调试，请勿在生产使用。
+- 失败响应不泄露信息：入站统一回标准 407 / SOCKS5 通用失败码（固定文案）；隧道层对认证失败与非协议流量返回中性伪装网页（可用服务端 params 的 `decoy-file` 自定义），与普通 Web 服务无法区分。
+- 出口节点证书校验默认开启；节点 params 的 `insecure-skip-verify` 仅供自签调试，请勿在生产使用。
 - 漏洞报告流程见 [SECURITY.md](SECURITY.md)：GitHub 私密漏洞报告已启用，承诺 14 天内首次响应。
 
 ## 限制与边界
@@ -220,7 +244,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 - **仅有显式代理的 TCP**：暂不支持 UDP（SOCKS5 `UDP ASSOCIATE` 与 Trojan UDP 转发），也没有 TUN / 透明代理模式；未配置代理的程序不会被接管。
 - **remote DNS 的前提**：应用需把域名交给代理（CONNECT / `socks5h`）或经 DNS 网关解析；应用自行解析后连 IP 时，域名分流与防污染均不适用。
 - **健康检查不校验隧道口令**：口令错误等隧道层问题由真实流量的被动冷却兜底；摘除判定按探测周期累计（默认最坏约 30s，期间少量请求可能失败）。
-- **连接池存在回收窗口**：空闲连接可能被服务端按握手超时回收；请保持 `pool.idle_ttl` 明显小于服务端 `timeouts.handshake`。
+- **连接池存在回收窗口**：空闲连接可能被服务端按握手超时回收；请保持 `outbound.pool.prewarm.ttl` 明显小于服务端 `timeouts.handshake`。
 - **热加载不覆盖监听地址**：`inbound.*` / `listen` 等变更会被明确拒绝并提示重启。
 - 生产目标平台为 Ubuntu 22.04，尚未提供发行包（deb / apt 源）与集中配置下发。
 

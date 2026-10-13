@@ -99,10 +99,13 @@ func TestE2ERulesRemoteRefreshFlipsRoute(t *testing.T) {
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cfg := baseClientCfg([]config.Node{{Addr: node.addr, Password: "node-secret"}})
-	cfg.Routing.RulesURL = rulesSrv.URL
-	cfg.Routing.RulesRefreshInterval = durationPtr(100 * time.Millisecond)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", node.addr, "node-secret")})
+	cfg.Routing.Rulesets = []config.Ruleset{{
+		Name:     "remote",
+		URL:      rulesSrv.URL,
+		Interval: durationPtr(100 * time.Millisecond),
+	}}
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, logger)
 
 	// 阶段一：规则命中直连（upstream=direct）。
@@ -157,10 +160,13 @@ func TestE2ERulesRemoteFailureKeepsRules(t *testing.T) {
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cfg := baseClientCfg([]config.Node{{Addr: node.addr, Password: "node-secret"}})
-	cfg.Routing.RulesURL = rulesSrv.URL
-	cfg.Routing.RulesRefreshInterval = durationPtr(50 * time.Millisecond)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", node.addr, "node-secret")})
+	cfg.Routing.Rulesets = []config.Ruleset{{
+		Name:     "remote",
+		URL:      rulesSrv.URL,
+		Interval: durationPtr(50 * time.Millisecond),
+	}}
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, logger)
 
 	resp := fetchThroughProxy(t, app, target.URL, "u", "p")
@@ -207,9 +213,12 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cfg := baseClientCfg([]config.Node{{Addr: node.addr, Password: "node-secret"}})
-	cfg.Routing.RulesURL = rulesSrv.URL
-	cfg.Routing.RulesRefreshInterval = durationPtr(30 * time.Minute) // 周期刷新不参与本测试
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", node.addr, "node-secret")})
+	cfg.Routing.Rulesets = []config.Ruleset{{
+		Name:     "remote",
+		URL:      rulesSrv.URL,
+		Interval: durationPtr(30 * time.Minute), // 周期刷新不参与本测试
+	}}
 	app := startClient(t, cfg, logger)
 
 	resp := fetchThroughProxy(t, app, target.URL, "u", "p")

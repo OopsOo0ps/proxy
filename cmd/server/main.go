@@ -32,7 +32,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	cfg, err := config.LoadServer(*configPath)
+	cfg, err := config.Load(*configPath, serverapp.KnownProtocols)
 	if err != nil {
 		fatal(err)
 	}
@@ -48,24 +48,21 @@ func main() {
 		"platform", info.Platform,
 	)
 
+	// New 完成完整组装（含监听绑定）：任何失败在此暴露，旧状态不存在。
 	app, err := serverapp.New(cfg, logger, logCtrl)
 	if err != nil {
-		fatal(err)
-	}
-	if err := app.Listen(); err != nil {
 		fatal(err)
 	}
 	logger.Info("listening",
 		"tunnel", app.TunnelAddr(),
 		"metrics", app.MetricsAddr(),
-		"users", len(cfg.Users),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// SIGHUP 重新加载配置文件：先解析校验，失败保持旧配置继续服务；
-	// 成功则原子生效（新连接使用新凭据与新证书）。
+	// 成功则原子生效（新握手使用新凭据与新证书）。
 	reloadCh := make(chan os.Signal, 1)
 	signal.Notify(reloadCh, syscall.SIGHUP)
 	defer signal.Stop(reloadCh)

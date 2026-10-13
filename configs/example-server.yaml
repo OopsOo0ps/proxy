@@ -1,40 +1,47 @@
 # proxy-server 示例配置（生产模板）。
+# schema 形状：判别字段列表 + 协议自有 params（未知字段会导致启动失败——严格解析）。
+# 服务端 = trojan 隧道入站 + 直连出站的特化：没有 routing / ruleset / 节点池。
 
-# 隧道监听地址（Trojan over TLS）。
+# 日志：级别 debug | info | warn | error；格式 json | text。
+log:
+  level: info
+  format: json
+
+# 运维端点（/metrics、/health、/stats、/log/level）。
+# 默认仅允许监听环回地址；确需远程只读访问时显式加 allow-remote: true
+#（PUT /log/level 永远只限环回来源）。
+api:
+  listen: "127.0.0.1:9200"
+  # allow-remote: false
+
+# 入站端点（列表 + 判别字段 type；服务端为 trojan 隧道接受器，可配置多个）。
 # 建议通过防火墙/安全组限制来源；生产可监听 443 以融入普通 HTTPS 流量。
-listen: "0.0.0.0:8443"
-
-tls:
-  cert_file: /etc/proxy/server.crt
-  key_file: /etc/proxy/server.key
-
-# 隧道凭据：为每个客户端分配独立的用户名与强口令。
-# 认证失败时服务端返回中性伪装页面（不泄露任何代理信息）。
-users:
-  - username: alice
-    password: change-me-alice
-  - username: bob
-    password: change-me-bob
-
-# 认证失败 / 非协议流量时返回的自定义伪装页面（可选）。
-decoy_file: ""
+inbounds:
+  - type: trojan
+    listen: "0.0.0.0:8443"
+    params:
+      # 隧道 TLS 证书与私钥（必填）。示例指向 make dev-cert 生成的本地证书；
+      # 生产部署替换为 /etc/proxy/server.crt 等实际路径。
+      cert-file: var/dev-cert.pem
+      key-file: var/dev-key.pem
+      # 隧道凭据：为每个客户端分配独立的用户名与强口令（必填）。
+      # 服务端只保留 SHA-224 摘要；认证失败时返回中性伪装页面
+      #（不泄露任何代理信息），可用 decoy-file 自定义页面。
+      users:
+        - username: alice
+          password: change-me-alice
+        - username: bob
+          password: change-me-bob
+      # decoy-file: /etc/proxy/decoy.html   # 可选：自定义伪装页面
 
 # 过载保护：进程级并发隧道上限；0 = 不限制。
 # 超限连接直接关闭（TLS 层无法携带错误语义），并计入 connections_rejected_total。
 limits:
-  max_connections: 1024
+  max-connections: 1024
 
+# 超时。纯数字按秒解释。
 timeouts:
-  dial: 10s
-  handshake: 10s
-  idle: 90s
+  dial: 10s       # 建立目标连接（服务端即出口，直连拨号）
+  handshake: 10s  # 隧道握手（TLS + Trojan）
+  idle: 90s       # 连接空闲回收
   shutdown: 15s   # 优雅关停：停止接受新连接后，等待存量隧道结束的最长时间
-
-# 指标与运维端点（/metrics、/health、/stats）。默认仅允许监听环回地址；
-# 确需远程只读访问时显式加 allow_remote: true（PUT /log/level 永远只限环回）。
-metrics:
-  listen: "127.0.0.1:9200"
-
-log:
-  level: info
-  format: json

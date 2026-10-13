@@ -255,9 +255,9 @@ func TestServerHappyPath(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(ctx context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -301,9 +301,9 @@ func TestServerClientResetDuringRelayIsNotError(t *testing.T) {
 	logs := &logBuffer{}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(ctx context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
@@ -361,9 +361,9 @@ func TestServerUpstreamResetDuringRelayIsNotError(t *testing.T) {
 	logs := &logBuffer{}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(ctx context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
@@ -403,10 +403,10 @@ func TestServerAuthFailureServesDecoy(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(context.Context, string) (net.Conn, error) {
+		Dial: dialerOf(func(context.Context, string) (net.Conn, error) {
 			t.Error("dial must not be called on auth failure")
 			return nil, errors.New("unreachable")
-		},
+		}),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -447,7 +447,7 @@ func TestServerHTTPProbeGetsDecoy(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+		Dial:     dialerOf(func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") }),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -477,7 +477,7 @@ func TestServerTargetDialFailureClosesSilently(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("connection refused") },
+		Dial:     dialerOf(func(context.Context, string) (net.Conn, error) { return nil, errors.New("connection refused") }),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -510,7 +510,7 @@ func TestServerUnsupportedCommand(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+		Dial:     dialerOf(func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") }),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -541,7 +541,7 @@ func TestServerHandshakeTimeout(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+		Dial:     dialerOf(func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") }),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 300*time.Millisecond)
 
@@ -605,9 +605,9 @@ func TestConnectThenStartRequest(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(ctx context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -651,7 +651,7 @@ func TestServerShutdownInterruptsPendingHandshake(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial:     func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") },
+		Dial:     dialerOf(func(context.Context, string) (net.Conn, error) { return nil, errors.New("unreachable") }),
 	}
 	cert, caPEM, err := testutil.NewTLSCertificate()
 	if err != nil {
@@ -789,9 +789,9 @@ func TestServerDrainsInflightTunnelOnShutdown(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(_ context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(_ context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 		ShutdownTimeout: 3 * time.Second,
 	}
 	nodeAddr, clientTLS, shutdown, finished := startTLSServerControlled(t, srv)
@@ -837,9 +837,9 @@ func TestServerForceClosesTunnelAfterShutdownTimeout(t *testing.T) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(_ context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(_ context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 		ShutdownTimeout: 200 * time.Millisecond,
 	}
 	nodeAddr, clientTLS, shutdown, finished := startTLSServerControlled(t, srv)

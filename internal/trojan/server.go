@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
@@ -49,26 +50,25 @@ type LivePolicy interface {
 	ShutdownTimeout() time.Duration
 }
 
-// DialFunc 建立到目标地址的直连（服务端即出口）。
-type DialFunc func(ctx context.Context, addr string) (net.Conn, error)
-
 // Server 是 Trojan 隧道服务端。
 type Server struct {
 	// Verifier 口令校验（必填）。
 	Verifier Verifier
-	// Dial 目标直连（必填）。
-	Dial DialFunc
+	// Dial 把解析出的目标接到对端字节流（必填）：服务端即出口，组合树的
+	// direct 剪枝就是本字段（§5.3）——组装根注入共享的直连拨号器，
+	// 返回的 Route 是权威路径（直连恒为 Route{Direct}）。
+	Dial core.TargetDialer
 	// Decoy 伪装页面；为空时使用 DefaultDecoyPage。
 	Decoy []byte
 	// Live 提供热加载后的动态策略；非 nil 时优先于上方静态字段。
 	Live LivePolicy
-	// HandshakeTimeout 握手超时，默认 10s。
+	// HandshakeTimeout 握手超时，默认 defaults.HandshakeTimeout。
 	HandshakeTimeout time.Duration
-	// DialTimeout 目标连接超时，默认 10s。
+	// DialTimeout 目标连接超时，默认 defaults.DialTimeout。
 	DialTimeout time.Duration
-	// IdleTimeout 连接空闲回收，默认 90s。
+	// IdleTimeout 连接空闲回收，默认 defaults.IdleTimeout。
 	IdleTimeout time.Duration
-	// ShutdownTimeout 关停时等待存量隧道结束的最长时间，默认 15s。
+	// ShutdownTimeout 关停时等待存量隧道结束的最长时间，默认 defaults.DrainTimeout。
 	ShutdownTimeout time.Duration
 	// Logger 日志；为 nil 时静默。
 	Logger *slog.Logger
@@ -162,11 +162,11 @@ func (s *Server) handle(ctx, connCtx context.Context, conn net.Conn) {
 	}
 
 	target := core.Target{Host: req.Host, Port: req.Port}
-	// 服务端即出口：出站是直连拨号，权威路径恒为 Route{Direct}（无出口标签）。
-	route := core.Route{Action: core.RouteDirect}
+	// 服务端即出口：出站是组装根注入的直连拨号器（组合树 direct 剪枝），
+	// DialTarget 返回的 Route 是权威路径（直连恒为 Route{Direct}，无出口标签）。
 	dialCtx, cancel := context.WithTimeout(connCtx, s.dialTimeout())
 	defer cancel()
-	upstream, err := s.Dial(dialCtx, target.String())
+	upstream, route, err := s.dialNow().DialTarget(dialCtx, target)
 	if err != nil {
 		// 与官方行为一致：目标不可达时静默关闭，不做区分响应。
 		logger.Warn("dial target failed", "target", target.String(), "error", err)
@@ -264,12 +264,32 @@ func (s *Server) decoyNow() []byte {
 	return s.Decoy
 }
 
+// dialNow 返回当前生效的目标直连（Live 存在时以热加载快照为准）。
+func (s *Server) dialNow() core.TargetDialer {
+	if s.Dial != nil {
+		return s.Dial
+	}
+	// 直接构造（测试与内嵌场景）未注入拨号器时回退共享直连实现，
+	// 超时跟随当前生效配置。
+	return dialNow{timeout: s.dialTimeout()}
+}
+
+type dialNow struct{ timeout time.Duration }
+
+func (d dialNow) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	conn, err := (&net.Dialer{Timeout: d.timeout}).DialContext(ctx, "tcp", t.String())
+	if err != nil {
+		return nil, core.Route{Action: core.RouteDirect}, err
+	}
+	return conn, core.Route{Action: core.RouteDirect}, nil
+}
+
 func (s *Server) handshakeTimeout() time.Duration {
 	if s.Live != nil {
 		return s.Live.HandshakeTimeout()
 	}
 	if s.HandshakeTimeout <= 0 {
-		return 10 * time.Second
+		return defaults.HandshakeTimeout
 	}
 	return s.HandshakeTimeout
 }
@@ -279,7 +299,7 @@ func (s *Server) dialTimeout() time.Duration {
 		return s.Live.DialTimeout()
 	}
 	if s.DialTimeout <= 0 {
-		return 10 * time.Second
+		return defaults.DialTimeout
 	}
 	return s.DialTimeout
 }
@@ -289,7 +309,7 @@ func (s *Server) idleTimeout() time.Duration {
 		return s.Live.IdleTimeout()
 	}
 	if s.IdleTimeout <= 0 {
-		return 90 * time.Second
+		return defaults.IdleTimeout
 	}
 	return s.IdleTimeout
 }

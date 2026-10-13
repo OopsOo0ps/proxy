@@ -3,6 +3,7 @@ package trojan
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 
@@ -27,9 +28,14 @@ type Transport struct {
 	passwordHash string // hex(SHA224(password))，构造时派生一次
 }
 
-// NewTransport 构建节点传输并封闭全部协议参数。口令校验归协议构造器：
-// 非空且不含 CR/LF（config 层已有同规则校验，此处兜底非配置路径的直接构造）。
+// NewTransport 构建节点传输并封闭全部协议参数。协议语义校验在这里
+// （设计文档 §7.3，config 不认识协议字段语义）：地址必须为 host:port、
+// 口令非空且不含 CR/LF。config.Params 只是参数形状，此处兜底非配置路径
+// 的直接构造。
 func NewTransport(cfg ClientConfig) (*Transport, error) {
+	if _, _, err := net.SplitHostPort(cfg.ServerAddr); err != nil {
+		return nil, fmt.Errorf("trojan: server addr %q: %w", cfg.ServerAddr, err)
+	}
 	if cfg.Password == "" {
 		return nil, errors.New("trojan: password must not be empty")
 	}

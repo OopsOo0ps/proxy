@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
@@ -37,13 +38,15 @@ import (
 const (
 	// DefaultRemote 是缺省的远程解析服务器（经出口节点，DNS over TCP）。
 	// 应选择从出口可达、支持 TCP 的解析器；必要时在配置中覆盖。
-	DefaultRemote = "1.1.1.1:53"
+	// 与配置层文档化缺省同源（internal/defaults.DNSRemote）。
+	DefaultRemote = defaults.DNSRemote
 
 	// DefaultResolvConfPath 是缺省的系统解析器配置文件路径。
 	DefaultResolvConfPath = "/etc/resolv.conf"
 
 	// DefaultTimeout 是单次查询（含上游往返）的缺省超时。
-	DefaultTimeout = 5 * time.Second
+	// 与配置层文档化缺省同源（internal/defaults.DNSTimeout）。
+	DefaultTimeout = defaults.DNSTimeout
 
 	// maxUDPPayload 是收发的 UDP 报文上限（覆盖 EDNS0 常用缓冲 4096）。
 	maxUDPPayload = 4096
@@ -378,9 +381,25 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 		resp     []byte
 		upstream string
 	)
-	if route.Action == core.RouteDirect {
+	switch route.Action {
+	case core.RouteDirect:
 		resp, upstream, err = s.queryLocal(ctx, q)
-	} else {
+	case core.RouteReject:
+		// 分流判定为拒绝：本地直接回 REFUSED——被拒名字不发给任何上游
+		//（发给出口节点同样会把查询泄漏出去）。
+		result := core.ResultDenied
+		elapsed := time.Since(start)
+		s.observer.QueryDone(route.Action.String(), result, elapsed)
+		logger.Info("dns query completed",
+			"name", q.name,
+			"qtype", typeName(q.qtype),
+			"route", route.Action.String(),
+			"result", result,
+			"duration", elapsed.Round(time.Microsecond).String(),
+			"duration_ms", elapsed.Milliseconds(),
+		)
+		return errorResponseEcho(q, rcodeRefused)
+	default:
 		resp, upstream, err = s.queryRemote(ctx, q)
 	}
 

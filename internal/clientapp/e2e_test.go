@@ -33,6 +33,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
+	"gopkg.in/yaml.v3"
 )
 
 func testTimeouts() config.Timeouts {
@@ -58,6 +59,62 @@ func boolPtr(b bool) *bool { return &b }
 
 func intPtr(v int) *int { return &v }
 
+// yamlParams 把协议参数形状编码为 yaml.Node（与严格解码路径一致）。
+func yamlParams(t *testing.T, body string) yaml.Node {
+	t.Helper()
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("encode params: %v", err)
+	}
+	return *doc.Content[0]
+}
+
+// trojanServerParams 构造服务端 trojan 入站的协议参数。
+func trojanServerParams(t *testing.T, certFile, keyFile, username, password string) yaml.Node {
+	t.Helper()
+	return yamlParams(t, fmt.Sprintf(
+		"cert-file: %q\nkey-file: %q\nusers:\n  - username: %q\n    password: %q\n",
+		certFile, keyFile, username, password))
+}
+
+// trojanNode 构造测试用出口节点（自签证书场景：跳过校验）。
+func trojanNode(t *testing.T, name, addr, password string) config.Node {
+	t.Helper()
+	return config.Node{
+		Name:     name,
+		Protocol: config.ProtocolTrojan,
+		Params:   yamlParams(t, fmt.Sprintf("addr: %q\npassword: %q\ninsecure-skip-verify: true\n", addr, password)),
+	}
+}
+
+// withAuth 为全部 http / socks5 入站配置共性认证。
+func withAuth(cfg *config.Config, username, password string) *config.Config {
+	for i := range cfg.Inbounds {
+		switch cfg.Inbounds[i].Type {
+		case config.TypeHTTP, config.TypeSOCKS5:
+			cfg.Inbounds[i].Auth = &config.AuthConfig{Users: []config.User{{Username: username, Password: password}}}
+		}
+	}
+	return cfg
+}
+
+// cloneCfg 深拷贝重载测试会修改的切片 / 指针字段（浅拷贝共享底层数组，
+// 原地修改会泄漏回旧配置）。
+func cloneCfg(cfg *config.Config) *config.Config {
+	next := *cfg
+	next.Inbounds = append([]config.Inbound(nil), cfg.Inbounds...)
+	if cfg.Outbound != nil {
+		ob := *cfg.Outbound
+		ob.Nodes = append([]config.Node(nil), cfg.Outbound.Nodes...)
+		next.Outbound = &ob
+	}
+	if cfg.Routing != nil {
+		rt := *cfg.Routing
+		next.Routing = &rt
+	}
+	return &next
+}
+
 // serverHandle 封装一个测试用 proxy-server。
 type serverHandle struct {
 	addr        string
@@ -72,22 +129,24 @@ func startServer(t *testing.T, password string, logger *slog.Logger, withMetrics
 }
 
 // startServerWith 启动测试用 proxy-server；mutate 可在启动前调整配置（如连接上限）。
-func startServerWith(t *testing.T, password string, logger *slog.Logger, withMetrics bool, mutate func(*config.Server)) *serverHandle {
+func startServerWith(t *testing.T, password string, logger *slog.Logger, withMetrics bool, mutate func(*config.Config)) *serverHandle {
 	t.Helper()
 	dir := t.TempDir()
 	certFile, keyFile, err := testutil.WriteTLSCertFiles(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &config.Server{
-		Listen:   "127.0.0.1:0",
-		TLS:      config.ServerTLS{CertFile: certFile, KeyFile: keyFile},
-		Users:    []config.User{{Username: "node-user", Password: password}},
+	cfg := &config.Config{
+		Inbounds: []config.Inbound{{
+			Type:   config.TypeTrojan,
+			Listen: "127.0.0.1:0",
+			Params: trojanServerParams(t, certFile, keyFile, "node-user", password),
+		}},
 		Timeouts: testServerTimeouts(),
 		Log:      config.Log{Level: "debug", Format: "json"},
 	}
 	if withMetrics {
-		cfg.Metrics.Listen = "127.0.0.1:0"
+		cfg.API.Listen = "127.0.0.1:0"
 	}
 	if mutate != nil {
 		mutate(cfg)
@@ -95,9 +154,6 @@ func startServerWith(t *testing.T, password string, logger *slog.Logger, withMet
 	app, err := serverapp.New(cfg, logger, nil)
 	if err != nil {
 		t.Fatalf("serverapp.New: %v", err)
-	}
-	if err := app.Listen(); err != nil {
-		t.Fatalf("serverapp.Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -121,15 +177,12 @@ func startServerWith(t *testing.T, password string, logger *slog.Logger, withMet
 	return &serverHandle{addr: app.TunnelAddr(), metricsAddr: app.MetricsAddr(), stop: stop}
 }
 
-// startClient 启动一个测试用 proxy-client。
-func startClient(t *testing.T, cfg *config.Client, logger *slog.Logger) *clientapp.App {
+// startClient 启动一个测试用 proxy-client（New 已完成组装与监听绑定）。
+func startClient(t *testing.T, cfg *config.Config, logger *slog.Logger) *clientapp.App {
 	t.Helper()
 	app, err := clientapp.New(cfg, logger, nil)
 	if err != nil {
 		t.Fatalf("clientapp.New: %v", err)
-	}
-	if err := app.Listen(); err != nil {
-		t.Fatalf("clientapp.Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -148,13 +201,16 @@ func startClient(t *testing.T, cfg *config.Client, logger *slog.Logger) *clienta
 	return app
 }
 
-// baseClientCfg 构造测试用客户端配置：双入站 + 指定节点 + 强制代理。
-func baseClientCfg(nodes []config.Node) *config.Client {
-	cfg := &config.Client{
-		Inbound:  config.Inbound{HTTP: "127.0.0.1:0", SOCKS5: "127.0.0.1:0"},
-		Nodes:    nodes,
-		TLS:      config.ClientTLS{InsecureSkipVerify: true}, // 自签测试证书
-		Routing:  config.Routing{Default: "proxy", PrivateDirect: boolPtr(false)},
+// baseClientCfg 构造测试用客户端配置：双入站 + 指定节点 + 强制代理
+// （私有直连关闭：回环目标也要能走隧道，便于全链路断言）。
+func baseClientCfg(nodes []config.Node) *config.Config {
+	cfg := &config.Config{
+		Inbounds: []config.Inbound{
+			{Type: config.TypeHTTP, Listen: "127.0.0.1:0"},
+			{Type: config.TypeSOCKS5, Listen: "127.0.0.1:0"},
+		},
+		Outbound: &config.Outbound{Nodes: nodes},
+		Routing:  &config.Routing{PrivateDirect: boolPtr(false)},
 		Timeouts: testTimeouts(),
 		Log:      config.Log{Level: "debug", Format: "json"},
 	}
@@ -230,7 +286,7 @@ func TestE2EConnectSuccessRateAndThreeNodes(t *testing.T) {
 		logs := &lockedBuffer{}
 		logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 		h := startServer(t, pw, logger, false)
-		nodes = append(nodes, config.Node{Addr: h.addr, Password: pw})
+		nodes = append(nodes, trojanNode(t, fmt.Sprintf("node-%d", len(nodes)+1), h.addr, pw))
 		nodeLogs = append(nodeLogs, logs)
 	}
 
@@ -312,7 +368,7 @@ func TestE2EFailoverAndAllNodesDown(t *testing.T) {
 	for _, pw := range passwords {
 		h := startServer(t, pw, nil, true)
 		handles = append(handles, h)
-		nodes = append(nodes, config.Node{Addr: h.addr, Password: pw})
+		nodes = append(nodes, trojanNode(t, fmt.Sprintf("node-%d", len(nodes)+1), h.addr, pw))
 	}
 
 	target := startTLSTarget(t)
@@ -396,8 +452,7 @@ func TestE2EHTTPInboundAuth(t *testing.T) {
 	h := startServer(t, "node-secret", nil, false)
 	target := startTLSTarget(t)
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Inbound.Auth = []config.User{{Username: "alice", Password: "secret"}}
+	cfg := withAuth(baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")}), "alice", "secret")
 	app := startClient(t, cfg, nil)
 
 	// 无凭据：407。
@@ -548,8 +603,7 @@ func TestE2ESOCKS5Inbound(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Inbound.Auth = []config.User{{Username: "alice", Password: "secret"}}
+	cfg := withAuth(baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")}), "alice", "secret")
 	app := startClient(t, cfg, nil)
 
 	// 错误凭据应被拒绝。
@@ -667,8 +721,8 @@ func TestE2EMetricsAndStructuredLogs(t *testing.T) {
 	h := startServer(t, "node-secret", serverLogger, true)
 	target := startTLSTarget(t)
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, clientLogger)
 
 	client := browser(t, "http://"+app.HTTPAddr(), 1)
@@ -785,8 +839,8 @@ func getJSON(t *testing.T, url string, out any) int {
 
 func TestE2EHealthAndStatsEndpoints(t *testing.T) {
 	h := startServer(t, "node-secret", nil, false)
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, nil)
 
 	// 健康：200 + status ok + uptime。
@@ -850,8 +904,8 @@ func TestE2EHealthReportsNodesCooling(t *testing.T) {
 	deadAddr := ln.Addr().String()
 	_ = ln.Close()
 
-	cfg := baseClientCfg([]config.Node{{Addr: deadAddr, Password: "pw"}})
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "dead", deadAddr, "pw")})
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, nil)
 
 	// 触发一次失败的拨号（失败在响应前已计入节点状态）。
@@ -974,23 +1028,25 @@ func TestE2EHealthCheckRemovesAndRejoinsNode(t *testing.T) {
 	flakyAddr := freeTCPAddr(t)
 	flakyLogs := &lockedBuffer{}
 	flakyLogger := slog.New(slog.NewJSONHandler(flakyLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	flaky := startServerWith(t, "flaky-secret", flakyLogger, false, func(c *config.Server) {
-		c.Listen = flakyAddr
+	flaky := startServerWith(t, "flaky-secret", flakyLogger, false, func(c *config.Config) {
+		c.Inbounds[0].Listen = flakyAddr
 	})
 
 	nodes := []config.Node{
-		{Addr: stable.addr, Password: "stable-secret"},
-		{Addr: flaky.addr, Password: "flaky-secret"},
+		trojanNode(t, "stable", stable.addr, "stable-secret"),
+		trojanNode(t, "flaky", flaky.addr, "flaky-secret"),
 	}
 	target := startTLSTarget(t)
 	cfg := baseClientCfg(nodes)
-	cfg.Metrics.Listen = "127.0.0.1:0"
-	cfg.Pool = config.Pool{MaxIdle: intPtr(2), IdleTTL: config.Duration(30 * time.Second)}
-	cfg.HealthCheck = config.HealthCheck{
-		Interval:  durationPtr(100 * time.Millisecond),
-		Timeout:   config.Duration(300 * time.Millisecond),
-		Failures:  intPtr(2),
-		Successes: intPtr(2),
+	cfg.API.Listen = "127.0.0.1:0"
+	cfg.Outbound.Pool = config.PoolConfig{
+		Prewarm: config.PrewarmConfig{Size: intPtr(2), TTL: config.Duration(30 * time.Second)},
+		Health: config.HealthConfig{
+			Interval:  durationPtr(100 * time.Millisecond),
+			Timeout:   config.Duration(300 * time.Millisecond),
+			Failures:  intPtr(2),
+			Successes: intPtr(2),
+		},
 	}
 	app := startClient(t, cfg, nil)
 
@@ -1030,8 +1086,8 @@ func TestE2EHealthCheckRemovesAndRejoinsNode(t *testing.T) {
 	}
 
 	// 同址重启 flaky 节点：健康检查连续成功达阈值后自动加回并重新承载流量。
-	flaky = startServerWith(t, "flaky-secret", flakyLogger, false, func(c *config.Server) {
-		c.Listen = flakyAddr
+	flaky = startServerWith(t, "flaky-secret", flakyLogger, false, func(c *config.Config) {
+		c.Inbounds[0].Listen = flakyAddr
 	})
 	up = waitUpstream(t, app.MetricsAddr(), flaky.addr, func(up upstreamStats) bool { return !up.Removed })
 	if !up.Healthy || up.ProbeFails != 0 {
@@ -1067,9 +1123,9 @@ func TestE2EUpstreamPoolClaimHit(t *testing.T) {
 	h := startServer(t, "node-secret", nil, false)
 	target := startTLSTarget(t)
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Pool = config.Pool{MaxIdle: intPtr(2), IdleTTL: config.Duration(3 * time.Second)}
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
+	cfg.Outbound.Pool = config.PoolConfig{Prewarm: config.PrewarmConfig{Size: intPtr(2), TTL: config.Duration(3 * time.Second)}}
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, nil)
 
 	// 启动预热完成后应有 2 条空闲隧道。
@@ -1111,13 +1167,10 @@ func TestE2EShutdownDrainsInflightRequest(t *testing.T) {
 	echoAddr := startEcho(t)
 	h := startServer(t, "node-secret", nil, false)
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
 	app, err := clientapp.New(cfg, nil, nil)
 	if err != nil {
 		t.Fatalf("clientapp.New: %v", err)
-	}
-	if err := app.Listen(); err != nil {
-		t.Fatalf("clientapp.Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErrCh := make(chan error, 1)
@@ -1260,9 +1313,9 @@ func TestE2EOverloadReturnsClearErrorAndRecovers(t *testing.T) {
 	echoAddr := startEcho(t)
 	h := startServer(t, "node-secret", nil, false)
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
 	cfg.Limits = config.Limits{MaxConnections: intPtr(1)}
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, nil)
 
 	// 隧道 1 占满唯一名额，并确认隧道确实在工作。
@@ -1343,7 +1396,7 @@ func TestE2ETunnelOverloadRejectsAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := startServerWith(t, "node-secret", nil, true, func(cfg *config.Server) {
+	h := startServerWith(t, "node-secret", nil, true, func(cfg *config.Config) {
 		cfg.Limits = config.Limits{MaxConnections: intPtr(1)}
 	})
 	dial := func() (net.Conn, error) {
@@ -1417,14 +1470,11 @@ func TestE2ELogLevelEndpointAndDynamicFiltering(t *testing.T) {
 	var logs lockedBuffer
 	logger, logCtrl := logging.NewControlWithWriter(&logs, "info", "json")
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
+	cfg.API.Listen = "127.0.0.1:0"
 	app, err := clientapp.New(cfg, logger, logCtrl)
 	if err != nil {
 		t.Fatalf("clientapp.New: %v", err)
-	}
-	if err := app.Listen(); err != nil {
-		t.Fatalf("clientapp.Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveErrCh := make(chan error, 1)
@@ -1539,15 +1589,22 @@ func TestE2EDNSGatewayRoutesRemoteAndDirect(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := baseClientCfg([]config.Node{{Addr: h.addr, Password: "node-secret"}})
-	cfg.Routing = config.Routing{Default: "proxy", RulesFile: rulesPath, PrivateDirect: boolPtr(false)}
-	cfg.Metrics.Listen = "127.0.0.1:0"
-	cfg.DNS = config.DNS{
-		Listen:  "127.0.0.1:0",
-		Remote:  remoteDNS.Addr,
-		Local:   []string{localDNS.Addr},
-		Timeout: config.Duration(3 * time.Second),
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", h.addr, "node-secret")})
+	cfg.Routing = &config.Routing{
+		PrivateDirect: boolPtr(false),
+		Rulesets: []config.Ruleset{{
+			Name: "local",
+			Type: "file",
+			Path: rulesPath,
+		}},
+		DNS: &config.DNSRouting{
+			Remote:  remoteDNS.Addr,
+			Local:   []string{localDNS.Addr},
+			Timeout: config.Duration(3 * time.Second),
+		},
 	}
+	cfg.API.Listen = "127.0.0.1:0"
+	cfg.Inbounds = append(cfg.Inbounds, config.Inbound{Type: config.TypeDNS, Listen: "127.0.0.1:0"})
 	app := startClient(t, cfg, logger)
 
 	// 代理名字：经出口节点远程解析，答案为远端解析器的记录。
@@ -1612,13 +1669,13 @@ func TestFailoverBudgetCapsHalfDeadNodes(t *testing.T) {
 	}
 
 	cfg := baseClientCfg([]config.Node{
-		{Addr: blackhole(), Password: "p1"},
-		{Addr: blackhole(), Password: "p2"},
+		trojanNode(t, "hole-1", blackhole(), "p1"),
+		trojanNode(t, "hole-2", blackhole(), "p2"),
 	})
 	cfg.Timeouts.Dial = config.Duration(2 * time.Second)
 	// 单节点握手超时远大于预算：没有预算时最坏等待 ≈ 2 × 10s。
 	cfg.Timeouts.Handshake = config.Duration(10 * time.Second)
-	cfg.Timeouts.Failover = config.Duration(300 * time.Millisecond)
+	cfg.Outbound.Pool.FailoverBudget = config.Duration(300 * time.Millisecond)
 	app := startClient(t, cfg, slog.New(slog.DiscardHandler))
 
 	client := browser(t, "http://"+app.HTTPAddr(), 1)

@@ -13,19 +13,23 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
+	"gopkg.in/yaml.v3"
 )
 
-func baseServerCfg(t *testing.T) *config.Server {
+// baseServerCfg 构造测试用服务端配置：单 trojan 入站（自签证书）。
+func baseServerCfg(t *testing.T) *config.Config {
 	t.Helper()
 	dir := t.TempDir()
 	certFile, keyFile, err := testutil.WriteTLSCertFiles(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &config.Server{
-		Listen: "127.0.0.1:0",
-		TLS:    config.ServerTLS{CertFile: certFile, KeyFile: keyFile},
-		Users:  []config.User{{Username: "alice", Password: "secret"}},
+	return &config.Config{
+		Inbounds: []config.Inbound{{
+			Type:   config.TypeTrojan,
+			Listen: "127.0.0.1:0",
+			Params: trojanParams(t, certFile, keyFile, "alice", "secret"),
+		}},
 		Timeouts: config.Timeouts{
 			Dial:      config.Duration(3 * time.Second),
 			Handshake: config.Duration(3 * time.Second),
@@ -35,9 +39,42 @@ func baseServerCfg(t *testing.T) *config.Server {
 	}
 }
 
+// trojanParams 把服务端 trojan 入站的协议参数编码为 yaml.Node
+// （与严格解码路径一致）。
+func trojanParams(t *testing.T, certFile, keyFile, username, password string) yaml.Node {
+	t.Helper()
+	body := "cert-file: " + quote(certFile) + "\n" +
+		"key-file: " + quote(keyFile) + "\n" +
+		"users:\n  - username: " + quote(username) + "\n    password: " + quote(password) + "\n"
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatal(err)
+	}
+	return *doc.Content[0]
+}
+
+func quote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// usersOf 返回服务端入站的凭据参数（测试改动用户时重建 params）。
+func usersOf(t *testing.T, certFile, keyFile string, users ...[2]string) yaml.Node {
+	t.Helper()
+	body := "cert-file: " + quote(certFile) + "\nkey-file: " + quote(keyFile) + "\nusers:\n"
+	for _, u := range users {
+		body += "  - username: " + quote(u[0]) + "\n    password: " + quote(u[1]) + "\n"
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatal(err)
+	}
+	return *doc.Content[0]
+}
+
 func TestNewRejectsMissingCert(t *testing.T) {
 	cfg := baseServerCfg(t)
-	cfg.TLS.CertFile = filepath.Join(t.TempDir(), "missing.pem")
+	cfg.Inbounds[0].Params = trojanParams(t, filepath.Join(t.TempDir(), "missing.pem"), filepath.Join(t.TempDir(), "missing.key"), "alice", "secret")
 	if _, err := serverapp.New(cfg, nil, nil); err == nil {
 		t.Fatal("missing certificate should be rejected")
 	}
@@ -45,7 +82,21 @@ func TestNewRejectsMissingCert(t *testing.T) {
 
 func TestNewRejectsMissingDecoyFile(t *testing.T) {
 	cfg := baseServerCfg(t)
-	cfg.DecoyFile = filepath.Join(t.TempDir(), "missing.html")
+	var doc yaml.Node
+	// 在原 params 基础上追加 decoy-file 字段：直接重新编码完整参数。
+	params := map[string]any{}
+	if err := cfg.Inbounds[0].Params.Decode(&params); err != nil {
+		t.Fatal(err)
+	}
+	params["decoy-file"] = filepath.Join(t.TempDir(), "missing.html")
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Inbounds[0].Params = *doc.Content[0]
 	if _, err := serverapp.New(cfg, nil, nil); err == nil {
 		t.Fatal("missing decoy file should be rejected")
 	}
@@ -53,16 +104,13 @@ func TestNewRejectsMissingDecoyFile(t *testing.T) {
 
 func TestListenServeShutdown(t *testing.T) {
 	cfg := baseServerCfg(t)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.API.Listen = "127.0.0.1:0"
 	app, err := serverapp.New(cfg, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Listen(); err != nil {
-		t.Fatal(err)
-	}
 	if app.TunnelAddr() == "" || app.MetricsAddr() == "" {
-		t.Fatal("addresses should be reported after Listen")
+		t.Fatal("addresses should be reported after New")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -140,15 +188,12 @@ func TestHealthReportsExpiredCertificate(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := baseServerCfg(t)
-	cfg.TLS = config.ServerTLS{CertFile: certFile, KeyFile: keyFile}
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.Inbounds[0].Params = trojanParams(t, certFile, keyFile, "alice", "secret")
+	cfg.API.Listen = "127.0.0.1:0"
 
 	// 过期证书不影响启动（TLS 握手时客户端自会拒绝），由 /health 暴露依赖状态。
 	app, err := serverapp.New(cfg, nil, nil)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := app.Listen(); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

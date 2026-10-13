@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 )
 
 // 领取结果标签值：命中 / 池内无可用连接 / 池内连接已失效。
@@ -79,7 +80,7 @@ type Node struct {
 type Options struct {
 	// MaxIdle 是每节点最大空闲连接数；<=0 时池关闭（Claim 恒失败）。
 	MaxIdle int
-	// IdleTTL 是空闲连接最长保留时间；<=0 时使用 5s。
+	// IdleTTL 是空闲连接最长保留时间；<=0 时使用 defaults.PrewarmTTL（5s）。
 	IdleTTL time.Duration
 	// Now 注入时钟（测试用），默认 time.Now。
 	Now func() time.Time
@@ -124,7 +125,7 @@ func New(nodes []Node, opts Options) (*Pool, error) {
 		return nil, errors.New("connpool: at least one node is required")
 	}
 	if opts.IdleTTL <= 0 {
-		opts.IdleTTL = 5 * time.Second
+		opts.IdleTTL = defaults.PrewarmTTL
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now

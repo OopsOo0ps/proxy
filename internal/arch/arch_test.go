@@ -52,7 +52,8 @@ var allowAny = map[string][]string{
 	"internal/outbound": {"core"},
 	// session 只承载 accept/drain 机械部分：除 shutdown 排空原语外
 	// 不依赖任何 internal 包（协议细节与契约词汇都不进生命周期层）。
-	"internal/session": {"shutdown"},
+	// shutdown 自身引用 defaults（L0 纯常量），随传递依赖一并放行。
+	"internal/session": {"shutdown", "defaults"},
 }
 
 // TestDependencyDirection 对矩阵中的每个包执行 go list -deps 并断言

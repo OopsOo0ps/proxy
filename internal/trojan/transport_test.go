@@ -26,9 +26,9 @@ func newTestTransport(t *testing.T) (*Transport, core.Target) {
 	}
 	srv := &Server{
 		Verifier: store,
-		Dial: func(ctx context.Context, addr string) (net.Conn, error) {
+		Dial: dialerOf(func(ctx context.Context, addr string) (net.Conn, error) {
 			return net.Dial("tcp", addr)
-		},
+		}),
 	}
 	nodeAddr, clientTLS := startTLSServer(t, srv, 3*time.Second)
 
@@ -67,4 +67,18 @@ func TestTransportConformance(t *testing.T) {
 	tr, _ := newTestTransport(t)
 
 	outbound.RunConformance(t, tr)
+}
+
+// dialerOf 把 (ctx, addr) 拨号函数适配为 core.TargetDialer（测试假件）。
+func dialerOf(fn func(ctx context.Context, addr string) (net.Conn, error)) core.TargetDialer {
+	return dialerOfAdapter{fn: fn}
+}
+
+type dialerOfAdapter struct {
+	fn func(ctx context.Context, addr string) (net.Conn, error)
+}
+
+func (a dialerOfAdapter) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	conn, err := a.fn(ctx, t.String())
+	return conn, core.Route{Action: core.RouteDirect}, err
 }
