@@ -24,20 +24,17 @@ flowchart LR
         SERVER["proxy-server<br/>Trojan over TLS 出口"]
     end
 
-    CONTROLLER["proxy-controller<br/>（规划中）"]
     TARGET["目标站点"]
 
     APP -->|"HTTP / HTTPS(CONNECT) / SOCKS5"| CLIENT
     CLIENT -->|"Trojan over TLS"| SERVER
     CLIENT -.->|"直连（规则命中 / 内网地址）"| TARGET
     SERVER -->|"出站访问"| TARGET
-    CONTROLLER -.->|"配置下发（规划中）"| CLIENT
-    CONTROLLER -.->|"配置下发（规划中）"| SERVER
 ```
 
 - 实线：数据流方向（请求逐级转发，响应沿原路返回）。
-- 虚线：控制流方向；`proxy-controller` 仍为骨架，配置下发尚未实现。
-- 代码依赖方向：`cmd/` → `internal/` → `pkg/`。
+- 虚线：直连路径（规则命中或内网地址时不经出口节点）。
+- 代码依赖方向：`cmd/` → `internal/`（分层约束由 `internal/arch` 守护测试强制）。
 
 ## 特性
 
@@ -225,7 +222,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 - **健康检查不校验隧道口令**：口令错误等隧道层问题由真实流量的被动冷却兜底；摘除判定按探测周期累计（默认最坏约 30s，期间少量请求可能失败）。
 - **连接池存在回收窗口**：空闲连接可能被服务端按握手超时回收；请保持 `pool.idle_ttl` 明显小于服务端 `timeouts.handshake`。
 - **热加载不覆盖监听地址**：`inbound.*` / `listen` 等变更会被明确拒绝并提示重启。
-- `proxy-controller` 仍为骨架，配置暂不支持集中下发；生产目标平台为 Ubuntu 22.04，尚未提供发行包（deb / apt 源）。
+- 生产目标平台为 Ubuntu 22.04，尚未提供发行包（deb / apt 源）与集中配置下发。
 
 完整清单（连接上限语义、远程规则边界、收尾中止不可区分等）见 [Wiki：限制与边界](https://github.com/OopsOo0ps/proxy/wiki/限制与边界)。
 
@@ -242,10 +239,9 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 ## 项目结构
 
 ```text
-├── cmd/                  # 可执行入口（三个独立二进制）
+├── cmd/                  # 可执行入口（两个独立二进制）
 │   ├── server/           #   proxy-server（远端出口）
-│   ├── client/           #   proxy-client（本机入口）
-│   └── controller/       #   proxy-controller（骨架）
+│   └── client/           #   proxy-client（本机入口）
 ├── configs/              # 示例配置（生产模板 + 本地三节点演示）
 ├── internal/
 │   ├── arch/             #   依赖方向守护测试（go list -deps 矩阵，make test 拦截）
@@ -273,8 +269,8 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 │   ├── sockswire/        #   SOCKS5 线格式编解码
 │   ├── status/           #   运行时状态快照（/stats）
 │   ├── testutil/         #   测试辅助（自签证书）
-│   └── trojan/           #   Trojan 协议（客户端传输实现 / 服务端）
-├── pkg/version/          #   版本信息（构建期注入）
+│   ├── trojan/           #   Trojan 协议（客户端传输实现 / 服务端）
+│   └── version/          #   版本信息（构建期 ldflags 注入）
 ├── test/integration/     #   黑盒集成测试（真实二进制端到端）
 ├── Dockerfile            # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
 ├── deploy/systemd/       # systemd 单元（Ubuntu 22.04，含沙箱配置）

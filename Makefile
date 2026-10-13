@@ -45,15 +45,15 @@ COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 LDFLAGS := -s -w \
-  -X '$(MODULE)/pkg/version.Version=$(VERSION)' \
-  -X '$(MODULE)/pkg/version.Commit=$(COMMIT)' \
-  -X '$(MODULE)/pkg/version.BuildDate=$(BUILD_DATE)'
+  -X '$(MODULE)/internal/version.Version=$(VERSION)' \
+  -X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
+  -X '$(MODULE)/internal/version.BuildDate=$(BUILD_DATE)'
 
 GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
-.PHONY: all build test cover lint fmt vet run run-server run-client run-controller dev-cert \
+.PHONY: all build test cover lint fmt vet run run-server run-client dev-cert \
 	version demo demo-up demo-check demo-down \
 	docker-build docker-build-debug clean help
 
@@ -63,7 +63,6 @@ build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-server ./cmd/server
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-client ./cmd/client
-	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-controller ./cmd/controller
 
 version: build
 	@$(BIN_DIR)/proxy-server -version
@@ -115,9 +114,6 @@ run-server: build
 
 run-client: build
 	$(BIN_DIR)/proxy-client -config $(CLIENT_CONFIG)
-
-run-controller: build
-	$(BIN_DIR)/proxy-controller
 
 dev-cert:
 	@mkdir -p var
@@ -244,7 +240,6 @@ help:
 		'  run             构建并前台启动 proxy-server（run-server 别名）' \
 		'  run-server      前台运行 proxy-server（SERVER_CONFIG= 覆盖配置）' \
 		'  run-client      前台运行 proxy-client（CLIENT_CONFIG= 覆盖配置）' \
-		'  run-controller  运行 proxy-controller' \
 		'  dev-cert        生成本地演示用自签证书到 var/' \
 		'  docker-build    构建最小运行镜像（linux/amd64，distroless）' \
 		'  docker-build-debug 构建排错镜像（alpine + 网络排查工具）' \
