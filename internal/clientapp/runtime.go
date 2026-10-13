@@ -13,7 +13,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
-	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
 	"github.com/OopsOo0ps/proxy/internal/ruleset"
@@ -36,8 +35,7 @@ type Runtime struct {
 	cfg        *config.Config
 	table      *routeTable
 	providers  []*ruleset.Provider
-	pool       *nodes.Pool
-	connPool   *connpool.Pool
+	pool       *nodes.Pool // 持有预热池（§5.3：NodePool → 每节点 PrewarmPool）
 	dnsRemote  string
 	dnsLocal   []string
 	dnsTimeout time.Duration
@@ -100,8 +98,7 @@ func newInboundServer(proto string, ic config.Inbound) InboundServer {
 // 各组件 Start 幂等；同一 Runtime 实例至多启动一次（restore 路径使用
 // 浅拷贝，天然获得新的启动状态）。
 func (r *Runtime) startResources(ctx context.Context) {
-	r.connPool.Start(ctx)
-	r.pool.StartHealthChecks(ctx)
+	r.pool.Start(ctx)
 	for _, p := range r.providers {
 		p.Start(ctx)
 	}
@@ -110,7 +107,6 @@ func (r *Runtime) startResources(ctx context.Context) {
 // closeResources 关闭快照的后台资源（幂等）：释放空闲预热连接并停止
 // 探测 / 刷新循环。在途连接不受影响（它们持有已领取的连接）。
 func (r *Runtime) closeResources() {
-	r.connPool.Close()
 	r.pool.Close()
 	for _, p := range r.providers {
 		p.Close()
@@ -135,9 +131,6 @@ func (r *Runtime) closeListeners() {
 // 用于构建 / 绑定失败的清理路径（不变量 3：失败路径关闭已打开的一切）。
 func (r *Runtime) closeOwned(reuse *Runtime) {
 	r.closeListeners()
-	if r.connPool != nil && (reuse == nil || r.connPool != reuse.connPool) {
-		r.connPool.Close()
-	}
 	if r.pool != nil && (reuse == nil || r.pool != reuse.pool) {
 		r.pool.Close()
 	}
@@ -151,9 +144,6 @@ func (r *Runtime) closeOwned(reuse *Runtime) {
 // releaseReplaced 关闭被 next 替换的后台资源（新运行时复用的除外）。
 // 提交路径使用：切换后立即释放被替换的池与规则源，在途连接不受影响。
 func (r *Runtime) releaseReplaced(next *Runtime) {
-	if r.connPool != nil && r.connPool != next.connPool {
-		r.connPool.Close()
-	}
 	if r.pool != nil && r.pool != next.pool {
 		r.pool.Close()
 	}

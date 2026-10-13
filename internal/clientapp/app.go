@@ -30,7 +30,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
-	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
@@ -503,7 +502,6 @@ func (b *builder) buildOutbound(cfg *config.Config, reuse *Runtime, rt *Runtime)
 			b.logger.Warn("upstream fingerprint failed; rebuilding pools", "error", err)
 		} else if !changed {
 			rt.pool = reuse.pool
-			rt.connPool = reuse.connPool
 			return nil
 		}
 	}
@@ -522,55 +520,24 @@ func (b *builder) buildOutbound(cfg *config.Config, reuse *Runtime, rt *Runtime)
 		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: addr, Transport: tr})
 	}
 
-	// 预热池只对实现 Prewarmer 能力的传输启用；size = 0 或无可用能力时
-	// 保持 nil（Claim 对 nil 接收者安全，恒回退新建）。
-	var connPool *connpool.Pool
+	// 节点池拨号回退路径：预热领取未命中时走节点自身传输（预热池由
+	// nodes.Pool 自持，§5.3 组合树：NodePool → 每节点 PrewarmPool）。
 	poolCfg := cfg.Outbound.Pool
-	if size := poolCfg.Prewarm.EffectiveSize(); size > 0 {
-		var specs []connpool.Node
-		for _, n := range nodeCfgs {
-			pw, ok := n.Transport.(outbound.Prewarmer)
-			if !ok {
-				continue
-			}
-			specs = append(specs, prewarmNode(n.Addr, pw))
-		}
-		if len(specs) > 0 {
-			var err error
-			connPool, err = connpool.New(specs, connpool.Options{
-				MaxIdle:  size,
-				IdleTTL:  poolCfg.Prewarm.EffectiveTTL(),
-				Logger:   b.logger,
-				Observer: b.metrics,
-			})
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	// 节点池拨号：预热领取未命中（或池未启用）时走节点自身传输。
-	dialFn := func(ctx context.Context, node nodes.Node, t core.Target) (net.Conn, error) {
-		if conn, ok := connPool.Claim(ctx, node.Addr, t); ok {
-			return conn, nil
-		}
-		return node.Transport.DialTunnel(ctx, t)
-	}
 	health := poolCfg.Health
 	opts := nodes.Options{
 		Logger:   b.logger,
 		Observer: b.metrics,
 		// 故障转移总预算：整条候选节点的等待上限（缺省 defaults.FailoverBudget）。
 		FailoverBudget: poolCfg.EffectiveFailoverBudget(),
+		// 预热池参数与观测出口：连接池实例由节点池按 Prewarmer 能力自建，
+		// 组装根只注入配置（config 是预热参数的唯一入口）。
+		Prewarm:         nodes.PrewarmOptions{Size: poolCfg.Prewarm.EffectiveSize(), TTL: poolCfg.Prewarm.EffectiveTTL()},
+		PrewarmObserver: b.metrics,
 		Health: nodes.HealthOptions{
 			Interval:  health.EffectiveInterval(),
 			Timeout:   health.EffectiveTimeout(),
 			Failures:  health.EffectiveFailures(),
 			Successes: health.EffectiveSuccesses(),
-		},
-		OnRemove: func(addr string) {
-			// 摘除后该节点不再接新流量：立即释放其空闲预热连接，避免积压死连接。
-			connPool.DropNode(addr)
 		},
 	}
 	if opts.Health.Interval > 0 {
@@ -585,13 +552,11 @@ func (b *builder) buildOutbound(cfg *config.Config, reuse *Runtime, rt *Runtime)
 			return prober.Probe(ctx)
 		}
 	}
-	pool, err := nodes.New(nodeCfgs, dialFn, opts)
+	pool, err := nodes.New(nodeCfgs, nil, opts)
 	if err != nil {
-		// 失败路径不产生外部副作用：释放已建预热池。
-		connPool.Close()
 		return err
 	}
-	rt.connPool, rt.pool = connPool, pool
+	rt.pool = pool
 	return nil
 }
 
@@ -609,36 +574,6 @@ func upstreamStackChanged(oldCfg, newCfg *config.Config) (bool, error) {
 	}
 	return oldFP != newFP, nil
 }
-
-// prewarmNode 把出口传输的两阶段预热能力映射为预热池节点（组装根的唯一
-// 映射点）：connect 阶段只完成协议握手；绑定请求在领取时补发（bind）。
-func prewarmNode(addr string, pw outbound.Prewarmer) connpool.Node {
-	return connpool.Node{
-		Addr: addr,
-		Dial: func(ctx context.Context) (net.Conn, error) {
-			prepared, err := pw.ConnectIdle(ctx)
-			if err != nil {
-				return nil, err
-			}
-			conn, ok := prepared.(net.Conn)
-			if !ok {
-				prepared.Discard()
-				return nil, fmt.Errorf("prewarm handle for %s does not carry a connection", addr)
-			}
-			return conn, nil
-		},
-		Start: func(ctx context.Context, conn net.Conn, t core.Target) error {
-			_, err := pw.Bind(ctx, pooledPrepared{Conn: conn}, t)
-			return err
-		},
-	}
-}
-
-// pooledPrepared 把池内空闲连接包装回两阶段句柄（bind 阶段的入参形态）。
-type pooledPrepared struct{ net.Conn }
-
-// Discard 释放底层连接（与预热池“以关闭连接释放”的语义一致）。
-func (c pooledPrepared) Discard() { _ = c.Close() }
 
 // —— DNS 网关的动态参数与剪枝 ——
 
@@ -857,7 +792,7 @@ func (b *builder) runtimeStats() status.Runtime {
 		},
 	}
 	if rt.pool != nil {
-		idle := rt.connPool.IdleCounts()
+		idle := rt.pool.IdleCounts()
 		for _, n := range rt.pool.Snapshot() {
 			out.Upstreams = append(out.Upstreams, status.Upstream{
 				Addr:              n.Addr,

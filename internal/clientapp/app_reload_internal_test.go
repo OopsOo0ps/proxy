@@ -245,7 +245,8 @@ func TestReloadAppliesLimitsAndLogConfig(t *testing.T) {
 }
 
 // TestReloadReusesOrRebuildsUpstreamPools 按指纹语义验证复用边界：
-// 非上游变更（日志 / 连接上限）复用节点池与预热池；上游变更（超时）重建。
+// 非上游变更（日志 / 连接上限）复用节点池（预热池是其内部机制，随节点池
+// 一并复用）；上游变更（超时）重建。
 func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 	dir := t.TempDir()
 	rulesPath := filepath.Join(dir, "rules.yaml")
@@ -257,8 +258,8 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 		t.Fatal(err)
 	}
 	rt := app.live.Load()
-	if rt.pool == nil || rt.connPool == nil {
-		t.Fatal("test setup: pools must be built")
+	if rt.pool == nil {
+		t.Fatal("test setup: node pool must be built")
 	}
 
 	// 非上游变更：指纹一致，池指针必须复用。
@@ -269,8 +270,8 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 		t.Fatalf("reload (non-upstream): %v", err)
 	}
 	rt2 := app.live.Load()
-	if rt2.pool != rt.pool || rt2.connPool != rt.connPool {
-		t.Fatal("非上游变更必须复用节点池与预热池（指纹应一致）")
+	if rt2.pool != rt.pool {
+		t.Fatal("非上游变更必须复用节点池（指纹应一致）")
 	}
 
 	// 上游变更：指纹变化，池必须重建。
@@ -280,7 +281,7 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 		t.Fatalf("reload (upstream): %v", err)
 	}
 	rt3 := app.live.Load()
-	if rt3.pool == rt2.pool || rt3.connPool == rt2.connPool {
-		t.Fatal("上游变更必须重建节点池与预热池（指纹应变化）")
+	if rt3.pool == rt2.pool {
+		t.Fatal("上游变更必须重建节点池（指纹应变化）")
 	}
 }

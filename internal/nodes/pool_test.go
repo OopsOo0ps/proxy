@@ -339,8 +339,10 @@ func TestNewValidation(t *testing.T) {
 	if _, err := New(nil, dial, Options{}); err == nil {
 		t.Fatal("empty nodes should be rejected")
 	}
-	if _, err := New(testNodes(), nil, Options{}); err == nil {
-		t.Fatal("nil dial should be rejected")
+	// dial 为 nil 是合法输入：回退路径默认走节点传输的 DialTunnel
+	//（预热池收归本包后，组装根不再需要传拨号闭包，见 prewarm_test.go）。
+	if _, err := New(testNodes(), nil, Options{}); err != nil {
+		t.Fatalf("nil dial should default to the node transport: %v", err)
 	}
 	if _, err := New([]Node{{Addr: "no-port", Transport: stubTransport{}}}, dial, Options{}); err == nil {
 		t.Fatal("bad addr should be rejected")

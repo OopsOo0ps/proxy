@@ -13,6 +13,11 @@
 // 不再参与任何尝试，真实流量也不再经过它）；摘除后继续探测，连续成功达
 // 阈值自动加回并清空被动失败计数与冷却。摘除状态只由探测更新，冷却状态
 // 只由真实拨号更新，二者独立但共同决定节点是否可接流量。
+//
+// 预热池是节点池的内部机制（§5.3 组合树：NodePool → 每节点 PrewarmPool）：
+// 对实现 outbound.Prewarmer 能力的节点，池按 Options.Prewarm 持有
+// connpool 实例做 connect-then-bind 预热；拨号 = 预热领取未命中回退
+// 节点传输的 DialTunnel。节点被主动摘除时同步释放其空闲预热连接。
 package nodes
 
 import (
@@ -25,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/connpool"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/outbound"
@@ -65,7 +71,8 @@ type Node struct {
 	Transport outbound.Transport
 }
 
-// DialFunc 通过指定节点建立到目标的隧道连接。
+// DialFunc 是节点拨号函数：预热领取未命中后的回退路径。组装根通常传
+// nil（默认走节点自身传输的 DialTunnel）；测试用它注入记录型假拨号。
 type DialFunc func(ctx context.Context, node Node, t core.Target) (net.Conn, error)
 
 // ProbeFunc 对节点做一次轻量健康探测（经节点传输的探测能力），失败时返回错误。
@@ -90,6 +97,16 @@ type HealthOptions struct {
 	Successes int
 }
 
+// PrewarmOptions 是预热池参数（§5.3 组合树的每节点 PrewarmPool）。
+type PrewarmOptions struct {
+	// Size 是每个可预热节点保留的最大空闲连接数；<= 0 时关闭预热
+	//（拨号直接走节点传输）。
+	Size int
+	// TTL 是空闲连接最长保留时间；<= 0 时使用 connpool 的缺省
+	//（defaults.PrewarmTTL，与配置层文档化缺省同源）。
+	TTL time.Duration
+}
+
 // Options 控制节点池行为。
 type Options struct {
 	// Cooldown 是失败冷却基数，默认 10s。
@@ -105,6 +122,11 @@ type Options struct {
 	Health HealthOptions
 	// Probe 是主动探测函数；开启健康检查（Health.Interval > 0）时必填。
 	Probe ProbeFunc
+	// Prewarm 是预热池参数；Size <= 0 或无节点实现 Prewarmer 能力时不预热。
+	Prewarm PrewarmOptions
+	// PrewarmObserver 是预热池的遥测出口（connpool.Observer，L4 适配）；
+	// nil 时使用 connpool.NopObserver。
+	PrewarmObserver connpool.Observer
 	// OnRemove 在节点刚被主动摘除时回调（可选）。
 	OnRemove func(addr string)
 	// OnRejoin 在节点刚被主动加回时回调（可选）。
@@ -117,11 +139,12 @@ type Options struct {
 
 // Pool 是并发安全的出口节点池。
 type Pool struct {
-	mu     sync.Mutex
-	nodes  []*state
-	dial   DialFunc
-	opts   Options
-	cursor atomic.Uint64
+	mu      sync.Mutex
+	nodes   []*state
+	dial    DialFunc
+	opts    Options
+	prewarm *connpool.Pool // 预热池（组合树的每节点 PrewarmPool）；nil = 未启用
+	cursor  atomic.Uint64
 
 	hcStarted bool
 	hcClosed  bool
@@ -151,12 +174,13 @@ type Status struct {
 }
 
 // New 构建节点池；节点数量至少为 1。
+//
+// dial 是节点拨号函数（预热领取未命中后的回退路径）；为 nil 时默认走
+// 节点自身传输的 DialTunnel。预热池由本包按 Options.Prewarm 自持：仅对
+// 实现 outbound.Prewarmer 能力的节点生成预热 spec，构建失败返回错误。
 func New(cfgs []Node, dial DialFunc, opts Options) (*Pool, error) {
 	if len(cfgs) == 0 {
 		return nil, errors.New("nodes: at least one exit node is required")
-	}
-	if dial == nil {
-		return nil, errors.New("nodes: dial func is required")
 	}
 	if opts.Cooldown <= 0 {
 		opts.Cooldown = 10 * time.Second
@@ -187,15 +211,82 @@ func New(cfgs []Node, dial DialFunc, opts Options) (*Pool, error) {
 			opts.Health.Successes = 2
 		}
 	}
-	p := &Pool{dial: dial, opts: opts}
+	p := &Pool{opts: opts}
+	// 预热池是节点池的内部机制（§5.3）：按配置为可预热节点建一次，
+	// 组装根只注入参数与观测出口，不再触碰预热连接的生命周期。
+	if opts.Prewarm.Size > 0 {
+		var specs []connpool.Node
+		for _, cfg := range cfgs {
+			pw, ok := cfg.Transport.(outbound.Prewarmer)
+			if !ok {
+				continue
+			}
+			specs = append(specs, prewarmNode(cfg.Addr, pw))
+		}
+		if len(specs) > 0 {
+			prewarm, err := connpool.New(specs, connpool.Options{
+				MaxIdle:  opts.Prewarm.Size,
+				IdleTTL:  opts.Prewarm.TTL,
+				Logger:   opts.Logger,
+				Observer: opts.PrewarmObserver,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("nodes: prewarm pool: %w", err)
+			}
+			p.prewarm = prewarm
+		}
+	}
+	if dial == nil {
+		dial = func(ctx context.Context, node Node, t core.Target) (net.Conn, error) {
+			return node.Transport.DialTunnel(ctx, t)
+		}
+	}
+	p.dial = func(ctx context.Context, node Node, t core.Target) (net.Conn, error) {
+		// 拨号 = 预热领取未命中回退节点拨号（行为与组装根自持预热池时等价）。
+		if conn, ok := p.prewarm.Claim(ctx, node.Addr, t); ok {
+			return conn, nil
+		}
+		return dial(ctx, node, t)
+	}
 	for i, cfg := range cfgs {
 		if err := validateNode(cfg); err != nil {
+			p.Close()
 			return nil, fmt.Errorf("nodes[%d]: %w", i, err)
 		}
 		p.nodes = append(p.nodes, &state{cfg: cfg})
 	}
 	return p, nil
 }
+
+// prewarmNode 把出口传输的两阶段预热能力映射为预热池节点（本包内唯一
+// 映射点）：connect 阶段只完成协议握手；绑定请求在领取时补发（bind）。
+func prewarmNode(addr string, pw outbound.Prewarmer) connpool.Node {
+	return connpool.Node{
+		Addr: addr,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			prepared, err := pw.ConnectIdle(ctx)
+			if err != nil {
+				return nil, err
+			}
+			conn, ok := prepared.(net.Conn)
+			if !ok {
+				prepared.Discard()
+				return nil, fmt.Errorf("prewarm handle for %s does not carry a connection", addr)
+			}
+			return conn, nil
+		},
+		Start: func(ctx context.Context, conn net.Conn, t core.Target) error {
+			_, err := pw.Bind(ctx, pooledPrepared{Conn: conn}, t)
+			return err
+		},
+	}
+}
+
+// pooledPrepared 把池内空闲连接包装回两阶段句柄（bind 阶段的入参形态）。
+type pooledPrepared struct{ net.Conn }
+
+// Discard 释放底层连接（与预热池“以关闭连接释放”的语义一致）。
+func (c pooledPrepared) Discard() { _ = c.Close() }
 
 // Len 返回节点数量。
 func (p *Pool) Len() int { return len(p.nodes) }
@@ -380,8 +471,19 @@ func (p *Pool) StartHealthChecks(ctx context.Context) {
 	go p.healthLoop(ctx, done)
 }
 
-// Close 停止主动健康探测并等待探测循环退出；可重复调用，对 nil 接收者安全。
-// 它不影响在途请求的拨号：被替换的池不再接新流量，由上层丢弃引用。
+// Start 启动池的后台任务（预热补池 + 主动健康探测）；幂等，对 nil 接收者
+// 安全。ctx 取消或 Close 后全部后台任务停止。
+func (p *Pool) Start(ctx context.Context) {
+	if p == nil {
+		return
+	}
+	p.prewarm.Start(ctx)
+	p.StartHealthChecks(ctx)
+}
+
+// Close 停止主动健康探测、释放预热空闲连接并等待后台任务退出；可重复调用，
+// 对 nil 接收者安全。它不影响在途请求的拨号：被替换的池不再接新流量，
+// 由上层丢弃引用。
 func (p *Pool) Close() {
 	if p == nil {
 		return
@@ -396,6 +498,16 @@ func (p *Pool) Close() {
 	if done != nil {
 		<-done
 	}
+	p.prewarm.Close()
+}
+
+// IdleCounts 返回各节点当前空闲预热连接数快照（供 /stats 使用）；
+// 未启用预热时为 nil。对 nil 接收者安全。
+func (p *Pool) IdleCounts() map[string]int {
+	if p == nil {
+		return nil
+	}
+	return p.prewarm.IdleCounts()
 }
 
 // healthLoop 周期执行探测，直到 ctx 取消。
@@ -472,6 +584,8 @@ func (p *Pool) recordProbe(st *state, err error) {
 	p.opts.Observer.ProbeResult(st.cfg.Addr, ok)
 	switch {
 	case removedNow:
+		// 摘除后该节点不再接新流量：立即释放其空闲预热连接，避免积压死连接。
+		p.prewarm.DropNode(st.cfg.Addr)
 		p.opts.Observer.HealthChanged(st.cfg.Addr, false)
 		if l := p.opts.Logger; l != nil {
 			l.Warn("exit node removed by active health check",
