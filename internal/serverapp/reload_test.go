@@ -23,14 +23,11 @@ import (
 )
 
 // startReloadApp 启动 serverapp 并在测试结束时优雅关停。
-func startReloadApp(t *testing.T, cfg *config.Server) *serverapp.App {
+func startReloadApp(t *testing.T, cfg *config.Config) *serverapp.App {
 	t.Helper()
 	app, err := serverapp.New(cfg, nil, nil)
 	if err != nil {
 		t.Fatalf("serverapp.New: %v", err)
-	}
-	if err := app.Listen(); err != nil {
-		t.Fatalf("serverapp.Listen: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -120,6 +117,42 @@ func tlsPeerSerial(t *testing.T, addr string) *big.Int {
 	return conn.ConnectionState().PeerCertificates[0].SerialNumber
 }
 
+// withUsers 返回换了凭据的配置副本（同监听地址：同端口重载）。
+func withUsers(t *testing.T, cfg *config.Config, users ...[2]string) *config.Config {
+	t.Helper()
+	next := *cfg
+	next.Inbounds = append([]config.Inbound(nil), cfg.Inbounds...)
+	old := map[string]any{}
+	if err := next.Inbounds[0].Params.Decode(&old); err != nil {
+		t.Fatal(err)
+	}
+	certFile, _ := old["cert-file"].(string)
+	keyFile, _ := old["key-file"].(string)
+	pairs := make([][2]string, 0, len(users))
+	pairs = append(pairs, users...)
+	next.Inbounds[0].Params = usersOf(t, certFile, keyFile, pairs...)
+	return &next
+}
+
+// withCert 返回换了证书的配置副本。
+func withCert(t *testing.T, cfg *config.Config, certFile, keyFile string) *config.Config {
+	t.Helper()
+	next := *cfg
+	next.Inbounds = append([]config.Inbound(nil), cfg.Inbounds...)
+	old := map[string]any{}
+	if err := next.Inbounds[0].Params.Decode(&old); err != nil {
+		t.Fatal(err)
+	}
+	users, _ := old["users"].([]any)
+	pairs := make([][2]string, 0, len(users))
+	for _, u := range users {
+		m, _ := u.(map[string]any)
+		pairs = append(pairs, [2]string{fmt.Sprint(m["username"]), fmt.Sprint(m["password"])})
+	}
+	next.Inbounds[0].Params = usersOf(t, certFile, keyFile, pairs...)
+	return &next
+}
+
 // TestReloadSwapsTunnelUsers 验证热加载后隧道凭据原子替换：
 // 新口令立即可用，旧口令立即失效（收到伪装页面而非数据）。
 func TestReloadSwapsTunnelUsers(t *testing.T) {
@@ -131,9 +164,8 @@ func TestReloadSwapsTunnelUsers(t *testing.T) {
 		t.Fatalf("initial password: echo = %q", got)
 	}
 
-	next := *cfg
-	next.Users = []config.User{{Username: "alice", Password: "new-secret"}}
-	if err := app.Reload(&next); err != nil {
+	next := withUsers(t, cfg, [2]string{"alice", "new-secret"})
+	if err := app.Reload(next); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 
@@ -160,13 +192,12 @@ func TestReloadRotatesCertificate(t *testing.T) {
 	}
 
 	cfg := baseServerCfg(t)
-	cfg.TLS = config.ServerTLS{CertFile: certA, KeyFile: keyA}
+	cfg.Inbounds[0].Params = trojanParams(t, certA, keyA, "alice", "secret")
 	app := startReloadApp(t, cfg)
 	serialA := tlsPeerSerial(t, app.TunnelAddr())
 
-	next := *cfg
-	next.TLS = config.ServerTLS{CertFile: certB, KeyFile: keyB}
-	if err := app.Reload(&next); err != nil {
+	next := withCert(t, cfg, certB, keyB)
+	if err := app.Reload(next); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	serialB := tlsPeerSerial(t, app.TunnelAddr())
@@ -175,9 +206,8 @@ func TestReloadRotatesCertificate(t *testing.T) {
 	}
 
 	// 无效证书路径：拒绝重载，旧证书（serialB）继续服务。
-	bad := *cfg
-	bad.TLS = config.ServerTLS{CertFile: filepath.Join(dirA, "missing.crt"), KeyFile: keyB}
-	if err := app.Reload(&bad); err == nil {
+	bad := withCert(t, cfg, filepath.Join(dirA, "missing.crt"), keyB)
+	if err := app.Reload(bad); err == nil {
 		t.Fatal("reload with missing certificate must fail")
 	}
 	if got := tlsPeerSerial(t, app.TunnelAddr()); got.Cmp(serialB) != 0 {
@@ -185,28 +215,72 @@ func TestReloadRotatesCertificate(t *testing.T) {
 	}
 }
 
-// TestReloadRejectsListenChangeAndCountsMetrics 验证监听地址变更被拒绝
-// （旧配置继续服务），且成功 / 失败都计入 config_reloads_total 指标。
-func TestReloadRejectsListenChangeAndCountsMetrics(t *testing.T) {
+// TestReloadMovesTunnelListener 验证重载支持监听变更（§8.2：快照重建默认，
+// "需重启字段"不存在）：隧道监听在重载后原子迁移——新端口立即服务，
+// 旧端口停止接受，且成功 / 失败计数口径不变。
+func TestReloadMovesTunnelListener(t *testing.T) {
 	cfg := baseServerCfg(t)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.API.Listen = "127.0.0.1:0"
+	app := startReloadApp(t, cfg)
+	target := startEchoTarget(t)
+	oldAddr := app.TunnelAddr()
+
+	newAddr := "127.0.0.1:" + portOfFree(t)
+	next := *cfg
+	next.Inbounds = append([]config.Inbound(nil), cfg.Inbounds...)
+	next.Inbounds[0].Listen = newAddr
+	if err := app.Reload(&next); err != nil {
+		t.Fatalf("reload with moved listener: %v", err)
+	}
+	if got := app.TunnelAddr(); got != newAddr {
+		t.Fatalf("listener did not move: addr = %q, want %q", got, newAddr)
+	}
+	if got := tunnelRoundTrip(t, app, "secret", target, "ping-moved"); got != "ping-moved" {
+		t.Fatalf("tunnel via new listener: echo = %q", got)
+	}
+	if conn, err := net.DialTimeout("tcp", oldAddr, 300*time.Millisecond); err == nil {
+		_ = conn.Close()
+		t.Fatal("old listener must stop accepting after the reload")
+	}
+}
+
+// portOfFree 返回一个刚释放端口的端口段。
+func portOfFree(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+// TestReloadCountsMetrics 验证成功 / 失败重载都计入 config_reloads_total，
+// 且关停期重载被拒绝。
+func TestReloadCountsMetrics(t *testing.T) {
+	cfg := baseServerCfg(t)
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startReloadApp(t, cfg)
 	target := startEchoTarget(t)
 
-	// 监听地址变更：明确拒绝，隧道不受影响。
-	moved := *cfg
-	moved.Listen = "127.0.0.1:18443"
-	if err := app.Reload(&moved); err == nil || !strings.Contains(err.Error(), "restart required") {
-		t.Fatalf("listen change must be rejected with restart hint, got %v", err)
+	// 构建失败：证书路径无效。
+	bad := withCert(t, cfg, filepath.Join(t.TempDir(), "missing.crt"), "missing.key")
+	if err := app.Reload(bad); err == nil {
+		t.Fatal("reload with missing certificate must fail")
 	}
+	// 失败后隧道不受影响。
 	if got := tunnelRoundTrip(t, app, "secret", target, "ping-ok"); got != "ping-ok" {
 		t.Fatalf("tunnel after rejected reload: echo = %q", got)
 	}
 
 	// 成功重载：凭据更新计数为 success。
-	next := *cfg
-	next.Users = []config.User{{Username: "alice", Password: "new-secret"}}
-	if err := app.Reload(&next); err != nil {
+	next := withUsers(t, cfg, [2]string{"alice", "new-secret"})
+	if err := app.Reload(next); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	body := scrapeMetricsBody(t, app.MetricsAddr())
@@ -235,7 +309,7 @@ func scrapeMetricsBody(t *testing.T, addr string) string {
 // 文件解析失败与构建成功都恰好各计入一次 config_reloads_total。
 func TestReloadFileCountsParseFailures(t *testing.T) {
 	cfg := baseServerCfg(t)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startReloadApp(t, cfg)
 
 	dir := t.TempDir()
@@ -247,8 +321,14 @@ func TestReloadFileCountsParseFailures(t *testing.T) {
 		t.Fatal("config with unknown field must fail to reload")
 	}
 
-	good := fmt.Sprintf("listen: %q\ntls: { cert_file: %q, key_file: %q }\nusers: [{ username: bob, password: new-secret }]\nmetrics: { listen: %q }\n",
-		cfg.Listen, cfg.TLS.CertFile, cfg.TLS.KeyFile, cfg.Metrics.Listen)
+	old := map[string]any{}
+	if err := cfg.Inbounds[0].Params.Decode(&old); err != nil {
+		t.Fatal(err)
+	}
+	certFile, _ := old["cert-file"].(string)
+	keyFile, _ := old["key-file"].(string)
+	good := fmt.Sprintf("inbounds:\n  - type: trojan\n    listen: %q\n    params:\n      cert-file: %q\n      key-file: %q\n      users:\n        - username: bob\n          password: new-secret\napi: { listen: %q }\n",
+		cfg.Inbounds[0].Listen, certFile, keyFile, cfg.API.Listen)
 	if err := os.WriteFile(path, []byte(good), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -265,4 +345,38 @@ func TestReloadFileCountsParseFailures(t *testing.T) {
 			t.Fatalf("/metrics missing %q:\n%s", want, body)
 		}
 	}
+}
+
+// TestReloadRejectsDuringShutdown 验证关停期拒绝重载（§8.2）：
+// 排空已开始时收到重载请求，明确拒绝且不启动半死的新运行时。
+func TestReloadRejectsDuringShutdown(t *testing.T) {
+	cfg := baseServerCfg(t)
+	app, err := serverapp.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("serverapp.New: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	cancel()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		err := app.Reload(withUsers(t, cfg, [2]string{"alice", "late-secret"}))
+		if err != nil {
+			if !strings.Contains(err.Error(), "shutting down; reload ignored") {
+				t.Fatalf("reload during shutdown: got %v", err)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("reload during shutdown must be rejected")
 }

@@ -3,8 +3,6 @@ package core
 import (
 	"testing"
 	"time"
-
-	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
 // TestTargetString 锁定 Target 的 host:port 形状：IPv6 字面量自动加方括号。
@@ -24,22 +22,17 @@ func TestTargetString(t *testing.T) {
 	}
 }
 
-// TestRouteLabel 锁定 upstream 日志词汇：命中节点地址优先，
-// 未知名返回 "pool"（连接复用场景），直连返回 "direct"。
-func TestRouteLabel(t *testing.T) {
-	cases := []struct {
-		route Route
-		want  string
-	}{
-		{Route{Action: routing.Direct}, "direct"},
-		{Route{Action: routing.Proxy, Upstream: ""}, "pool"},
-		{Route{Action: routing.Proxy, Upstream: "node1.example.com:443"}, "node1.example.com:443"},
-		// 地址优先于动作：直连时 Upstream 恒为空，此处仅锁定实现语义。
-		{Route{Action: routing.Direct, Upstream: "node2.example.com:443"}, "node2.example.com:443"},
+// TestRouteActionString 锁定动作的观测写法：metrics 标签与日志的 route
+// 字段从 Route.Action 派生，取值漂移即破坏 /metrics 兼容。
+func TestRouteActionString(t *testing.T) {
+	cases := map[RouteAction]string{
+		RouteDirect: "direct",
+		RouteProxy:  "proxy",
+		RouteReject: "reject",
 	}
-	for _, tc := range cases {
-		if got := tc.route.Label(); got != tc.want {
-			t.Fatalf("Label(%+v) = %q, want %q", tc.route, got, tc.want)
+	for action, want := range cases {
+		if got := action.String(); got != want {
+			t.Fatalf("RouteAction(%d).String() = %q, want %q", action, got, want)
 		}
 	}
 }
@@ -50,27 +43,18 @@ func TestTelemetryVocabulary(t *testing.T) {
 	cases := map[string]string{
 		ProtoHTTP:      "http",
 		ProtoSOCKS5:    "socks5",
+		ProtoDNS:       "dns",
 		ProtoTunnel:    "tunnel",
-		RouteDirect:    "direct",
-		RouteProxy:     "proxy",
-		RouteNone:      "none",
 		ResultOK:       "ok",
-		ResultAuthFail: "auth_fail",
+		ResultDenied:   "denied",
 		ResultDialFail: "dial_fail",
 		ResultError:    "error",
+		ResultOverload: "overloaded",
 	}
 	for got, want := range cases {
 		if got != want {
 			t.Fatalf("telemetry vocabulary constant = %q, want %q", got, want)
 		}
-	}
-	// route 词汇与 routing.Action 的字符串写法保持一致（请求指标按
-	// Action.String() 记 route 标签）。
-	if got, want := routing.Direct.String(), RouteDirect; got != want {
-		t.Fatalf("routing.Direct.String() = %q, want %q", got, want)
-	}
-	if got, want := routing.Proxy.String(), RouteProxy; got != want {
-		t.Fatalf("routing.Proxy.String() = %q, want %q", got, want)
 	}
 }
 
@@ -80,8 +64,15 @@ func TestNopTelemetry(t *testing.T) {
 	if NopTelemetry == nil {
 		t.Fatal("NopTelemetry must not be nil")
 	}
-	NopTelemetry.RequestDone(ProtoHTTP, RouteProxy, ResultOK, time.Second)
 	NopTelemetry.ConnOpened(ProtoSOCKS5)
-	NopTelemetry.ConnClosed(ProtoTunnel)
-	NopTelemetry.ConnRejected(ProtoTunnel)
+	NopTelemetry.ConnRejected(ProtoTunnel, ResultOverload)
+	NopTelemetry.ConnDone(ConnAttrs{
+		Proto:     ProtoHTTP,
+		Target:    Target{Host: "example.com", Port: 443},
+		Route:     Route{Action: RouteProxy, Label: "node1:443"},
+		Result:    ResultOK,
+		Duration:  time.Second,
+		BytesUp:   11,
+		BytesDown: 22,
+	})
 }

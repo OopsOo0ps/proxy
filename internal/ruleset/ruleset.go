@@ -7,6 +7,9 @@
 //     内容未变只刷新“最近成功”状态；任何失败都保留当前规则继续服务；
 //   - Recheck 供配置热加载（SIGHUP）调用：文件源严格重读（失败应拒绝重载），
 //     URL 源容错重拉（失败只告警，保持现有规则）。
+//
+// 本包只承载“来源与刷新”机械：规则文档的解码函数由组装根注入
+// （config 是全仓唯一 yaml 属主），本包零 yaml、零序列化格式知识。
 package ruleset
 
 import (
@@ -22,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
@@ -115,8 +119,11 @@ type Options struct {
 	// FetchTimeout / MaxFetchBytes 为 0 时取包内缺省值（15s / 8 MiB）。
 	FetchTimeout  time.Duration
 	MaxFetchBytes int64
+	// Parse 是规则文档的解码函数（组装根注入 config.ParseRules；
+	// 本包不认识任何序列化格式）。配置了规则源时必填。
+	Parse func(data []byte) (*routing.Rules, error)
 	// Default 是未命中规则时的默认动作；规则文件里的 default 优先。
-	Default routing.Action
+	Default core.RouteAction
 	// PrivateDirect 为 true 时环回 / 私网 / 特殊地址一律直连。
 	PrivateDirect bool
 	// Logger 记录加载与刷新结果；nil 时静默。
@@ -158,6 +165,8 @@ type Provider struct {
 	lastSuccess time.Time
 	lastErr     string
 
+	parse func(data []byte) (*routing.Rules, error) // 规则文档解码（组装根注入）
+
 	engine atomic.Pointer[routing.Engine]
 
 	// attemptMu 串行化读取 / 拉取尝试，避免周期刷新与 Recheck 并发重复拉取。
@@ -186,6 +195,9 @@ func New(opts Options) (*Provider, error) {
 	if opts.FilePath != "" && opts.URL != "" {
 		return nil, errors.New("ruleset: at most one of file path and URL may be set")
 	}
+	if opts.Parse == nil && (opts.FilePath != "" || opts.URL != "") {
+		return nil, errors.New("ruleset: parse function is required when a rule source is configured")
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -201,6 +213,7 @@ func New(opts Options) (*Provider, error) {
 	p := &Provider{
 		spec:     SpecOf(opts.FilePath, opts.URL, opts.RefreshInterval),
 		opts:     routing.Options{Default: opts.Default, PrivateDirect: opts.PrivateDirect},
+		parse:    opts.Parse,
 		log:      logger,
 		obs:      obs,
 		now:      now,
@@ -232,20 +245,48 @@ func New(opts Options) (*Provider, error) {
 func (p *Provider) Spec() Spec { return p.spec }
 
 // Decide 返回 host 的分流动作；任何时刻可用（尚未成功加载时按空规则处理）。
-func (p *Provider) Decide(host string) routing.Action {
+func (p *Provider) Decide(host string) core.RouteAction {
 	if p == nil {
-		return routing.Proxy
+		return core.RouteProxy
 	}
 	engine := p.engine.Load()
 	if engine == nil {
-		return routing.Proxy
+		return core.RouteProxy
 	}
 	return engine.Decide(host)
 }
 
+// MatchRule 只按当前生效的规则表匹配（不含私网直连前置与缺省动作）：
+// 命中返回动作与 true。导出给组装根组合多个规则源时复用同一匹配实现
+// （组合表的匹配顺序 = 各源声明顺序）。
+func (p *Provider) MatchRule(host string) (core.RouteAction, bool) {
+	if p == nil {
+		return 0, false
+	}
+	engine := p.engine.Load()
+	if engine == nil {
+		return 0, false
+	}
+	return engine.MatchRule(host)
+}
+
+// DocDefault 返回规则文档指定的缺省动作（文档未指定或尚未成功加载时 ok=false）。
+// 组装根组合多规则源时用它计算组合表的最终缺省动作（文档 default 优先）。
+func (p *Provider) DocDefault() (core.RouteAction, bool) {
+	if p == nil {
+		return 0, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.rules == nil || p.rules.Default == nil {
+		return 0, false
+	}
+	return *p.rules.Default, true
+}
+
 // UpdateOptions 更新引擎参数（默认动作 / 私网直连），基于最近一次成功解析的
 // 规则重新编译并原子切换；不触发任何网络或文件访问，参数未变化时不动作。
-func (p *Provider) UpdateOptions(def routing.Action, privateDirect bool) {
+func (p *Provider) UpdateOptions(def core.RouteAction, privateDirect bool) {
 	p.mu.Lock()
 	if p.opts.Default == def && p.opts.PrivateDirect == privateDirect {
 		p.mu.Unlock()
@@ -368,7 +409,7 @@ func (p *Provider) attempt(ctx context.Context) error {
 		p.recordError(err)
 		return err
 	}
-	rules, err := routing.ParseRules(data)
+	rules, err := p.parse(data)
 	if err != nil {
 		p.recordError(err)
 		return err

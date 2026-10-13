@@ -29,15 +29,15 @@ ARG BUILD_DATE=unknown
 
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
         -ldflags "-s -w \
-          -X github.com/OopsOo0ps/proxy/pkg/version.Version=$VERSION \
-          -X github.com/OopsOo0ps/proxy/pkg/version.Commit=$COMMIT \
-          -X github.com/OopsOo0ps/proxy/pkg/version.BuildDate=$BUILD_DATE" \
+          -X github.com/OopsOo0ps/proxy/internal/version.Version=$VERSION \
+          -X github.com/OopsOo0ps/proxy/internal/version.Commit=$COMMIT \
+          -X github.com/OopsOo0ps/proxy/internal/version.BuildDate=$BUILD_DATE" \
         -o /out/proxy-client ./cmd/client \
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath \
         -ldflags "-s -w \
-          -X github.com/OopsOo0ps/proxy/pkg/version.Version=$VERSION \
-          -X github.com/OopsOo0ps/proxy/pkg/version.Commit=$COMMIT \
-          -X github.com/OopsOo0ps/proxy/pkg/version.BuildDate=$BUILD_DATE" \
+          -X github.com/OopsOo0ps/proxy/internal/version.Version=$VERSION \
+          -X github.com/OopsOo0ps/proxy/internal/version.Commit=$COMMIT \
+          -X github.com/OopsOo0ps/proxy/internal/version.BuildDate=$BUILD_DATE" \
         -o /out/proxy-server ./cmd/server
 
 # ---- 最小运行镜像：proxy-client ----

@@ -38,18 +38,18 @@ func TestNewStoreRejectsInvalidUsers(t *testing.T) {
 	}
 }
 
-func TestVerify(t *testing.T) {
+func TestAuthenticate(t *testing.T) {
 	s := testStore(t)
-	if !s.Verify("alice", "alice-secret") {
+	if !s.Authenticate("alice", "alice-secret") {
 		t.Fatal("valid credentials should verify")
 	}
-	if s.Verify("alice", "wrong") {
+	if s.Authenticate("alice", "wrong") {
 		t.Fatal("wrong password must not verify")
 	}
-	if s.Verify("carol", "alice-secret") {
+	if s.Authenticate("carol", "alice-secret") {
 		t.Fatal("unknown user must not verify")
 	}
-	if s.Verify("", "") {
+	if s.Authenticate("", "") {
 		t.Fatal("empty credentials must not verify")
 	}
 	if s.Len() != 2 {
@@ -106,14 +106,14 @@ func BenchmarkStoreVerify(b *testing.B) {
 
 	b.Run("hit", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			if !s.Verify("user-07", "secret-07") {
+			if !s.Authenticate("user-07", "secret-07") {
 				b.Fatal("valid credential must verify")
 			}
 		}
 	})
 	b.Run("miss", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			if s.Verify("nobody", "secret-07") {
+			if s.Authenticate("nobody", "secret-07") {
 				b.Fatal("unknown user must not verify")
 			}
 		}

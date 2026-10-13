@@ -5,132 +5,213 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
 )
 
-// fakeTransport 是进程内回环传输：直连本地回显服务端，「绑定」为空操作
-// （直连即绑定）。用于在协议无关的层面验证 RunConformance 自身的断言逻辑。
-type fakeTransport struct {
-	addr string // 回显服务端地址
+// 本文件是验收闸门自身的负例与正例对照（设计文档 §4.2）：
+// 检查逻辑拆分在 conformance.go 的 check* 函数中（返回错误列表），
+// 这里直接驱动它们——故意写坏的假实现必须被拦住，闸门才可信。
+
+// —— 假实现（负例） ——
+
+// nilDialTransport：DialTunnel 返回 (nil, nil) 的假成功。
+type nilDialTransport struct{}
+
+func (nilDialTransport) DialTunnel(context.Context, core.Target) (net.Conn, error) { return nil, nil }
+
+// fakeAlwaysDial：无视 ctx 恒返回可用连接（假成功）。
+type fakeAlwaysDial struct{}
+
+func (fakeAlwaysDial) DialTunnel(context.Context, core.Target) (net.Conn, error) {
+	c1, c2 := net.Pipe()
+	go echoPipe(c2)
+	return c1, nil
 }
 
-// dead 标记连接已作废（预热连接的关闭状态；真实协议中对应
-// 「在已失效连接上补发请求必然失败」的线级行为，此处显式建模）。
-type fakeConn struct {
-	net.Conn
-	dead atomic.Bool
+// fakePrewarmer：Bind 行为可注入的两阶段假实现。
+type fakePrewarmer struct {
+	bindFn func(ctx context.Context, p Prepared, target core.Target) (net.Conn, error)
 }
 
-func (c *fakeConn) Close() error {
-	c.dead.Store(true)
-	return c.Conn.Close()
-}
-
-func newFakeTransport(t *testing.T) *fakeTransport {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go func(c net.Conn) {
-				_, _ = io.Copy(c, c) // 回显
-				_ = c.Close()
-			}(conn)
-		}
-	}()
-	return &fakeTransport{addr: ln.Addr().String()}
-}
-
-func (f *fakeTransport) DialTunnel(ctx context.Context, target core.Target) (net.Conn, error) {
-	return net.Dial("tcp", f.addr)
-}
-
-func (f *fakeTransport) ConnectIdle(ctx context.Context) (net.Conn, error) {
-	conn, err := net.Dial("tcp", f.addr)
-	if err != nil {
+func (fakePrewarmer) ConnectIdle(ctx context.Context) (Prepared, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return &fakeConn{Conn: conn}, nil
+	c1, c2 := net.Pipe()
+	go echoPipe(c2)
+	return pipeHandle{c1, c2}, nil
 }
 
-func (f *fakeTransport) Bind(ctx context.Context, conn net.Conn, target core.Target) error {
-	if fc, ok := conn.(*fakeConn); ok && fc.dead.Load() {
-		return errors.New("fake: bind on discarded connection")
+func (f fakePrewarmer) Bind(ctx context.Context, p Prepared, target core.Target) (net.Conn, error) {
+	return f.bindFn(ctx, p, target)
+}
+
+// fakeProber：探测假成功——对不可达端点也返回 nil。
+type fakeProber struct{}
+
+func (fakeProber) Probe(context.Context) error { return nil }
+
+// —— 合法实现（正例对照，内存内无外部端口依赖） ——
+
+// pipeHandle 是基于 net.Pipe 的合法 Prepared。
+type pipeHandle struct {
+	client net.Conn
+	server net.Conn
+}
+
+func (p pipeHandle) Discard() {
+	_ = p.client.Close()
+	_ = p.server.Close()
+}
+
+func echoPipe(c net.Conn) {
+	_, _ = io.Copy(c, c)
+	_ = c.Close()
+}
+
+// pipeTransport：具备全部三项能力的合法内存传输。
+// connect/bind 两阶段语义显式建模：Bind 在空闲连接上写出绑定标记，
+// 句柄被 Discard 后写出必然失败（对应真实协议的线级行为）。
+type pipeTransport struct{}
+
+func (pipeTransport) DialTunnel(ctx context.Context, target core.Target) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return nil // 直连即绑定：回显目标不需要补发请求
+	c1, c2 := net.Pipe()
+	go echoPipe(c2)
+	return c1, nil
 }
 
-func (f *fakeTransport) Probe(ctx context.Context) error {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", f.addr)
-	if err != nil {
-		return err
+func (pipeTransport) ConnectIdle(ctx context.Context) (Prepared, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return conn.Close()
+	c1, c2 := net.Pipe()
+	go echoPipe(c2)
+	return pipeHandle{c1, c2}, nil
 }
 
-// deadProber 指向不可达端点（端口无人监听）。
-type deadProber struct {
-	addr string
-}
-
-func (p *deadProber) Probe(ctx context.Context) error {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", p.addr)
-	if err != nil {
-		return err
+func (pipeTransport) Bind(ctx context.Context, p Prepared, target core.Target) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return conn.Close()
+	h, ok := p.(pipeHandle)
+	if !ok {
+		return nil, errors.New("pipeTransport: unexpected prepared handle")
+	}
+	// 绑定请求语义：写出标记并等待对端回显（内存回显服务端原样返回），
+	// 句柄被 Discard 后写出/读取必然失败。
+	if err := h.client.SetDeadline(time.Now().Add(time.Second)); err != nil {
+		return nil, err
+	}
+	marker := []byte(target.String() + "\n")
+	if _, err := h.client.Write(marker); err != nil {
+		return nil, err
+	}
+	got := make([]byte, len(marker))
+	if _, err := io.ReadFull(h.client, got); err != nil {
+		return nil, err
+	}
+	if string(got) != string(marker) {
+		return nil, errors.New("pipeTransport: bind marker mismatch")
+	}
+	_ = h.client.SetDeadline(time.Time{})
+	return h.client, nil
 }
 
-// echoRoundTrip 断言连接可做原始字节往返（回显）。
-func echoRoundTrip(t *testing.T, conn net.Conn) {
+// directTransport：直连回环目标的合法 Transport（走真实 TCP，覆盖半关闭检查）。
+type directTransport struct{ d net.Dialer }
+
+func (t *directTransport) DialTunnel(ctx context.Context, target core.Target) (net.Conn, error) {
+	return t.d.DialContext(ctx, "tcp", target.String())
+}
+
+// —— 负例断言 ——
+
+func testTarget(t *testing.T) core.Target {
 	t.Helper()
-	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	payload := []byte("conformance payload")
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("echo = %q, want %q", got, payload)
+	return startEchoTarget(t)
+}
+
+func cancelledCtx(ctx context.Context) context.Context {
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	return cctx
+}
+
+// TestGuardsCatchNilDial 假成功 (nil, nil) 必须被 checkDial 拦住。
+func TestGuardsCatchNilDial(t *testing.T) {
+	errs := checkDial(context.Background(), nilDialTransport{}, testTarget(t))
+	if len(errs) == 0 {
+		t.Fatal("checkDial must reject DialTunnel (nil, nil) fake success")
 	}
 }
 
-// TestRunConformanceWithFakeTransport 用协议无关的进程内传输验证一致性
-// 验收助手本身：三项子验收（dial / prewarm-bind / probe）全部通过。
-func TestRunConformanceWithFakeTransport(t *testing.T) {
-	f := newFakeTransport(t)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+// TestGuardsCatchCanceledDial 已取消 ctx 上的拨号假成功必须被拦住。
+func TestGuardsCatchCanceledDial(t *testing.T) {
+	errs := checkDial(cancelledCtx(context.Background()), fakeAlwaysDial{}, testTarget(t))
+	if len(errs) == 0 {
+		t.Fatal("checkDial must reject DialTunnel fake success with canceled ctx")
 	}
-	closedAddr := ln.Addr().String()
-	_ = ln.Close()
+}
 
-	RunConformance(t, ConformanceSpec{
-		Transport:  f,
-		Target:     core.Target{Host: "echo.example", Port: 443},
-		RoundTrip:  echoRoundTrip,
-		Prewarmer:  f,
-		Prober:     f,
-		DeadProber: &deadProber{addr: closedAddr},
-	})
+// TestGuardsCatchNilBind Bind 假成功（返回 nil conn）必须被 checkPrewarm 拦住。
+func TestGuardsCatchNilBind(t *testing.T) {
+	pw := fakePrewarmer{bindFn: func(context.Context, Prepared, core.Target) (net.Conn, error) {
+		return nil, nil
+	}}
+	errs := checkPrewarm(context.Background(), nilDialTransport{}, pw, testTarget(t))
+	if len(errs) == 0 {
+		t.Fatal("checkPrewarm must reject Bind (nil, nil) fake success")
+	}
+}
+
+// TestGuardsCatchBindAfterDiscard 无视 Discard 的 Bind 假成功必须被拦住。
+func TestGuardsCatchBindAfterDiscard(t *testing.T) {
+	pw := fakePrewarmer{bindFn: func(_ context.Context, p Prepared, _ core.Target) (net.Conn, error) {
+		h, ok := p.(pipeHandle)
+		if !ok {
+			return nil, errors.New("unexpected handle")
+		}
+		return h.client, nil // 不写出绑定标记：对已 Discard 的句柄返回假成功
+	}}
+	errs := checkPrewarm(context.Background(), nilDialTransport{}, pw, testTarget(t))
+	if len(errs) == 0 {
+		t.Fatal("checkPrewarm must reject Bind on a discarded handle")
+	}
+}
+
+// TestGuardsCatchProbeFakeSuccess 探测假成功（已取消 ctx 仍返回 nil）必须被拦住。
+func TestGuardsCatchProbeFakeSuccess(t *testing.T) {
+	errs := checkProbe(context.Background(), fakeProber{})
+	if len(errs) == 0 {
+		t.Fatal("checkProbe must reject a probe faking success on canceled ctx")
+	}
+}
+
+// —— 正例对照（闸门不误报） ——
+
+// TestChecksPassForHonestImplementations 合法实现的检查零违例。
+func TestChecksPassForHonestImplementations(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+	target := testTarget(t)
+	if errs := checkDial(ctx, &directTransport{}, target); len(errs) > 0 {
+		t.Fatalf("checkDial false positive: %v", errs)
+	}
+	if errs := checkDial(ctx, pipeTransport{}, target); len(errs) > 0 {
+		t.Fatalf("checkDial false positive: %v", errs)
+	}
+	if errs := checkPrewarm(ctx, pipeTransport{}, pipeTransport{}, target); len(errs) > 0 {
+		t.Fatalf("checkPrewarm false positive: %v", errs)
+	}
+}
+
+// TestRunConformanceAcceptsHonestTransport 完整闸门对合法传输通过。
+func TestRunConformanceAcceptsHonestTransport(t *testing.T) {
+	RunConformance(t, pipeTransport{})
 }

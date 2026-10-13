@@ -99,10 +99,13 @@ func TestE2ERulesRemoteRefreshFlipsRoute(t *testing.T) {
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cfg := baseClientCfg([]config.Node{{Addr: node.addr, Password: "node-secret"}})
-	cfg.Routing.RulesURL = rulesSrv.URL
-	cfg.Routing.RulesRefreshInterval = durationPtr(100 * time.Millisecond)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", node.addr, "node-secret")})
+	cfg.Routing.Rulesets = []config.Ruleset{{
+		Name:     "remote",
+		URL:      rulesSrv.URL,
+		Interval: durationPtr(100 * time.Millisecond),
+	}}
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, logger)
 
 	// 阶段一：规则命中直连（upstream=direct）。
@@ -157,10 +160,13 @@ func TestE2ERulesRemoteFailureKeepsRules(t *testing.T) {
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cfg := baseClientCfg([]config.Node{{Addr: node.addr, Password: "node-secret"}})
-	cfg.Routing.RulesURL = rulesSrv.URL
-	cfg.Routing.RulesRefreshInterval = durationPtr(50 * time.Millisecond)
-	cfg.Metrics.Listen = "127.0.0.1:0"
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", node.addr, "node-secret")})
+	cfg.Routing.Rulesets = []config.Ruleset{{
+		Name:     "remote",
+		URL:      rulesSrv.URL,
+		Interval: durationPtr(50 * time.Millisecond),
+	}}
+	cfg.API.Listen = "127.0.0.1:0"
 	app := startClient(t, cfg, logger)
 
 	resp := fetchThroughProxy(t, app, target.URL, "u", "p")
@@ -169,14 +175,16 @@ func TestE2ERulesRemoteFailureKeepsRules(t *testing.T) {
 	}
 	waitLogCount(t, clientLogs, `"upstream":"direct"`, 1, "direct route not observed")
 
-	// 非法内容：刷新失败计数，规则保持直连。
+	// 非法内容：刷新失败计数，规则保持直连。第二次请求复用首条请求留下的
+	// 直连上游连接（不触发新拨号），日志按“池选择未定”词汇记录 upstream=pool
+	// ——请求未走出口节点即为规则未被破坏的证据（见下方 node tunnel 计数）。
 	body.Store("rules: [:::")
 	waitForMetric(t, app.MetricsAddr(), `ruleset_refreshes_total{result="error"} 1`)
 	resp = fetchThroughProxy(t, app, target.URL, "u", "p")
 	if got := readBody(t, resp); resp.StatusCode != http.StatusOK || got != "target-ok" {
 		t.Fatalf("request during bad rules: status=%d body=%q", resp.StatusCode, got)
 	}
-	waitLogCount(t, clientLogs, `"upstream":"direct"`, 2, "direct route lost after bad rules")
+	waitLogCount(t, clientLogs, `"upstream":"pool"`, 1, "second request did not reuse the pooled upstream")
 
 	// 源恢复为新内容：自动收敛为走代理。
 	body.Store(remoteRulesProxyLoopback)
@@ -205,9 +213,12 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	clientLogs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(clientLogs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	cfg := baseClientCfg([]config.Node{{Addr: node.addr, Password: "node-secret"}})
-	cfg.Routing.RulesURL = rulesSrv.URL
-	cfg.Routing.RulesRefreshInterval = durationPtr(30 * time.Minute) // 周期刷新不参与本测试
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "node-1", node.addr, "node-secret")})
+	cfg.Routing.Rulesets = []config.Ruleset{{
+		Name:     "remote",
+		URL:      rulesSrv.URL,
+		Interval: durationPtr(30 * time.Minute), // 周期刷新不参与本测试
+	}}
 	app := startClient(t, cfg, logger)
 
 	resp := fetchThroughProxy(t, app, target.URL, "u", "p")

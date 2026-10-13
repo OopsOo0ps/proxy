@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15378/badge)](https://www.bestpractices.dev/projects/15378)
 
-Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署，控制端集中管理配置**，追求轻量、干净、长期可演进。
+Proxy 是一个从零构建、面向 Ubuntu 22.04 的生产级正向代理工具：**客户端 / 服务端分离部署**，追求轻量、干净、长期可演进。
 
 当前版本已具备可用的代理核心：本机 HTTP/HTTPS 与 SOCKS5 入站、基于 Trojan（over TLS）的隧道出站（多节点轮询 + 主动健康检查摘除 / 自动加回 + 失败冷却转移）、域名分流（本地规则文件 / 远程 URL 动态加载）、可选 DNS 网关（remote DNS）、认证、结构化日志、Prometheus 指标与健康/状态端点。
 
@@ -24,20 +24,17 @@ flowchart LR
         SERVER["proxy-server<br/>Trojan over TLS 出口"]
     end
 
-    CONTROLLER["proxy-controller<br/>（规划中）"]
     TARGET["目标站点"]
 
     APP -->|"HTTP / HTTPS(CONNECT) / SOCKS5"| CLIENT
     CLIENT -->|"Trojan over TLS"| SERVER
     CLIENT -.->|"直连（规则命中 / 内网地址）"| TARGET
     SERVER -->|"出站访问"| TARGET
-    CONTROLLER -.->|"配置下发（规划中）"| CLIENT
-    CONTROLLER -.->|"配置下发（规划中）"| SERVER
 ```
 
 - 实线：数据流方向（请求逐级转发，响应沿原路返回）。
-- 虚线：控制流方向；`proxy-controller` 仍为骨架，配置下发尚未实现。
-- 代码依赖方向：`cmd/` → `internal/` → `pkg/`。
+- 虚线：直连路径（规则命中或内网地址时不经出口节点）。
+- 代码依赖方向：`cmd/` → `internal/`（分层约束由 `internal/arch` 守护测试强制）。
 
 ## 特性
 
@@ -52,7 +49,7 @@ flowchart LR
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超时强制断开剩余连接 |
 | 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误并计入 `connections_rejected_total` |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
-| 规则集动态加载 | 本地 `rules_file` 或远程 `rules_url` 二选一；周期刷新、失败保持现有规则、SIGHUP 立即重拉 |
+| 规则集动态加载 | 规则源 `rulesets`（远程 url 或本地 file）；周期刷新、失败保持现有规则、SIGHUP 立即重拉 |
 | DNS 处理 | **remote DNS（默认）**：域名随隧道到出口解析；**可选 DNS 网关**：本机环回监听，按同一分流规则转发查询 |
 | 认证 | 入站用户名密码 + 隧道口令；失败响应不泄露任何内部信息 |
 | 日志 | `log/slog` 结构化 JSON，含 `request_id`、`client_ip`、`upstream`、`duration`；级别可运行时切换 |
@@ -122,76 +119,118 @@ make run-client CLIENT_CONFIG=configs/example-client.yaml   # 本机入口
 
 配置为 YAML 且严格解析：**未知字段会直接导致启动失败**，避免拼写错误被静默忽略。核心字段（完整字段与语义见 [Wiki：配置参考](https://github.com/OopsOo0ps/proxy/wiki/配置参考)）：
 
+配置形状镜像运行时名词：**入站与出口节点都是带判别字段的列表**，协议专属
+参数与校验归协议所有（`params` 块由协议包的结构体严格解码）。
+
 ```yaml
 # proxy-client（本机入口）；完整注释版见 configs/example-client.yaml。
-inbound:
-  http: "127.0.0.1:8080"     # HTTP/HTTPS 入站（CONNECT + 绝对地址请求）
-  socks5: "127.0.0.1:1080"   # SOCKS5 入站（TCP CONNECT）
-  auth:                      # 入站认证；监听非环回地址时必填
-    - username: alice
-      password: change-me
+log:
+  level: info                # debug | info | warn | error
+  format: json               # json | text
 
-nodes:                       # 出口节点（Trojan over TLS），建议 ≥3
-  - addr: "node1.example.com:443"
-    password: node1-token
-    sni: www.example.com     # 可选：TLS SNI / 证书校验名
+api:
+  listen: "127.0.0.1:9100"   # /metrics、/health、/stats、/log/level；默认仅允许环回，非环回需 allow-remote: true
+
+inbounds:                    # 入站端点列表（判别字段 type：http | socks5 | dns）
+  - type: http
+    listen: "127.0.0.1:8080" # HTTP/HTTPS 入站（CONNECT + 绝对地址请求）
+    auth:                    # 入站认证（共性机制）；监听非环回地址时必填
+      users:
+        - username: alice
+          password: change-me
+  - type: socks5
+    listen: "127.0.0.1:1080" # SOCKS5 入站（TCP CONNECT）
+    auth:
+      users:
+        - username: alice
+          password: change-me
+
+outbound:
+  nodes:                     # 出口节点（判别字段 protocol），建议 ≥3
+    - name: edge-1
+      protocol: trojan
+      params:                # trojan 自有参数（协议校验在协议构造器）
+        addr: "node1.example.com:443"
+        password: node1-token
+        sni: www.example.com # 可选：TLS SNI / 证书校验名
+  pool:                      # 节点池策略（协议无关）
+    prewarm:
+      size: 2                # 上游空闲隧道连接池（预热复用）；0 = 关闭
+      ttl: 5s                # 应明显小于服务端 timeouts.handshake
+    health:                  # 出口节点主动健康检查（故障自愈）
+      interval: 10s          # 0 = 关闭
+      failures: 3            # 连续失败 N 次摘除
+      successes: 2           # 摘除后连续成功 M 次自动加回
+    failover-budget: 30s     # 出口节点故障转移总预算（全部候选节点合计）
 
 routing:
-  default: proxy             # direct | proxy
-  rules_file: ""             # 规则源二选一：本地 rules_file 或远程 rules_url
-  private_direct: true       # 环回 / 私网 / 链路本地目标一律直连
-
-pool:                        # 上游空闲隧道连接池（预热复用；0 = 关闭）
-  max_idle: 2
-  idle_ttl: 5s               # 应明显小于服务端 timeouts.handshake
-
-health_check:                # 出口节点主动健康检查（故障自愈）
-  interval: 10s              # 0 = 关闭
-  failures: 3                # 连续失败 N 次摘除
-  successes: 2               # 摘除后连续成功 M 次自动加回
+  private-direct: true       # 环回 / 私网 / 链路本地目标一律直连（硬规则）
+  rules:                     # 内联规则（按顺序匹配；match 词表见 Wiki）
+    - { match: domain-suffix, value: cn, action: direct }
+    - { match: cidr, value: 10.0.0.0/8, action: direct }
+    - { default: proxy }     # 缺省动作（direct | proxy | reject）
+  # rulesets:                # 规则源（来源可替换：url 定时刷新 / file 本地文件）
+  #   - { name: cn-list, url: "https://…", interval: 24h }
 
 timeouts:                    # 纯数字按秒解释
   dial: 10s                  # 建立目标 / 节点连接
   handshake: 10s             # 隧道握手（TLS + Trojan）
-  failover: 30s              # 出口节点故障转移总预算（全部候选节点合计）
+  idle: 90s                  # 连接空闲回收
   shutdown: 15s              # 优雅关停排空期限
 
 limits:
-  max_connections: 1024      # 进程级并发上限（HTTP + SOCKS5 合计）；0 = 不限制
-
-metrics:
-  listen: "127.0.0.1:9100"   # /metrics、/health、/stats；默认仅允许环回，非环回需 allow_remote: true
-log:
-  level: info                # debug | info | warn | error
-  format: json               # json | text
+  max-connections: 1024      # 进程级并发上限（全部入站合计）；0 = 不限制
 ```
 
 ```yaml
 # proxy-server（远端出口）；完整注释版见 configs/example-server.yaml。
-listen: "0.0.0.0:8443"       # Trojan over TLS 隧道
-tls:
-  cert_file: server.crt
-  key_file: server.key
-users:                       # 每个客户端分配独立凭据
-  - username: alice
-    password: change-me-alice
-limits:
-  max_connections: 1024      # 进程级并发隧道上限
-metrics:
+# 服务端 = trojan 隧道入站 + 直连出站的特化：没有 routing / ruleset / 节点池。
+api:
   listen: "127.0.0.1:9200"
+
+inbounds:
+  - type: trojan
+    listen: "0.0.0.0:8443"   # Trojan over TLS 隧道
+    params:                  # trojan 服务端自有参数
+      cert-file: server.crt
+      key-file: server.key
+      users:                 # 每个客户端分配独立凭据（服务端只存 SHA-224 摘要）
+        - username: alice
+          password: change-me-alice
+
+limits:
+  max-connections: 1024      # 进程级并发隧道上限
 ```
 
-入口校验：监听非环回地址时必须配置 `inbound.auth`，否则启动直接报错。
+入口校验：http / socks5 监听非环回地址时必须配置 `auth`，否则启动直接报错。
+
+### 配置热加载语义
+
+收到 `SIGHUP` 后按「先构建、后切换」执行：读取并严格解析配置 → 完整构建新运行时 → 全部成功后原子切换 → 旧快照排空。配置面没有静默角落，每个字段的热更路径显式分为三类：
+
+| 热更路径 | 覆盖字段 | 语义 |
+| --- | --- | --- |
+| **快照重建**（默认） | 其余全部字段 | 全量构建新运行时后原子切换——任何字段改动都会在新快照中生效（不存在「需重启字段」这一分类）。注意：节点池重建会**重置冷却与摘除状态**（旧探测循环停止、旧空闲连接关闭） |
+| **运行期热更** | 规则表、日志级别 | 经 `livePolicy` 原子指针独立生效（无需等到重载）；重载发生时**以配置文件为准**，覆盖运行期改动（如 `PUT /log/level` 的切级、规则源重检结果） |
+| **复用保状态** | 上游栈未变时的节点池 / 预热池、规则源 Provider | 对相关配置子树计算指纹：未变 → 复用实例并触发一次重检（预热连接与冷却 / 摘除状态保留）；指纹内任一字段变更 → 重建（状态重置） |
+
+两条兜底语义：
+
+- **关停期拒绝重载**：排空已开始时收到 `SIGHUP`，明确拒绝（`shutting down; reload ignored`），不启动半死的新运行时。
+- **重载失败回滚保旧**：构建或切换的任何一步失败，旧配置继续在原端口服务；切换阶段（先停旧监听再绑新监听）若同端口重绑冲突，同样回滚到旧监听恢复服务。
+- **回滚失败 fail-closed**：重载切换失败且回滚也失败时，进程 fail-closed 退出（由进程管理器重启），不以零监听状态静默存活。该语义依赖进程管理器的自动重启（如 systemd 单元配置 `Restart=always`），否则回滚失败即永久停机。
+
+生效边界为「新拨号」：快照切换对新拨号立即生效，包括被替换世代在途请求的后续拨号；请求级快照冻结不是本模型的语义。
 
 进一步的主题：
 
-- [Wiki：分流与规则](https://github.com/OopsOo0ps/proxy/wiki/分流与规则) — `rules_file` 语法、内网直连、远程规则定时刷新。
+- [Wiki：分流与规则](https://github.com/OopsOo0ps/proxy/wiki/分流与规则) — 规则语法（内联 `rules` 与规则源 `rulesets`）、内网直连、远程规则定时刷新。
 - [Wiki：DNS-策略](https://github.com/OopsOo0ps/proxy/wiki/DNS-策略) — remote DNS 默认行为与可选 DNS 网关。
 - [Wiki：运行时语义](https://github.com/OopsOo0ps/proxy/wiki/运行时语义) — 配置热加载（SIGHUP）、优雅关闭、过载保护。
 
 ## 可观测性
 
-配置 `metrics.listen` 后，同一端口暴露四个端点：
+配置 `api.listen` 后，同一端口暴露四个端点：
 
 | 端点 | 用途 |
 | --- | --- |
@@ -208,14 +247,14 @@ curl -s http://127.0.0.1:9100/stats | python3 -m json.tool
 curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 ```
 
-指标全表、日志字段、出口节点健康检查（主动探测 + 被动冷却）与 `/stats` 完整字段见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。运维端点默认仅允许绑定环回地址；确需远程只读访问时可显式设置 `metrics.allow_remote: true`（仍不做鉴权，请配合防火墙）。`PUT /log/level` 是状态变更，永远只接受环回来源，不受该开关影响。
+指标全表、日志字段、出口节点健康检查（主动探测 + 被动冷却）与 `/stats` 完整字段见 [Wiki：可观测性](https://github.com/OopsOo0ps/proxy/wiki/可观测性)。运维端点默认仅允许绑定环回地址；确需远程只读访问时可显式设置 `api.allow-remote: true`（仍不做鉴权，请配合防火墙）。`PUT /log/level` 是状态变更，永远只接受环回来源，不受该开关影响。
 
 ## 安全
 
 - 入站代理支持用户名/密码认证（HTTP `Proxy-Authorization` / SOCKS5 RFC 1929）；监听非环回地址时**强制**要求认证。
 - 隧道凭据以 SHA-224 摘要形式在 TLS 内传输；服务端凭据存储只保留摘要，比较全部使用常量时间实现，避免时序侧信道。
-- 失败响应不泄露信息：入站统一回标准 407 / SOCKS5 通用失败码（固定文案）；隧道层对认证失败与非协议流量返回中性伪装网页（可用 `decoy_file` 自定义），与普通 Web 服务无法区分。
-- 出口节点证书校验默认开启；`insecure_skip_verify` 仅供自签调试，请勿在生产使用。
+- 失败响应不泄露信息：入站统一回标准 407 / SOCKS5 通用失败码（固定文案）；隧道层对认证失败与非协议流量返回中性伪装网页（可用服务端 params 的 `decoy-file` 自定义），与普通 Web 服务无法区分。
+- 出口节点证书校验默认开启；节点 params 的 `insecure-skip-verify` 仅供自签调试，请勿在生产使用。
 - 漏洞报告流程见 [SECURITY.md](SECURITY.md)：GitHub 私密漏洞报告已启用，承诺 14 天内首次响应。
 
 ## 限制与边界
@@ -223,9 +262,9 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 - **仅有显式代理的 TCP**：暂不支持 UDP（SOCKS5 `UDP ASSOCIATE` 与 Trojan UDP 转发），也没有 TUN / 透明代理模式；未配置代理的程序不会被接管。
 - **remote DNS 的前提**：应用需把域名交给代理（CONNECT / `socks5h`）或经 DNS 网关解析；应用自行解析后连 IP 时，域名分流与防污染均不适用。
 - **健康检查不校验隧道口令**：口令错误等隧道层问题由真实流量的被动冷却兜底；摘除判定按探测周期累计（默认最坏约 30s，期间少量请求可能失败）。
-- **连接池存在回收窗口**：空闲连接可能被服务端按握手超时回收；请保持 `pool.idle_ttl` 明显小于服务端 `timeouts.handshake`。
-- **热加载不覆盖监听地址**：`inbound.*` / `listen` 等变更会被明确拒绝并提示重启。
-- `proxy-controller` 仍为骨架，配置暂不支持集中下发；生产目标平台为 Ubuntu 22.04，尚未提供发行包（deb / apt 源）。
+- **连接池存在回收窗口**：空闲连接可能被服务端按握手超时回收；请保持 `outbound.pool.prewarm.ttl` 明显小于服务端 `timeouts.handshake`。
+- **指标口径**：`requests_total` 的 `route` 标签取值为 `direct` / `proxy` / `reject`（路由动作），另有 `pool` 表示终态时节点池尚未确定具体出口（如拨号中途失败或上游连接复用）；`active_connections` 口径为**在服务的请求 / 连接数**（`ConnOpened − (ConnDone + ConnRejected)`），非 TCP socket 数。
+- 生产目标平台为 Ubuntu 22.04，尚未提供发行包（deb / apt 源）与集中配置下发。
 
 完整清单（连接上限语义、远程规则边界、收尾中止不可区分等）见 [Wiki：限制与边界](https://github.com/OopsOo0ps/proxy/wiki/限制与边界)。
 
@@ -241,53 +280,58 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 
 ## 项目结构
 
+包结构按 L0–L5 分层（层号登记在 `internal/arch/layering.go`），依赖方向严格单向
+（只允许依赖更低层 + 少量显式登记的同层边），由 `internal/arch` 守护测试以
+`go list -deps` 矩阵强制（`make test` 拦截违规；新包未登记分层即编译失败）。
+
 ```text
-├── cmd/                  # 可执行入口（三个独立二进制）
-│   ├── server/           #   proxy-server（远端出口）
-│   ├── client/           #   proxy-client（本机入口）
-│   └── controller/       #   proxy-controller（骨架）
-├── configs/              # 示例配置（生产模板 + 本地三节点演示）
-├── internal/
-│   ├── arch/             #   依赖方向守护测试（go list -deps 矩阵，make test 拦截）
-│   ├── auth/             #   凭据存储与常量时间校验
-│   ├── clientapp/        #   proxy-client 组装与端到端测试
-│   ├── config/           #   配置解析、默认值与校验
-│   ├── connlimit/        #   进程级并发连接上限（背压）
-│   ├── connpool/         #   上游隧道预热池（connect-then-bind 契约）
-│   ├── core/             #   核心契约（Target / Route / 拨号·认证·遥测接口）
-│   ├── dialer/           #   路由感知的出站拨号（实现 core.TargetDialer）
-│   ├── dnsgw/            #   可选 DNS 网关（分流感知的 DNS 转发）
-│   ├── httpproxy/        #   HTTP/HTTPS 入站（CONNECT + 转发）
-│   ├── logging/          #   slog 初始化、request_id 与运行期级别/格式切换
-│   ├── metrics/          #   Prometheus 指标（L4 适配层，实现各组件 Observer）
-│   ├── netutil/          #   网络小工具
-│   ├── nodes/            #   出口节点池（轮询/冷却/切换；节点携带传输实现）
-│   ├── outbound/         #   出口传输契约（Transport/Prewarmer/Prober）与一致性验收
-│   ├── relay/            #   双向转发（半关闭/空闲超时）
-│   ├── routing/          #   分流规则引擎
-│   ├── ruleset/          #   规则源（本地文件 / 远程 URL）与定时刷新
-│   ├── serverapp/        #   proxy-server 组装
-│   ├── session/          #   入站 accept/drain 生命周期（socks5/trojan 共用）
-│   ├── shutdown/         #   优雅关停排空原语
-│   ├── socks5/           #   SOCKS5 入站与地址编码
-│   ├── sockswire/        #   SOCKS5 线格式编解码
-│   ├── status/           #   运行时状态快照（/stats）
-│   ├── testutil/         #   测试辅助（自签证书）
-│   └── trojan/           #   Trojan 协议（客户端传输实现 / 服务端）
-├── pkg/version/          #   版本信息（构建期注入）
-├── test/integration/     #   黑盒集成测试（真实二进制端到端）
-├── Dockerfile            # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
-├── deploy/systemd/       # systemd 单元（Ubuntu 22.04，含沙箱配置）
-├── Makefile              # 开发入口（build / test / cover / lint ...）
-└── .github/workflows/    # CI（构建 + 测试 + golangci-lint + Docker 镜像）
+├── cmd/                      # 可执行入口（两个独立二进制）
+│   ├── client/               #   proxy-client（本机入口）        [L5]
+│   └── server/               #   proxy-server（远端出口）        [L5]
+├── configs/                  # 示例配置（生产模板 + 本地三节点演示）
+├── internal/                 # 28 个包，按层组织
+│   ├── relay/                #   [L0 纯原语] 双向转发（半关闭 / 空闲超时 / 缓冲复用）
+│   ├── sockswire/            #   [L0] SOCKS5 线格式编解码
+│   ├── netutil/              #   [L0] 网络小工具
+│   ├── logging/              #   [L0] slog JSON 日志（request_id 与运行期级别切换）
+│   ├── shutdown/             #   [L0] 优雅关停排空原语（停止 accept → 排空 → 强切）
+│   ├── connlimit/            #   [L0] 进程级并发连接上限（背压闸）
+│   ├── auth/                 #   [L0] 凭据存储与常量时间校验
+│   ├── defaults/             #   [L0] 全部文档化数值缺省的唯一来源（纯常量）
+│   ├── version/              #   [L0] 版本信息（构建期 ldflags 注入）
+│   ├── core/                 #   [L1 核心契约] Target / Route / 拨号·认证·遥测接口
+│   ├── outbound/             #   [L1] 出口能力契约（Transport / Prewarmer / Prober）与一致性验收
+│   ├── session/              #   [L1] 入站 accept 机械（双 ctx 生命周期，零 core 依赖）
+│   ├── dialer/               #   [L2 领域引擎] TargetDialer 组合树（路由分派 + 直连 + 节点池）
+│   ├── routing/              #   [L2] 分流规则引擎（纯函数判定）
+│   ├── ruleset/              #   [L2] 规则源（本地文件 / 远程 URL）与定时刷新
+│   ├── nodes/                #   [L2] 出口节点池（轮询 / 健康 / 冷却 / 故障转移预算；预热池自持）
+│   ├── connpool/             #   [L2] 上游隧道预热池（connect-then-bind，TTL 失效回退）
+│   ├── httpproxy/            #   [L3 协议端点] HTTP/HTTPS 入站（CONNECT + 绝对地址）
+│   ├── socks5/               #   [L3] SOCKS5 入站（TCP CONNECT）
+│   ├── dnsgw/                #   [L3] 可选 DNS 网关（分流感知的 DNS 转发）
+│   ├── trojan/               #   [L3] Trojan 协议（客户端传输 + 服务端接受器）
+│   ├── config/               #   [L4 组装/面] 严格 YAML 配置（判别字段 + 协议 params）
+│   ├── clientapp/            #   [L4] proxy-client 组装根（快照构建 / 热加载 / 重载语义）
+│   ├── serverapp/            #   [L4] proxy-server 组装根（trojan 服务端 + 直连出站特化）
+│   ├── metrics/              #   [L4] Prometheus 指标适配（实现各组件 Observer）
+│   ├── status/               #   [L4] 运维端点（/health /stats /log/level）
+│   ├── testutil/             #   [L4] 测试地基 + 入站一致性套件（C1–C10）
+│   └── arch/                 #   [L4] 依赖方向守护测试（go list -deps 矩阵，make test 拦截）
+├── test/integration/         # 黑盒集成与混沌测试 [L5]（构建并启动真实二进制）
+├── Dockerfile                # 容器镜像（多阶段：最小版 / 排错版，linux/amd64）
+├── deploy/systemd/           # systemd 单元（Ubuntu 22.04，含沙箱配置）
+├── Makefile                  # 开发入口（build / test / cover / bench / lint ...）
+└── .github/workflows/        # CI（构建 + 测试 + golangci-lint + Docker 镜像）
 ```
 
 ## 开发
 
-- `make build`：构建三个二进制到 `bin/`（自动注入版本信息）
+- `make build`：构建两个二进制到 `bin/`（自动注入版本信息）
 - `make version`：打印两个二进制的版本信息
 - `make test`：运行全部单元测试（含端到端、黑盒集成与混沌用例，不依赖外部网络）
 - `make cover`：运行测试并打印总覆盖率
+- `make bench`：运行热路径基准测试（`go test -bench`，只跑 `internal/`，不含集成测试）
 - `make lint`：静态检查（golangci-lint v2，首次自动下载）
 - `make demo`：一条命令跑通本地三节点演示；分步使用 `make demo-up` / `make demo-check` / `make demo-down`
 - `make run-server` / `make run-client`：前台运行（`SERVER_CONFIG` / `CLIENT_CONFIG` 指定配置）

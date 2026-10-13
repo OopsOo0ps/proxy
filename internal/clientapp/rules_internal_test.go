@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/core"
 )
 
 func writeRules(t *testing.T, path, body string) {
@@ -25,21 +25,21 @@ func TestReloadReusesRulesProviderWhenSourceUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := app.policy.load().rules
+	before := app.live.Load().providers[0]
 
 	writeRules(t, rulesPath, "rules:\n  - action: direct\n    match: [\"*.example.net\"]\n")
 	next := baseReloadCfg(t, rulesPath)
 	if err := app.Reload(next); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	after := app.policy.load().rules
+	after := app.live.Load().providers[0]
 	if after != before {
 		t.Fatal("rules provider must be reused when the source is unchanged")
 	}
-	if got := after.Decide("a.example.net"); got != routing.Direct {
+	if got := after.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("new file content not applied: decide = %v", got)
 	}
-	if got := after.Decide("a.example.org"); got != routing.Proxy {
+	if got := after.Decide("a.example.org"); got != core.RouteProxy {
 		t.Fatalf("old rules leaked: decide = %v", got)
 	}
 }
@@ -56,23 +56,23 @@ func TestReloadSwitchesRulesProviderWhenSourceChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := app.policy.load().rules
+	before := app.live.Load().providers[0]
 
 	next := baseReloadCfg(t, rulesB)
 	if err := app.Reload(next); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	after := app.policy.load().rules
+	after := app.live.Load().providers[0]
 	if after == before {
 		t.Fatal("rules provider must be rebuilt when the source changes")
 	}
 	if after.Spec().Target != rulesB {
 		t.Fatalf("spec target = %q, want %q", after.Spec().Target, rulesB)
 	}
-	if got := after.Decide("a.example.net"); got != routing.Direct {
+	if got := after.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("new source rules not applied: decide = %v", got)
 	}
-	if got := after.Decide("a.example.org"); got != routing.Proxy {
+	if got := after.Decide("a.example.org"); got != core.RouteProxy {
 		t.Fatalf("old source rules leaked: decide = %v", got)
 	}
 }
@@ -86,7 +86,7 @@ func TestRuntimeStatsIncludesRuleset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rt := app.runtimeStats()
+	rt := app.b.runtimeStats()
 	if rt.Ruleset == nil {
 		t.Fatal("stats must include the ruleset section when a source is configured")
 	}
@@ -102,7 +102,37 @@ func TestRuntimeStatsOmitsRulesetWithoutSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rt := app.runtimeStats(); rt.Ruleset != nil {
+	if rt := app.b.runtimeStats(); rt.Ruleset != nil {
 		t.Fatalf("ruleset section must be omitted without a source: %+v", rt.Ruleset)
 	}
+}
+
+// TestBuildRejectsUnknownProtocols 钉住两个分派点的 fail-fast 语义：
+// 未知入站类型与未知出口协议在组装期报用户可读错误（解析期拦截在 config）。
+func TestBuildRejectsUnknownProtocols(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	writeRules(t, rulesPath, "")
+
+	badInbound := baseReloadCfg(t, rulesPath)
+	badInbound.Inbounds[0].Type = "quic"
+	if _, err := Build(badInbound, BuildOptions{}); err == nil || !strings_Contains(err.Error(), "unknown inbound type") {
+		t.Fatalf("unknown inbound type must fail at build, got %v", err)
+	}
+
+	badNode := baseReloadCfg(t, rulesPath)
+	badNode.Outbound.Nodes[0].Protocol = "shadowsocks"
+	if _, err := Build(badNode, BuildOptions{}); err == nil || !strings_Contains(err.Error(), "unknown outbound protocol") {
+		t.Fatalf("unknown outbound protocol must fail at build, got %v", err)
+	}
+}
+
+// strings_Contains 是测试内的子串判断（避免仅为此导入 strings）。
+func strings_Contains(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
 }

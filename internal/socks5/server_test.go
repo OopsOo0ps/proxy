@@ -12,7 +12,6 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
-	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
@@ -28,10 +27,11 @@ func mustPort(t *testing.T, s string) uint16 {
 
 // stubDialer 是可注入的 TargetDialer 测试桩。
 type stubDialer struct {
-	mu   sync.Mutex
-	host string
-	port uint16
-	dial func(ctx context.Context, t core.Target) (net.Conn, error)
+	mu    sync.Mutex
+	host  string
+	port  uint16
+	route core.RouteAction
+	dial  func(ctx context.Context, t core.Target) (net.Conn, error)
 }
 
 func (d *stubDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
@@ -39,13 +39,11 @@ func (d *stubDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, c
 	d.host, d.port = t.Host, t.Port
 	d.mu.Unlock()
 	if d.dial == nil {
-		return nil, core.Route{}, errors.New("stub: no dial")
+		return nil, core.Route{Action: d.route}, errors.New("stub: no dial")
 	}
 	conn, err := d.dial(ctx, t)
-	return conn, core.Route{Action: routing.Direct}, err
+	return conn, core.Route{Action: d.route}, err
 }
-
-func (d *stubDialer) RouteFor(string) routing.Action { return routing.Direct }
 
 // startEcho 启动一个回显 TCP 服务，并返回其地址。
 func startEcho(t *testing.T) string {
@@ -347,6 +345,129 @@ func TestServerPassesTargetToDialer(t *testing.T) {
 	if gotHost != host || gotPort != port {
 		t.Fatalf("dialer got %s:%d, want %s:%d", gotHost, gotPort, host, port)
 	}
+}
+
+// recTelemetry 记录 core.Telemetry 三类事件（事件序列与 ConnAttrs 组装断言用）。
+type recTelemetry struct {
+	mu       sync.Mutex
+	opened   []string
+	rejected []string
+	done     []core.ConnAttrs
+}
+
+func (r *recTelemetry) ConnOpened(proto string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.opened = append(r.opened, proto)
+}
+
+func (r *recTelemetry) ConnRejected(proto, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rejected = append(r.rejected, proto+"/"+reason)
+}
+
+func (r *recTelemetry) ConnDone(a core.ConnAttrs) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done = append(r.done, a)
+}
+
+func (r *recTelemetry) snapshot() (opened, rejected []string, done []core.ConnAttrs) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.opened...), append([]string(nil), r.rejected...), append([]core.ConnAttrs(nil), r.done...)
+}
+
+// TestTelemetryEventSequence 钉住三事件口径：accept 后 ConnOpened；
+// 服务终态恰好一个 ConnDone，且 ConnAttrs 的权威 Route / 结果 / 字节数
+// 由 DialTarget 返回值组装（不变量 6）。
+func TestTelemetryEventSequence(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustPort(t, portStr)
+
+	tel := &recTelemetry{}
+	srv := &Server{
+		Dialer: &stubDialer{route: core.RouteProxy, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+			return net.Dial("tcp", t.String())
+		}},
+		Telemetry: tel,
+	}
+	proxyAddr := startServer(t, srv)
+
+	conn, rep, err := socks5Connect(t, proxyAddr, "", "", host, port)
+	if err != nil || rep != ReplySuccess {
+		t.Fatalf("connect: rep=%#x err=%v", rep, err)
+	}
+	payload := []byte("telemetry payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		opened, _, done := tel.snapshot()
+		if len(opened) == 1 && len(done) == 1 {
+			if done[0].Route.Action != core.RouteProxy {
+				t.Fatalf("route = %v, want proxy（权威路径来自 DialTarget）", done[0].Route.Action)
+			}
+			if done[0].Proto != core.ProtoSOCKS5 || done[0].Result != core.ResultOK {
+				t.Fatalf("attrs = %+v, want socks5/ok", done[0])
+			}
+			if done[0].Target.Host != host || done[0].Target.Port != port {
+				t.Fatalf("target = %s, want %s", done[0].Target, net.JoinHostPort(host, strconv.Itoa(int(port))))
+			}
+			if done[0].BytesUp != int64(len(payload)) || done[0].BytesDown != int64(len(payload)) {
+				t.Fatalf("bytes = %d/%d, want %d/%d", done[0].BytesUp, done[0].BytesDown, len(payload), len(payload))
+			}
+			if done[0].RequestID == "" || done[0].ClientIP == "" || done[0].Duration <= 0 {
+				t.Fatalf("attrs = %+v, want request_id/client_ip/duration filled", done[0])
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	opened, rejected, done := tel.snapshot()
+	t.Fatalf("telemetry events did not pair: opened=%v rejected=%v done=%+v", opened, rejected, done)
+}
+
+// TestTelemetryAuthFailureRejected 钉住认证失败的口径：未进入服务即被拒，
+// 记 ConnRejected(denied)，不产生 ConnDone（无路由维度）。
+func TestTelemetryAuthFailureRejected(t *testing.T) {
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tel := &recTelemetry{}
+	srv := &Server{Auth: store, Dialer: &stubDialer{route: core.RouteDirect}, Telemetry: tel}
+	proxyAddr := startServer(t, srv)
+
+	if _, _, err := socks5Connect(t, proxyAddr, "alice", "wrong", "203.0.113.9", 80); !errors.Is(err, errAuthFailed) {
+		t.Fatalf("err = %v, want auth failed", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		opened, rejected, done := tel.snapshot()
+		if len(rejected) == 1 {
+			if rejected[0] != core.ProtoSOCKS5+"/"+core.ResultDenied {
+				t.Fatalf("rejected = %v, want socks5/denied", rejected)
+			}
+			if len(opened) != 1 || len(done) != 0 {
+				t.Fatalf("events = opened=%v done=%+v, want opened×1 and no done", opened, done)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	opened, rejected, done := tel.snapshot()
+	t.Fatalf("rejection not observed: opened=%v rejected=%v done=%+v", opened, rejected, done)
 }
 
 // startServerControlled 启动 SOCKS5 服务并暴露关停触发与 Serve 结束信号。

@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/OopsOo0ps/proxy/pkg/version"
+	"github.com/OopsOo0ps/proxy/internal/version"
 )
 
 // fetchConfig 是远程规则拉取的固定约束。

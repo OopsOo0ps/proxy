@@ -1,6 +1,6 @@
 // 运行时日志级别端点：GET 查询当前级别，PUT 切换级别（debug/info/warn/error）。
 // GET 是只读操作；PUT 是运行时状态变更，永远只接受环回来源的请求（远程一律
-// 403）——即使运维端点通过 metrics.allow_remote 绑定了非环回地址。端点不做
+// 403）——即使运维端点通过 api.allow-remote 绑定了非环回地址。端点不做
 // 鉴权，非环回暴露时请配合防火墙，并注意反向代理会让请求看起来来自环回。
 package logging
 

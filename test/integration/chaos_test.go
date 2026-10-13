@@ -45,18 +45,20 @@ func TestChaosKilledUpstreamRemovedAndRejoins(t *testing.T) {
 
 	serverConfig := func(name, addr, password string) string {
 		return writeFile(t, dir, name, fmt.Sprintf(`
-listen: "%s"
-tls:
-  cert_file: %q
-  key_file: %q
-users:
-  - username: node-user
-    password: %s
-metrics:
-  listen: "127.0.0.1:0"
 log:
   level: info
   format: json
+api:
+  listen: "127.0.0.1:0"
+inbounds:
+  - type: trojan
+    listen: %q
+    params:
+      cert-file: %q
+      key-file: %q
+      users:
+        - username: node-user
+          password: %s
 `, addr, certFile, keyFile, password))
 	}
 	cfgA := serverConfig("server-a.yaml", nodeAAddr, nodeAPassword)
@@ -84,31 +86,40 @@ log:
 	targetURL := "https://localhost:" + portOf(t, target.Listener.Addr().String())
 
 	clientConfig := writeFile(t, dir, "client.yaml", fmt.Sprintf(`
-inbound:
-  http: "127.0.0.1:0"
-  auth:
-    - username: alice
-      password: change-me
-nodes:
-  - addr: "%s"
-    password: %s
-  - addr: "%s"
-    password: %s
-tls:
-  insecure_skip_verify: true
-routing:
-  default: proxy
-  private_direct: false
-health_check:
-  interval: 200ms
-  timeout: 300ms
-  failures: 2
-  successes: 2
-metrics:
-  listen: "127.0.0.1:0"
 log:
   level: info
   format: json
+api:
+  listen: "127.0.0.1:0"
+inbounds:
+  - type: http
+    listen: "127.0.0.1:0"
+    auth:
+      users:
+        - username: alice
+          password: change-me
+outbound:
+  nodes:
+    - name: node-a
+      protocol: trojan
+      params:
+        addr: %q
+        password: %s
+        insecure-skip-verify: true
+    - name: node-b
+      protocol: trojan
+      params:
+        addr: %q
+        password: %s
+        insecure-skip-verify: true
+  pool:
+    health:
+      interval: 200ms
+      timeout: 300ms
+      failures: 2
+      successes: 2
+routing:
+  private-direct: false
 `, nodeAAddr, nodeAPassword, nodeBAddr, nodeBPassword))
 	clientProc := startProcess(t, "proxy-client", filepath.Join(binDir, "proxy-client"), "-config", clientConfig)
 	clientListen := waitForRecords(t, clientProc, "listening", 1, 10*time.Second)[0]

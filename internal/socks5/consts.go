@@ -30,6 +30,7 @@ const (
 	// 回复码。
 	ReplySuccess         = 0x00
 	ReplyGeneralFailure  = 0x01
+	ReplyNotAllowed      = 0x02 // connection not allowed by ruleset（路由拒绝）
 	ReplyConnRefused     = 0x05
 	ReplyCmdNotSupported = 0x07
 )

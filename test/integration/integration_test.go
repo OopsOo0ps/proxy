@@ -123,18 +123,20 @@ func TestBinariesEndToEndRoutingAndMetrics(t *testing.T) {
 
 	// ---- 启动服务：proxy-server（远端出口）----
 	serverConfig := writeFile(t, dir, "server.yaml", fmt.Sprintf(`
-listen: "127.0.0.1:0"
-tls:
-  cert_file: %q
-  key_file: %q
-users:
-  - username: node-user
-    password: node-secret
-metrics:
-  listen: "127.0.0.1:0"
 log:
   level: info
   format: json
+api:
+  listen: "127.0.0.1:0"
+inbounds:
+  - type: trojan
+    listen: "127.0.0.1:0"
+    params:
+      cert-file: %q
+      key-file: %q
+      users:
+        - username: node-user
+          password: node-secret
 `, certFile, keyFile))
 	serverProc := startProcess(t, "proxy-server", filepath.Join(binDir, "proxy-server"), "-config", serverConfig)
 	serverListen := waitForRecords(t, serverProc, "listening", 1, 10*time.Second)[0]
@@ -149,26 +151,38 @@ rules:
     match: ["127.0.0.1"]
 `)
 	clientConfig := writeFile(t, dir, "client.yaml", fmt.Sprintf(`
-inbound:
-  http: "127.0.0.1:0"
-  socks5: "127.0.0.1:0"
-  auth:
-    - username: alice
-      password: change-me
-nodes:
-  - addr: %q
-    password: node-secret
-tls:
-  insecure_skip_verify: true
-routing:
-  default: proxy
-  private_direct: false
-  rules_file: %q
-metrics:
-  listen: "127.0.0.1:0"
 log:
   level: info
   format: json
+api:
+  listen: "127.0.0.1:0"
+inbounds:
+  - type: http
+    listen: "127.0.0.1:0"
+    auth:
+      users:
+        - username: alice
+          password: change-me
+  - type: socks5
+    listen: "127.0.0.1:0"
+    auth:
+      users:
+        - username: alice
+          password: change-me
+outbound:
+  nodes:
+    - name: node-1
+      protocol: trojan
+      params:
+        addr: %q
+        password: node-secret
+        insecure-skip-verify: true
+routing:
+  private-direct: false
+  rulesets:
+    - name: local
+      type: file
+      path: %q
 `, tunnelAddr, rulesConfig))
 	clientProc := startProcess(t, "proxy-client", filepath.Join(binDir, "proxy-client"), "-config", clientConfig)
 	clientListen := waitForRecords(t, clientProc, "listening", 1, 10*time.Second)[0]
