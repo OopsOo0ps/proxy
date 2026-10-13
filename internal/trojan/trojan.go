@@ -23,6 +23,7 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
+	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
 )
 
@@ -159,10 +160,10 @@ type ClientConfig struct {
 // 作为包内实现细节保留导出，新代码请经 Transport 能力面触达。
 func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	if cfg.DialTimeout <= 0 {
-		cfg.DialTimeout = 10 * time.Second
+		cfg.DialTimeout = defaults.DialTimeout
 	}
 	if cfg.HandshakeTimeout <= 0 {
-		cfg.HandshakeTimeout = 10 * time.Second
+		cfg.HandshakeTimeout = defaults.HandshakeTimeout
 	}
 
 	d := &net.Dialer{Timeout: cfg.DialTimeout}
@@ -195,11 +196,11 @@ func Connect(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 // StartRequest 在已完成握手的隧道连接上向 target 写出 Trojan 请求。
 // 供本包 Transport 实现 Bind（outbound.Prewarmer 的 bind 阶段）使用；
 // 作为包内实现细节保留导出，新代码请经 Transport 能力面触达。
-// timeout 是写超时（<=0 时默认 10s）；写期限同时不晚于 ctx 的截止时间，
+// timeout 是写超时（<=0 时取 defaults.HandshakeTimeout）；写期限同时不晚于 ctx 的截止时间，
 // 保证故障转移总预算能覆盖请求写出阶段。成功后清除写期限，连接可直接用于转发。
 func StartRequest(ctx context.Context, conn net.Conn, passwordHash string, t core.Target, timeout time.Duration) error {
 	if timeout <= 0 {
-		timeout = 10 * time.Second
+		timeout = defaults.HandshakeTimeout
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(deadline); remaining < timeout {

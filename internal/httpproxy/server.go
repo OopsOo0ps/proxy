@@ -401,6 +401,17 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 	rec := &dialRecord{}
 	ctx := logging.WithRequestID(context.WithValue(r.Context(), dialRecordKey{}, rec), reqID)
 
+	// 终态 Target 与本请求的拨号目标同源：复用 CONNECT 路径同一解析辅助
+	// splitHostPortDefault（http 方案缺省端口 80，与转发拨号的取端口口径一致）。
+	// 解析失败在 r.URL 校验后不可达；保持旧 Target 口径，不中断请求。
+	var forwardTarget core.Target
+	if forwardHost, forwardPort, err := splitHostPortDefault(r.URL.Host, 80); err != nil {
+		// 保持旧 Target 口径，不中断请求。
+		forwardTarget = core.Target{Host: r.URL.Hostname()}
+	} else {
+		forwardTarget = core.Target{Host: forwardHost, Port: forwardPort}
+	}
+
 	sw := &statusRecorder{ResponseWriter: w}
 	h.proxy.ServeHTTP(sw, r.WithContext(ctx))
 
@@ -430,7 +441,7 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 		RequestID: reqID,
 		ClientIP:  clientIP,
 		Proto:     core.ProtoHTTP,
-		Target:    core.Target{Host: r.URL.Hostname()},
+		Target:    forwardTarget,
 		Route:     route,
 		Result:    result,
 		Duration:  elapsed,
