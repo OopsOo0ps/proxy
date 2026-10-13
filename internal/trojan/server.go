@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strconv"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
@@ -79,32 +78,44 @@ type Server struct {
 
 // Serve 在 ln 上接受并处理隧道连接；ctx 取消后优雅关停：
 // 先停止接受新连接，让已在转发的隧道在关停期限内自然结束，超时后强制断开。
-// accept/drain 机械部分委托 internal/session（与 socks5 共用同一实现）。
+// accept/drain 机械部分委托 internal/session（与 socks5 共用同一实现），
+// 本包实现 session.ConnHandler 提供协议逻辑。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	return session.Serve(ctx, ln, session.Options{
+	return session.Serve(ctx, ln, tunnelHandler{srv: s, serveCtx: ctx}, session.Options{
 		Logger:         s.Logger,
 		DrainTimeout:   s.shutdownTimeout,
 		DrainedMessage: "shutdown: all in-flight tunnels drained",
-	}, s.handle)
+	})
 }
 
-func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
+// tunnelHandler 是隧道服务端的 session.ConnHandler：捕获 serveCtx，
+// 让握手阶段的阻塞读取对关停立即敏感（存量已握手连接仍按排空期限处理）。
+type tunnelHandler struct {
+	srv      *Server
+	serveCtx context.Context
+}
+
+// ServeConn 处理一条已接受的连接（session.ConnHandler）：握手 → 认证 →
+// 拨号 → relay；拒绝路径与遥测事件发射都在这里。
+// connCtx 承载强制断开期限（排空超时后被取消）。
+func (h tunnelHandler) ServeConn(connCtx context.Context, conn net.Conn) {
+	h.srv.handle(h.serveCtx, connCtx, conn)
+}
+
+func (s *Server) handle(ctx, connCtx context.Context, conn net.Conn) {
 	defer func() { _ = conn.Close() }()
 
 	start := time.Now()
 	reqID := logging.NewRequestID()
-	logger := s.logger().With("request_id", reqID, "proto", "tunnel", "client_ip", netutil.RemoteIP(conn.RemoteAddr()))
+	clientIP := netutil.RemoteIP(conn.RemoteAddr())
+	logger := s.logger().With("request_id", reqID, "proto", core.ProtoTunnel, "client_ip", clientIP)
+	tel := s.telemetryNow()
 
-	s.telemetryNow().ConnOpened(core.ProtoTunnel)
-	defer s.telemetryNow().ConnClosed(core.ProtoTunnel)
-
-	result := core.ResultError
-	defer func() {
-		s.telemetryNow().RequestDone(core.ProtoTunnel, core.RouteDirect, result, time.Since(start))
-	}()
+	// accept 后即计（active +1）；终态由 ConnDone / ConnRejected 配对回收。
+	tel.ConnOpened(core.ProtoTunnel)
 
 	_ = conn.SetDeadline(time.Now().Add(s.handshakeTimeout()))
-	// 握手阶段对 ctx 取消敏感：服务端关停时立即打断阻塞中的读取。
+	// 握手阶段对关停取消敏感：服务端关停时立即打断阻塞中的读取。
 	// 客户端连接池会持有"已握手、待发送请求"的预热连接，等待它们
 	// 自然超时会让优雅退出拖满一个握手超时；这类连接没有在途请求，
 	// 直接关闭不丢任何数据。
@@ -115,7 +126,8 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 	req, err := ReadRequest(br)
 	if err != nil {
 		if ctx.Err() != nil {
-			// 关停中断：不再回放伪装页面，直接退出。
+			// 关停中断：不再回放伪装页面，直接退出（未进入服务，按拒绝计）。
+			tel.ConnRejected(core.ProtoTunnel, core.ResultError)
 			return
 		}
 		if IsNotProtocol(err) {
@@ -125,54 +137,78 @@ func (s *Server) handle(ctx, relayCtx context.Context, conn net.Conn) {
 			logger.Debug("handshake failed", "error", err)
 		}
 		s.serveDecoy(conn)
+		// 未进入服务即被拒（认证/协议失败）：按拒绝计，无路由维度。
+		tel.ConnRejected(core.ProtoTunnel, core.ResultDenied)
 		return
 	}
 	stopHandshakeWatch()
 
 	// 超过关停期限（forceCancel）时打断尚未进入转发的连接（如拨号中）。
-	stopForce := context.AfterFunc(relayCtx, func() { _ = conn.SetDeadline(time.Now()) })
+	stopForce := context.AfterFunc(connCtx, func() { _ = conn.SetDeadline(time.Now()) })
 	defer stopForce()
 
 	user, ok := s.verifierNow().VerifyTunnel(req.PasswordHash)
 	if !ok {
 		logger.Warn("tunnel authentication failed")
-		result = core.ResultAuthFail
 		s.serveDecoy(conn)
+		tel.ConnRejected(core.ProtoTunnel, core.ResultDenied)
 		return
 	}
 	if req.Command != sockswire.CmdConnect {
 		// UDP ASSOCIATE 等命令暂不支持：直接关闭并记录。
 		logger.Warn("unsupported tunnel command", "command", req.Command)
+		tel.ConnRejected(core.ProtoTunnel, core.ResultError)
 		return
 	}
 
-	target := net.JoinHostPort(req.Host, strconv.Itoa(int(req.Port)))
-	dialCtx, cancel := context.WithTimeout(relayCtx, s.dialTimeout())
+	target := core.Target{Host: req.Host, Port: req.Port}
+	// 服务端即出口：出站是直连拨号，权威路径恒为 Route{Direct}（无出口标签）。
+	route := core.Route{Action: core.RouteDirect}
+	dialCtx, cancel := context.WithTimeout(connCtx, s.dialTimeout())
 	defer cancel()
-	upstream, err := s.Dial(dialCtx, target)
+	upstream, err := s.Dial(dialCtx, target.String())
 	if err != nil {
 		// 与官方行为一致：目标不可达时静默关闭，不做区分响应。
-		logger.Warn("dial target failed", "target", target, "error", err)
-		result = core.ResultDialFail
+		logger.Warn("dial target failed", "target", target.String(), "error", err)
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoTunnel,
+			Target:    target,
+			Route:     route,
+			Result:    core.ResultDialFail,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	defer func() { _ = upstream.Close() }()
 
 	_ = conn.SetDeadline(time.Time{})
 	clientConn := relay.PrefixConn(conn, br)
-	stats, relayErr := relay.BiCopy(relayCtx, clientConn, upstream, s.idleTimeout())
-	result = core.ResultOK
+	stats, relayErr := relay.BiCopy(connCtx, clientConn, upstream, s.idleTimeout())
+	result := core.ResultOK
 	if relay.IsFailure(relayErr) {
 		result = core.ResultError
 	}
 	elapsed := time.Since(start)
 	attrs := append([]any{
 		"user", user,
-		"target", target,
-		"route", core.RouteDirect,
-		"upstream", target,
+		"target", target.String(),
+		"route", route.Action.String(),
+		"upstream", target.String(),
 	}, session.RelayAttrs(elapsed, stats.ClientToUpstream, stats.UpstreamToClient, result, relayErr)...)
 	logger.Info("tunnel completed", attrs...)
+	tel.ConnDone(core.ConnAttrs{
+		RequestID: reqID,
+		ClientIP:  clientIP,
+		Proto:     core.ProtoTunnel,
+		Target:    target,
+		Route:     route,
+		Result:    result,
+		Duration:  elapsed,
+		BytesUp:   stats.ClientToUpstream,
+		BytesDown: stats.UpstreamToClient,
+	})
 }
 
 // serveDecoy 写出伪装网页并优雅关闭，避免 RST 截断响应。

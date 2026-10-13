@@ -13,7 +13,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/serverapp"
-	"github.com/OopsOo0ps/proxy/pkg/version"
+	"github.com/OopsOo0ps/proxy/internal/version"
 )
 
 func main() {

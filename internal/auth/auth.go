@@ -28,7 +28,8 @@ func SHA224Hex(password string) string {
 }
 
 // Store 保存凭据，支持两种校验方式：
-//   - Verify：入站代理的用户名/密码（HTTP Basic、SOCKS5 RFC 1929）
+//   - Authenticate：入站代理的用户名/密码（HTTP Basic、SOCKS5 RFC 1929）；
+//     方法名与 core.Authenticator 契约一致，实现方无需 import core；
 //   - VerifyTunnel：隧道口令摘要（Trojan），返回匹配到的用户名
 //
 // Store 构造后只读，可安全并发使用。
@@ -73,9 +74,9 @@ func NewStore(users []User) (*Store, error) {
 	return s, nil
 }
 
-// Verify 以常量时间比较校验用户名/密码。
+// Authenticate 以常量时间比较校验用户名/密码（core.Authenticator 契约实现）。
 // 用户名不存在时同样执行一次摘要比较，避免通过响应时间枚举用户名。
-func (s *Store) Verify(username, password string) bool {
+func (s *Store) Authenticate(username, password string) bool {
 	got := sha256.Sum256([]byte(password))
 	// 未命中时 want 为零值摘要，比较依然执行，但不可能相等。
 	want := s.inbound[username]

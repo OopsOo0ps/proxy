@@ -33,7 +33,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/socks5"
 	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
-	"github.com/OopsOo0ps/proxy/pkg/version"
+	"github.com/OopsOo0ps/proxy/internal/version"
 )
 
 // App 是组装完成的 proxy-client 实例。
@@ -108,10 +108,9 @@ func (l clientLive) Auth() core.Authenticator {
 }
 func (l clientLive) Dialer() core.TargetDialer { return l.app.policy.load().dialer }
 
-// DialProxy 实现 core.ProxyDialer：DNS 网关用它把远程解析固定送往当前
-// 快照的出口节点池，热加载语义与其余动态策略一致。
-func (l clientLive) DialProxy(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
-	return l.app.policy.load().dialer.DialProxy(ctx, t)
+// Router 把当前快照的规则源适配为 dnsgw 的查询判定（DNS 走哪条路 = 流量走哪条路）。
+func (l clientLive) Router() dnsgw.RouteDecider {
+	return rulesRouter{rules: l.app.policy.load().rules}
 }
 
 func (l clientLive) IdleTimeout() time.Duration {
@@ -126,17 +125,44 @@ func (l clientLive) HandshakeTimeout() time.Duration {
 func (l clientLive) ShutdownTimeout() time.Duration {
 	return l.app.policy.load().cfg.Timeouts.Shutdown.Std()
 }
-func (l clientLive) Router() dnsgw.RouteDecider { return l.app.policy.load().rules }
-func (l clientLive) Remote() string             { return l.app.policy.load().dnsRemote }
-func (l clientLive) Local() []string            { return l.app.policy.load().dnsLocal }
-func (l clientLive) Timeout() time.Duration     { return l.app.policy.load().dnsTimeout }
+func (l clientLive) Remote() string         { return l.app.policy.load().dnsRemote }
+func (l clientLive) Local() []string        { return l.app.policy.load().dnsLocal }
+func (l clientLive) Timeout() time.Duration { return l.app.policy.load().dnsTimeout }
 
 var (
 	_ httpproxy.LivePolicy = clientLive{}
 	_ socks5.LivePolicy    = clientLive{}
 	_ dnsgw.LivePolicy     = clientLive{}
-	_ core.ProxyDialer     = clientLive{}
 )
+
+// rulesRouter 把规则源包装为 dnsgw 的查询判定（消费方接口的实现归组装根）：
+// core.Target 承载查询名（Port 无语义），判定动作即权威路径（无出口标签）。
+type rulesRouter struct{ rules *ruleset.Provider }
+
+func (r rulesRouter) Decide(t core.Target) core.Route {
+	return core.Route{Action: r.rules.Decide(t.Host)}
+}
+
+// dnsDirectDialer 是 DNS 网关的直连剪枝（本地解析路径）：对本地解析器的
+// UDP 拨号，超时跟随当前快照。
+type dnsDirectDialer struct{ app *App }
+
+func (d dnsDirectDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	conn, err := (&net.Dialer{Timeout: d.app.policy.load().dnsTimeout}).DialContext(ctx, "udp", t.String())
+	return conn, core.Route{Action: core.RouteDirect}, err
+}
+
+// dnsTunnelDialer 是 DNS 网关的代理剪枝（远端解析路径）：不经分流，一律经
+// 当前快照的出口节点池（同一棵组合树的池子树，返回权威路径 Route{Proxy}）。
+type dnsTunnelDialer struct{ app *App }
+
+func (d dnsTunnelDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	pool := d.app.policy.load().pool
+	if pool == nil {
+		return nil, core.Route{Action: core.RouteProxy, Label: "pool"}, dialer.ErrNoNodes
+	}
+	return pool.DialTarget(ctx, t)
+}
 
 // New 校验依赖并组装应用（不绑定端口）。
 // logCtrl 是运行时可调整的日志控制器（可为 nil，此时 /log/level 端点不可用）。
@@ -165,9 +191,11 @@ func New(cfg *config.Client, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 			Remote:     rt.dnsRemote,
 			Local:      rt.dnsLocal,
 			Timeout:    rt.dnsTimeout,
-			Router:     rt.rules,
-			// 拨号经 clientLive 读取当前快照：远程解析始终跟随热加载后的出口节点。
-			ProxyDialer:     clientLive{app: app},
+			Router:     rulesRouter{rules: rt.rules},
+			// 出站两侧注入的是读当前快照的适配器：直连路径（本地解析）与
+			// 代理路径（经出口隧道远程解析）始终跟随热加载后的运行时。
+			Direct:          dnsDirectDialer{app: app},
+			Proxy:           dnsTunnelDialer{app: app},
 			Logger:          logger,
 			Observer:        app.metrics,
 			ShutdownTimeout: cfg.Timeouts.Shutdown.Std(),
@@ -201,7 +229,10 @@ func (a *App) Listen() error {
 			return fmt.Errorf("clientapp: listen http %s: %w", addr, err)
 		}
 		a.httpLn = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
-			a.metrics.ConnRejected(core.ProtoHTTP)
+			// 过载拒绝也是一次 accept 后的终态：先开后拒，保持 active 口径平衡
+			//（active = ConnOpened − (ConnDone+ConnRejected)）。
+			a.metrics.ConnOpened(core.ProtoHTTP)
+			a.metrics.ConnRejected(core.ProtoHTTP, core.ResultOverload)
 			httpproxy.WriteOverloaded(conn)
 		})
 	}
@@ -211,7 +242,8 @@ func (a *App) Listen() error {
 			return fmt.Errorf("clientapp: listen socks5 %s: %w", addr, err)
 		}
 		a.socksLn = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
-			a.metrics.ConnRejected(core.ProtoSOCKS5)
+			a.metrics.ConnOpened(core.ProtoSOCKS5)
+			a.metrics.ConnRejected(core.ProtoSOCKS5, core.ResultOverload)
 			socks5.WriteOverloadReply(conn)
 		})
 	}
@@ -627,6 +659,7 @@ func (a *App) buildRuleset(cfg *config.Client, reuse *clientRuntime) (*ruleset.P
 		FilePath:        cfg.Routing.RulesFile,
 		URL:             cfg.Routing.RulesURL,
 		RefreshInterval: cfg.Routing.EffectiveRulesRefreshInterval(),
+		Parse:           config.ParseRules,
 		Default:         def,
 		PrivateDirect:   privateDirect,
 		Logger:          a.logger,
@@ -703,12 +736,7 @@ func buildUpstream(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, 
 			if !ok {
 				continue
 			}
-			specs = append(specs, connpool.Node{
-				Addr: n.Addr,
-				// connect 阶段只完成协议握手；绑定请求在领取时补发（bind）。
-				Dial:  pw.ConnectIdle,
-				Start: pw.Bind,
-			})
+			specs = append(specs, prewarmNode(n.Addr, pw))
 		}
 		if len(specs) > 0 {
 			var err error
@@ -768,6 +796,38 @@ func buildUpstream(cfg *config.Client, baseTLS *tls.Config, m *metrics.Metrics, 
 	}
 	return connPool, pool, nil
 }
+
+// prewarmNode 把出口传输的两阶段预热能力映射为预热池节点（组装根的唯一
+// 映射点）：connect 阶段只完成协议握手；绑定请求在领取时补发（bind）。
+// 预热句柄（outbound.Prepared）承载空闲连接（存活探测与补发绑定都经它），
+// 池以关闭连接释放，与 Prepared.Discard 的语义一致。
+func prewarmNode(addr string, pw outbound.Prewarmer) connpool.Node {
+	return connpool.Node{
+		Addr: addr,
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			prepared, err := pw.ConnectIdle(ctx)
+			if err != nil {
+				return nil, err
+			}
+			conn, ok := prepared.(net.Conn)
+			if !ok {
+				prepared.Discard()
+				return nil, fmt.Errorf("prewarm handle for %s does not carry a connection", addr)
+			}
+			return conn, nil
+		},
+		Start: func(ctx context.Context, conn net.Conn, t core.Target) error {
+			_, err := pw.Bind(ctx, pooledPrepared{Conn: conn}, t)
+			return err
+		},
+	}
+}
+
+// pooledPrepared 把池内空闲连接包装回两阶段句柄（bind 阶段的入参形态）。
+type pooledPrepared struct{ net.Conn }
+
+// Discard 释放底层连接（与预热池“以关闭连接释放”的语义一致）。
+func (c pooledPrepared) Discard() { _ = c.Close() }
 
 func buildClientTLS(cfg *config.Client) (*tls.Config, error) {
 	tlsCfg := &tls.Config{

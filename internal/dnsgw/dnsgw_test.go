@@ -14,20 +14,70 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/core"
-	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/testutil"
 )
 
-// routerFunc 是测试用分流决策：*.lan 直连，其余走代理。
-type routerFunc func(string) routing.Action
+// routeFunc 是测试用分流判定：*.lan 直连，其余走代理（消费方接口的测试桩，
+// 与生产组装根包装 routing.Decide 的形状一致）。
+type routeFunc func(host string) core.RouteAction
 
-func (f routerFunc) Decide(host string) routing.Action { return f(host) }
+func (f routeFunc) Decide(t core.Target) core.Route {
+	return core.Route{Action: f(t.Host)}
+}
 
-func testAction(host string) routing.Action {
+func testAction(host string) core.RouteAction {
 	if strings.HasSuffix(host, ".lan") {
-		return routing.Direct
+		return core.RouteDirect
 	}
-	return routing.Proxy
+	return core.RouteProxy
+}
+
+// dialerFunc 把函数适配为 core.TargetDialer（测试桩用）。
+type dialerFunc func(ctx context.Context, t core.Target) (net.Conn, core.Route, error)
+
+func (f dialerFunc) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	return f(ctx, t)
+}
+
+// dialDirectUDP 返回本地解析路径（直连剪枝）的拨号桩：对目标做 UDP 拨号，
+// 与生产组装的直连剪枝同语义。
+func dialDirectUDP() core.TargetDialer {
+	return dialerFunc(func(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, "udp", t.String())
+		return conn, core.Route{Action: core.RouteDirect}, err
+	})
+}
+
+// dialThroughExit 返回一个“经隧道”的拨号桩：直连给定的上游 DNS 地址，
+// 并记录调用参数（测试中网关与上游同机，语义上是出口侧访问）。
+func dialThroughExit(t *testing.T, upstream string, calls *atomic.Int64) core.TargetDialer {
+	t.Helper()
+	host, portString, err := net.SplitHostPort(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPort, err := strconv.Atoi(portString)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dialerFunc(func(ctx context.Context, got core.Target) (net.Conn, core.Route, error) {
+		calls.Add(1)
+		if got.Host != host || int(got.Port) != wantPort {
+			return nil, core.Route{}, errors.New("unexpected tunnel target " + got.String())
+		}
+		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
+		if err != nil {
+			return nil, core.Route{}, err
+		}
+		return conn, core.Route{Action: core.RouteProxy, Label: "test-node"}, nil
+	})
+}
+
+// noDial 返回一个任何调用都报错的拨号桩（断言路径不应触达出站）。
+func noDial(msg string) core.TargetDialer {
+	return dialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
+		return nil, core.Route{}, errors.New(msg)
+	})
 }
 
 // gatewayHandle 封装一个运行中的测试网关。
@@ -39,7 +89,7 @@ type gatewayHandle struct {
 func startGateway(t *testing.T, opts Options) *gatewayHandle {
 	t.Helper()
 	if opts.Router == nil {
-		opts.Router = routerFunc(testAction)
+		opts.Router = routeFunc(testAction)
 	}
 	srv, err := New(opts)
 	if err != nil {
@@ -64,38 +114,6 @@ func startGateway(t *testing.T, opts Options) *gatewayHandle {
 		}
 	})
 	return &gatewayHandle{srv: srv, addr: ln.Addr().String()}
-}
-
-// proxyDialerFunc 把函数适配为 core.ProxyDialer（测试桩用）。
-type proxyDialerFunc func(ctx context.Context, t core.Target) (net.Conn, core.Route, error)
-
-func (f proxyDialerFunc) DialProxy(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
-	return f(ctx, t)
-}
-
-// dialThroughExit 返回一个“经隧道”的拨号器：直连给定的上游 DNS 地址，
-// 并记录调用参数（测试中网关与上游同机，语义上是出口侧访问）。
-func dialThroughExit(t *testing.T, upstream string, calls *atomic.Int64) ProxyDialer {
-	t.Helper()
-	host, portString, err := net.SplitHostPort(upstream)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantPort, err := strconv.Atoi(portString)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return proxyDialerFunc(func(ctx context.Context, got core.Target) (net.Conn, core.Route, error) {
-		calls.Add(1)
-		if got.Host != host || int(got.Port) != wantPort {
-			return nil, core.Route{}, errors.New("unexpected tunnel target " + got.String())
-		}
-		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", upstream)
-		if err != nil {
-			return nil, core.Route{}, err
-		}
-		return conn, core.Route{Action: routing.Proxy, Upstream: "test-node"}, nil
-	})
 }
 
 func mustQuery(t *testing.T, addr, name string, id uint16) []byte {
@@ -131,10 +149,11 @@ func TestRemoteRouteGoesThroughExit(t *testing.T) {
 
 	var tunnelCalls atomic.Int64
 	gw := startGateway(t, Options{
-		Remote:      remote.Addr,
-		Local:       []string{local.Addr},
-		Timeout:     2 * time.Second,
-		ProxyDialer: dialThroughExit(t, remote.Addr, &tunnelCalls),
+		Remote:  remote.Addr,
+		Local:   []string{local.Addr},
+		Timeout: 2 * time.Second,
+		Direct:  dialDirectUDP(),
+		Proxy:   dialThroughExit(t, remote.Addr, &tunnelCalls),
 	})
 
 	resp := mustQuery(t, gw.addr, "site.test", 0x1111)
@@ -175,10 +194,11 @@ func TestDirectRouteUsesLocalResolver(t *testing.T) {
 
 	var tunnelCalls atomic.Int64
 	gw := startGateway(t, Options{
-		Remote:      remote.Addr,
-		Local:       []string{local.Addr},
-		Timeout:     2 * time.Second,
-		ProxyDialer: dialThroughExit(t, remote.Addr, &tunnelCalls),
+		Remote:  remote.Addr,
+		Local:   []string{local.Addr},
+		Timeout: 2 * time.Second,
+		Direct:  dialDirectUDP(),
+		Proxy:   dialThroughExit(t, remote.Addr, &tunnelCalls),
 	})
 
 	resp := mustQuery(t, gw.addr, "printer.lan", 0x2222)
@@ -209,9 +229,8 @@ func TestDirectTruncatedReplyFallsBackToTCP(t *testing.T) {
 	gw := startGateway(t, Options{
 		Local:   []string{local.Addr},
 		Timeout: 2 * time.Second,
-		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
-			return nil, core.Route{}, errors.New("tunnel must not be used for direct names")
-		}),
+		Direct:  dialDirectUDP(),
+		Proxy:   noDial("tunnel must not be used for direct names"),
 	})
 
 	resp := mustQuery(t, gw.addr, "printer.lan", 0x3333)
@@ -236,9 +255,10 @@ func TestTCPClientTransport(t *testing.T) {
 	gw := startGateway(t, Options{
 		Remote:  remote.Addr,
 		Timeout: 2 * time.Second,
-		ProxyDialer: proxyDialerFunc(func(ctx context.Context, _ core.Target) (net.Conn, core.Route, error) {
+		Direct:  dialDirectUDP(),
+		Proxy: dialerFunc(func(ctx context.Context, _ core.Target) (net.Conn, core.Route, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", remote.Addr)
-			return conn, core.Route{Action: routing.Proxy, Upstream: "test-node"}, err
+			return conn, core.Route{Action: core.RouteProxy, Label: "test-node"}, err
 		}),
 	})
 
@@ -280,9 +300,8 @@ func TestTCPClientTransport(t *testing.T) {
 func TestMalformedQueryGetsFormErr(t *testing.T) {
 	gw := startGateway(t, Options{
 		Timeout: time.Second,
-		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
-			return nil, core.Route{}, errors.New("must not dial")
-		}),
+		Direct:  noDial("must not dial"),
+		Proxy:   noDial("must not dial"),
 	})
 	resp, err := testutil.QueryUDP(gw.addr, []byte{0x12, 0x34, 0x01}, time.Second)
 	if err != nil {
@@ -296,9 +315,8 @@ func TestMalformedQueryGetsFormErr(t *testing.T) {
 func TestNonQueryIsDropped(t *testing.T) {
 	gw := startGateway(t, Options{
 		Timeout: time.Second,
-		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
-			return nil, core.Route{}, errors.New("must not dial")
-		}),
+		Direct:  noDial("must not dial"),
+		Proxy:   noDial("must not dial"),
 	})
 	// 一条响应报文（QR=1）应被静默丢弃，避免转发环。
 	reply := testutil.BuildReply(testutil.BuildAQuery("x.test", 0x6666), 0, nil, false)
@@ -310,9 +328,8 @@ func TestNonQueryIsDropped(t *testing.T) {
 func TestUnsupportedOpcodeGetsRefused(t *testing.T) {
 	gw := startGateway(t, Options{
 		Timeout: time.Second,
-		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
-			return nil, core.Route{}, errors.New("must not dial")
-		}),
+		Direct:  noDial("must not dial"),
+		Proxy:   noDial("must not dial"),
 	})
 	query := testutil.BuildAQuery("x.test", 0x7777)
 	query[2] |= 5 << 3 // opcode = UPDATE
@@ -337,12 +354,13 @@ func TestRemoteFailureReturnsServFail(t *testing.T) {
 	gw := startGateway(t, Options{
 		Remote:  deadAddr,
 		Timeout: time.Second,
-		ProxyDialer: proxyDialerFunc(func(ctx context.Context, _ core.Target) (net.Conn, core.Route, error) {
+		Direct:  dialDirectUDP(),
+		Proxy: dialerFunc(func(ctx context.Context, _ core.Target) (net.Conn, core.Route, error) {
 			conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", deadAddr)
 			if err != nil {
 				return nil, core.Route{}, err
 			}
-			return conn, core.Route{Action: routing.Proxy, Upstream: "test-node"}, nil
+			return conn, core.Route{Action: core.RouteProxy, Label: "test-node"}, nil
 		}),
 	})
 
@@ -398,10 +416,9 @@ func TestLocalResolversFromResolvConf(t *testing.T) {
 func TestServeShutdown(t *testing.T) {
 	srv, err := New(Options{
 		Timeout: time.Second,
-		Router:  routerFunc(testAction),
-		ProxyDialer: proxyDialerFunc(func(context.Context, core.Target) (net.Conn, core.Route, error) {
-			return nil, core.Route{}, errors.New("must not dial")
-		}),
+		Router:  routeFunc(testAction),
+		Direct:  noDial("must not dial"),
+		Proxy:   noDial("must not dial"),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -426,5 +443,19 @@ func TestServeShutdown(t *testing.T) {
 	}
 	if _, err := testutil.QueryUDP(addr, testutil.BuildAQuery("x.test", 1), 200*time.Millisecond); err == nil {
 		t.Fatal("关停后监听应已关闭")
+	}
+}
+
+// TestNewRequiresContractDialers 钉住契约注入约束：分流判定与两侧出站能力
+// 必须由组装根注入。
+func TestNewRequiresContractDialers(t *testing.T) {
+	if _, err := New(Options{}); err == nil || !strings.Contains(err.Error(), "router") {
+		t.Fatalf("err = %v, want router required", err)
+	}
+	if _, err := New(Options{Router: routeFunc(testAction)}); err == nil || !strings.Contains(err.Error(), "direct") {
+		t.Fatalf("err = %v, want direct dialer required", err)
+	}
+	if _, err := New(Options{Router: routeFunc(testAction), Direct: dialDirectUDP()}); err == nil || !strings.Contains(err.Error(), "proxy") {
+		t.Fatalf("err = %v, want proxy dialer required", err)
 	}
 }

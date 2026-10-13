@@ -2,8 +2,6 @@ package trojan
 
 import (
 	"context"
-	"crypto/tls"
-	"io"
 	"net"
 	"strconv"
 	"testing"
@@ -45,23 +43,6 @@ func newTestTransport(t *testing.T) (*Transport, core.Target) {
 	return tr, core.Target{Host: host, Port: uint16(port)}
 }
 
-// echoThrough 验证连接可用作原始字节转发（回显目标）。
-func echoThrough(t *testing.T, conn net.Conn) {
-	t.Helper()
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
-	payload := []byte("transport payload")
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != string(payload) {
-		t.Fatalf("echo = %q, want %q", got, payload)
-	}
-}
-
 func TestNewTransportRejectsBadPassword(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -80,28 +61,10 @@ func TestNewTransportRejectsBadPassword(t *testing.T) {
 
 // TestTransportConformance 把 Trojan 传输跑一遍 outbound 一致性验收
 // （回环 TLS 服务端 + 回显目标；dial / prewarm-bind / probe 全部三项能力，
-// 断言由 internal/outbound 统一持有：未来协议接入即跑同一套验收）。
+// 断言由 internal/outbound 统一持有：未来协议接入即跑同一套验收，
+// 含 Discard 后 Bind 必须失败与取消 ctx 假成功识别等负例）。
 func TestTransportConformance(t *testing.T) {
-	tr, target := newTestTransport(t)
+	tr, _ := newTestTransport(t)
 
-	// 不可达端点（端口无人监听）：探测失败路径。
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	closedAddr := ln.Addr().String()
-	_ = ln.Close()
-	dead, err := NewTransport(ClientConfig{ServerAddr: closedAddr, Password: "x", TLSConfig: &tls.Config{InsecureSkipVerify: true}})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	outbound.RunConformance(t, outbound.ConformanceSpec{
-		Transport:  tr,
-		Target:     target,
-		RoundTrip:  echoThrough,
-		Prewarmer:  tr,
-		Prober:     tr,
-		DeadProber: dead,
-	})
+	outbound.RunConformance(t, tr)
 }

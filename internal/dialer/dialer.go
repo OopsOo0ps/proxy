@@ -1,4 +1,6 @@
-// Package dialer 依据分流规则建立到目标的连接：直连或经出口节点隧道。
+// Package dialer 是路由感知的出站组合点（设计文档 §5.3 的组合树根）：
+// 依据分流规则把目标分派给直连拨号或出口节点池。分派器透传被委派方的
+// 权威 Route，入站不得自行推断上游（不变量 6）。
 package dialer
 
 import (
@@ -10,26 +12,22 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
-	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
 // ErrNoNodes 表示决策为“走代理”但未配置任何出口节点。
 var ErrNoNodes = errors.New("dialer: no exit nodes configured")
 
 // 编译期断言：*Dialer 满足 core 契约，接口漂移在构建期暴露。
-var (
-	_ core.TargetDialer = (*Dialer)(nil)
-	_ core.ProxyDialer  = (*Dialer)(nil)
-)
+var _ core.TargetDialer = (*Dialer)(nil)
 
 // Router 是拨号前的分流决策器：*routing.Engine（静态规则）与
 // *ruleset.Provider（含远程刷新的动态规则源）都满足该接口。
 type Router interface {
-	Decide(host string) routing.Action
+	Decide(host string) core.RouteAction
 }
 
-// Dialer 是路由感知的出站拨号器，实现 core.TargetDialer 与 core.ProxyDialer
-// （入站组件只见 core 契约，实现细节不出本包），可安全并发使用。
+// Dialer 是路由感知的出站拨号器，实现 core.TargetDialer（入站组件只见
+// core 契约，实现细节不出本包），可安全并发使用。
 type Dialer struct {
 	router Router
 	pool   *nodes.Pool // 可为 nil（未配置节点，仅支持直连）
@@ -58,36 +56,24 @@ func New(opts Options) *Dialer {
 	}
 }
 
-// RouteFor 返回 host 的路由决策（不含端口），用于指标与日志预判。
-// 仅是预判：规则重载窗口内可能与实际不一致，权威路径以 DialTarget
-// 返回的 core.Route 为准。
-func (d *Dialer) RouteFor(host string) routing.Action {
-	return d.router.Decide(host)
-}
-
 // DialTarget 建立到 t 的连接：按分流规则直连或经出口节点。
+// 返回的 Route 是权威路径（直连 Route{Direct}；经池 Route{Proxy, 节点地址}），
+// 路由判定为拒绝时返回 (nil, Route{Reject}, nil)，由入站按协议回拒绝响应。
 func (d *Dialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
-	if d.router.Decide(t.Host) == routing.Direct {
+	switch d.router.Decide(t.Host) {
+	case core.RouteDirect:
 		addr := t.String()
 		conn, err := d.direct.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			return nil, core.Route{Action: routing.Direct}, fmt.Errorf("direct dial %s: %w", addr, err)
+			return nil, core.Route{Action: core.RouteDirect}, fmt.Errorf("direct dial %s: %w", addr, err)
 		}
-		return conn, core.Route{Action: routing.Direct}, nil
+		return conn, core.Route{Action: core.RouteDirect}, nil
+	case core.RouteReject:
+		return nil, core.Route{Action: core.RouteReject}, nil
+	default:
+		if d.pool == nil {
+			return nil, core.Route{Action: core.RouteProxy, Label: "pool"}, ErrNoNodes
+		}
+		return d.pool.DialTarget(ctx, t)
 	}
-	return d.DialProxy(ctx, t)
-}
-
-// DialProxy 强制经出口节点建立到 t 的隧道连接（不做分流决策）。
-// DNS 网关用它把解析请求固定送往出口（remote DNS）——出口是否可直连
-// 公共 DNS 服务器不应受本地分流规则影响。
-func (d *Dialer) DialProxy(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
-	if d.pool == nil {
-		return nil, core.Route{Action: routing.Proxy}, ErrNoNodes
-	}
-	conn, node, err := d.pool.Dial(ctx, t)
-	if err != nil {
-		return nil, core.Route{Action: routing.Proxy}, err
-	}
-	return conn, core.Route{Action: routing.Proxy, Upstream: node.Addr}, nil
 }

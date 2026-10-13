@@ -14,13 +14,34 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
+// 规则文档的解码由组装根注入（生产为 config.ParseRules）；本包测试注入
+// 一个极简行式解码器，保持 ruleset 测试零 yaml。格式：每行一条规则
+// “<action> <match 条目...>”，“#” 开头为注释。
 const (
-	rulesV1 = "rules:\n  - action: direct\n    match: [\"*.example.com\"]\n"
-	rulesV2 = "rules:\n  - action: direct\n    match: [\"*.example.net\"]\n"
+	rulesV1 = "direct *.example.com\n"
+	rulesV2 = "direct *.example.net\n"
 )
+
+func testParse(data []byte) (*routing.Rules, error) {
+	var rules routing.Rules
+	for i, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		action, err := routing.ParseAction(fields[0])
+		if err != nil {
+			return nil, fmt.Errorf("line %d: %w", i+1, err)
+		}
+		rules.Rules = append(rules.Rules, routing.Rule{Action: action, Match: fields[1:]})
+	}
+	return &rules, nil
+}
 
 // fakeTransport 按预设状态码与内容回复请求，不触碰网络。
 type fakeTransport struct {
@@ -102,7 +123,8 @@ func newURLProvider(t *testing.T, tr *fakeTransport, obs Observer, interval time
 	p, err := New(Options{
 		URL:             "http://rules.test/rules.yaml",
 		RefreshInterval: interval,
-		Default:         routing.Proxy,
+		Parse:           testParse,
+		Default:         core.RouteProxy,
 		Logger:          discardLogger(),
 		Observer:        obs,
 		fetchClient:     &http.Client{Transport: tr},
@@ -126,11 +148,11 @@ func waitFor(t *testing.T, timeout time.Duration, msg string, cond func() bool) 
 }
 
 func TestNewNoneSource(t *testing.T) {
-	p, err := New(Options{Default: routing.Direct, PrivateDirect: true, Logger: discardLogger()})
+	p, err := New(Options{Default: core.RouteDirect, PrivateDirect: true, Logger: discardLogger()})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := p.Decide("anything.example"); got != routing.Direct {
+	if got := p.Decide("anything.example"); got != core.RouteDirect {
 		t.Fatalf("decide = %v, want direct (configured default)", got)
 	}
 	if snap := p.Snapshot(); snap.Source != SourceNone || snap.Loaded {
@@ -142,9 +164,20 @@ func TestNewNoneSource(t *testing.T) {
 }
 
 func TestNewRejectsBothSources(t *testing.T) {
-	_, err := New(Options{FilePath: "a.yaml", URL: "http://rules.test/r.yaml"})
+	_, err := New(Options{FilePath: "a.yaml", URL: "http://rules.test/r.yaml", Parse: testParse})
 	if err == nil || !strings.Contains(err.Error(), "at most one") {
 		t.Fatalf("err = %v, want mutual exclusion error", err)
+	}
+}
+
+// TestNewRequiresParse 钉住解码注入约束：配置了规则源而未注入解码函数
+// 必须在构造期报错（本包零序列化格式知识）。
+func TestNewRequiresParse(t *testing.T) {
+	if _, err := New(Options{FilePath: "rules.yaml"}); err == nil {
+		t.Fatal("expected error for missing parse function")
+	}
+	if _, err := New(Options{URL: "http://rules.test/r.yaml"}); err == nil {
+		t.Fatal("expected error for missing parse function")
 	}
 }
 
@@ -157,14 +190,15 @@ func TestFileSourceLifecycle(t *testing.T) {
 	obs := &fakeObserver{}
 	p, err := New(Options{
 		FilePath: rulesPath,
-		Default:  routing.Proxy,
+		Parse:    testParse,
+		Default:  core.RouteProxy,
 		Logger:   discardLogger(),
 		Observer: obs,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("decide = %v, want direct", got)
 	}
 	snap := p.Snapshot()
@@ -182,10 +216,10 @@ func TestFileSourceLifecycle(t *testing.T) {
 	if err := p.Recheck(context.Background()); err != nil {
 		t.Fatalf("recheck: %v", err)
 	}
-	if got := p.Decide("a.example.net"); got != routing.Direct {
+	if got := p.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("new rules not applied: decide = %v", got)
 	}
-	if got := p.Decide("a.example.com"); got != routing.Proxy {
+	if got := p.Decide("a.example.com"); got != core.RouteProxy {
 		t.Fatalf("old rules leaked: decide = %v", got)
 	}
 
@@ -196,7 +230,7 @@ func TestFileSourceLifecycle(t *testing.T) {
 	if err := p.Recheck(context.Background()); err == nil {
 		t.Fatal("recheck with missing file must fail")
 	}
-	if got := p.Decide("a.example.net"); got != routing.Direct {
+	if got := p.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("rules changed after failed recheck: decide = %v", got)
 	}
 	if got := obs.refreshCount(RefreshError); got != 1 {
@@ -205,7 +239,10 @@ func TestFileSourceLifecycle(t *testing.T) {
 }
 
 func TestFileSourceInitialFailureIsStrict(t *testing.T) {
-	_, err := New(Options{FilePath: filepath.Join(t.TempDir(), "missing.yaml")})
+	_, err := New(Options{
+		FilePath: filepath.Join(t.TempDir(), "missing.yaml"),
+		Parse:    testParse,
+	})
 	if err == nil {
 		t.Fatal("missing rules file must fail construction")
 	}
@@ -215,7 +252,7 @@ func TestURLSourceInitialLoadAndSpec(t *testing.T) {
 	tr := &fakeTransport{status: 200, body: rulesV1}
 	obs := &fakeObserver{}
 	p := newURLProvider(t, tr, obs, 30*time.Minute)
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("decide = %v, want direct", got)
 	}
 	want := Spec{Kind: SourceURL, Target: "http://rules.test/rules.yaml", Interval: 30 * time.Minute}
@@ -236,7 +273,7 @@ func TestURLSourceInitialFailureWarnsAndRecovers(t *testing.T) {
 	p := newURLProvider(t, tr, obs, 10*time.Millisecond)
 
 	// 启动拉取失败：不返回错误，空规则（默认动作）继续，状态记录失败。
-	if got := p.Decide("a.example.com"); got != routing.Proxy {
+	if got := p.Decide("a.example.com"); got != core.RouteProxy {
 		t.Fatalf("decide = %v, want default proxy while unloaded", got)
 	}
 	snap := p.Snapshot()
@@ -254,7 +291,7 @@ func TestURLSourceInitialFailureWarnsAndRecovers(t *testing.T) {
 	defer p.Close()
 	tr.set(200, rulesV1)
 	waitFor(t, 3*time.Second, "rules become active after recovery", func() bool {
-		return p.Decide("a.example.com") == routing.Direct
+		return p.Decide("a.example.com") == core.RouteDirect
 	})
 	if snap := p.Snapshot(); !snap.Loaded || snap.LastError != "" || snap.Rules != 1 {
 		t.Fatalf("unexpected snapshot after recovery: %+v", snap)
@@ -273,15 +310,15 @@ func TestURLRefreshSwapsOnlyOnChange(t *testing.T) {
 	waitFor(t, 3*time.Second, "unchanged refresh counted", func() bool {
 		return obs.refreshCount(RefreshUnchanged) >= 1
 	})
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("rules changed without content change: decide = %v", got)
 	}
 
 	tr.set(200, rulesV2)
 	waitFor(t, 3*time.Second, "changed content applied", func() bool {
-		return p.Decide("a.example.net") == routing.Direct
+		return p.Decide("a.example.net") == core.RouteDirect
 	})
-	if got := p.Decide("a.example.com"); got != routing.Proxy {
+	if got := p.Decide("a.example.com"); got != core.RouteProxy {
 		t.Fatalf("old rules leaked after refresh: decide = %v", got)
 	}
 }
@@ -295,12 +332,12 @@ func TestURLRefreshFailureKeepsRules(t *testing.T) {
 	p.Start(ctx)
 	defer p.Close()
 
-	// 刷新返回非法 YAML：保持现有规则，记录错误。
-	tr.set(200, "rules: [:::")
+	// 刷新返回解码失败的内容：保持现有规则，记录错误。
+	tr.set(200, "frobnicate example.com")
 	waitFor(t, 3*time.Second, "error counted", func() bool {
 		return obs.refreshCount(RefreshError) >= 1
 	})
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("rules lost after bad refresh: decide = %v", got)
 	}
 	snap := p.Snapshot()
@@ -313,7 +350,7 @@ func TestURLRefreshFailureKeepsRules(t *testing.T) {
 	waitFor(t, 3*time.Second, "second error counted", func() bool {
 		return obs.refreshCount(RefreshError) >= 2
 	})
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("rules lost after http failure: decide = %v", got)
 	}
 }
@@ -326,7 +363,7 @@ func TestRecheckURLIsLenient(t *testing.T) {
 	if err := p.Recheck(context.Background()); err != nil {
 		t.Fatalf("recheck with failing URL must be lenient, got %v", err)
 	}
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("rules lost after failed recheck: decide = %v", got)
 	}
 
@@ -334,7 +371,7 @@ func TestRecheckURLIsLenient(t *testing.T) {
 	if err := p.Recheck(context.Background()); err != nil {
 		t.Fatalf("recheck: %v", err)
 	}
-	if got := p.Decide("a.example.net"); got != routing.Direct {
+	if got := p.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("recheck did not apply new content: decide = %v", got)
 	}
 }
@@ -344,11 +381,11 @@ func TestUpdateOptionsRecompilesWithoutFetch(t *testing.T) {
 	p := newURLProvider(t, tr, nil, 30*time.Minute)
 	before := tr.requests()
 
-	p.UpdateOptions(routing.Direct, false)
-	if got := p.Decide("unmatched.example"); got != routing.Direct {
+	p.UpdateOptions(core.RouteDirect, false)
+	if got := p.Decide("unmatched.example"); got != core.RouteDirect {
 		t.Fatalf("decide = %v, want direct after options update", got)
 	}
-	if got := p.Decide("a.example.com"); got != routing.Direct {
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
 		t.Fatalf("rules lost after options update: decide = %v", got)
 	}
 	if got := tr.requests(); got != before {
@@ -362,7 +399,8 @@ func TestOnChangeFiresOnEngineSwap(t *testing.T) {
 	p, err := New(Options{
 		URL:             "http://rules.test/rules.yaml",
 		RefreshInterval: 10 * time.Millisecond,
-		Default:         routing.Proxy,
+		Parse:           testParse,
+		Default:         core.RouteProxy,
 		Logger:          discardLogger(),
 		OnChange:        func() { changes.Add(1) },
 		fetchClient:     &http.Client{Transport: tr},
@@ -387,14 +425,14 @@ func TestOnChangeFiresOnEngineSwap(t *testing.T) {
 	// 内容变化触发一次。
 	tr.set(200, rulesV2)
 	waitFor(t, 3*time.Second, "changed content applied", func() bool {
-		return p.Decide("a.example.net") == routing.Direct && changes.Load() == 2
+		return p.Decide("a.example.net") == core.RouteDirect && changes.Load() == 2
 	})
 	if got := changes.Load(); got != 2 {
 		t.Fatalf("changes after content change = %d, want 2", got)
 	}
 
 	// 引擎参数变化触发一次。
-	p.UpdateOptions(routing.Direct, true)
+	p.UpdateOptions(core.RouteDirect, true)
 	if got := changes.Load(); got != 3 {
 		t.Fatalf("changes after options update = %d, want 3", got)
 	}

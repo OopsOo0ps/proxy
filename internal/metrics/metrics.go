@@ -5,13 +5,14 @@
 // 核心指标名与需求 1.7 / 2.3 一致：
 //   - requests_total（counter，标签 proto/route/result）
 //   - request_duration_seconds（histogram，标签 proto/route）
-//   - active_connections（gauge，标签 proto）
+//   - active_connections（gauge，标签 proto）：active = ConnOpened − (ConnDone+ConnRejected)
 //   - upstream_pool_claims_total（counter，标签 node/result）
 //   - upstream_pool_idle_connections（gauge，标签 node）
 //   - upstream_pool_warm_failures_total（counter，标签 node）
 //   - upstream_health_probes_total（counter，标签 node/result）：主动健康探测（路线图 3.3）
 //   - upstream_healthy（gauge，标签 node）：节点当前是否可接流量（0 = 已被摘除）
-//   - connections_rejected_total（counter，标签 proto）：超过连接上限被拒绝的连接
+//   - connections_rejected_total（counter，标签 proto）：未进入服务即被拒的连接
+//     （过载闸 / 认证失败等；拒绝原因不作为指标维度）
 //   - dns_queries_total（counter，标签 route/result）与 dns_query_duration_seconds
 //     （histogram，标签 route）：DNS 网关查询（路线图 3.1）
 //   - config_reloads_total（counter，标签 result）：配置热加载次数（路线图 3.2）
@@ -150,19 +151,21 @@ func (m *Metrics) preInitialize() {
 	for _, proto := range []string{core.ProtoHTTP, core.ProtoSOCKS5, core.ProtoTunnel} {
 		m.active.WithLabelValues(proto)
 		m.rejected.WithLabelValues(proto)
-		for _, route := range []string{core.RouteDirect, core.RouteProxy, core.RouteNone} {
+		for _, route := range []string{
+			core.RouteDirect.String(), core.RouteProxy.String(), core.RouteReject.String(),
+		} {
 			m.duration.WithLabelValues(proto, route)
-			for _, result := range []string{core.ResultOK, core.ResultAuthFail, core.ResultDialFail, core.ResultError} {
+			for _, result := range []string{core.ResultOK, core.ResultDenied, core.ResultDialFail, core.ResultError} {
 				m.requests.WithLabelValues(proto, route, result)
 			}
 		}
 	}
-	for _, route := range []string{core.RouteDirect, core.RouteProxy, core.RouteNone} {
+	for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String(), ""} {
 		for _, result := range []string{core.ResultOK, core.ResultError, dnsgw.ResultInvalid} {
 			m.dnsQueries.WithLabelValues(route, result)
 		}
 	}
-	for _, route := range []string{core.RouteDirect, core.RouteProxy} {
+	for _, route := range []string{core.RouteDirect.String(), core.RouteProxy.String()} {
 		m.dnsDuration.WithLabelValues(route)
 	}
 	for _, result := range []string{ReloadSuccess, ReloadError} {
@@ -209,17 +212,7 @@ func (m *Metrics) ActiveByProto() map[string]int64 {
 
 // —— core.Telemetry 适配（httpproxy / socks5 / trojan 服务端） ——
 
-// RequestDone 记录一次完成的请求（含失败），并观察其耗时。
-// proto/route/result 取 core 的遥测词汇常量。
-func (m *Metrics) RequestDone(proto, route, result string, d time.Duration) {
-	if m == nil {
-		return
-	}
-	m.requests.WithLabelValues(proto, route, result).Inc()
-	m.duration.WithLabelValues(proto, route).Observe(d.Seconds())
-}
-
-// ConnOpened 记录一个活跃连接开始。
+// ConnOpened 记录一个活跃连接开始（active +1）。
 func (m *Metrics) ConnOpened(proto string) {
 	if m == nil {
 		return
@@ -227,33 +220,54 @@ func (m *Metrics) ConnOpened(proto string) {
 	m.active.WithLabelValues(proto).Inc()
 }
 
-// ConnClosed 记录一个活跃连接结束。
-func (m *Metrics) ConnClosed(proto string) {
+// ConnRejected 记录一次未进入服务即被拒的连接：active -1、rejected +1。
+// reason 取事件拒绝原因词汇（core.ResultOverload / core.ResultDenied 等），
+// 计数维度只有 proto（拒绝原因用于日志与排查，指标不为其扩维）。
+func (m *Metrics) ConnRejected(proto, reason string) {
 	if m == nil {
 		return
 	}
 	m.active.WithLabelValues(proto).Dec()
+	m.rejected.WithLabelValues(proto).Inc()
 }
 
-// ConnRejected 记录一次因超过连接上限被拒绝的连接。
-func (m *Metrics) ConnRejected(proto string) {
+// ConnDone 记录一次服务终态：active -1、requests/duration +1。
+// route 标签从 ConnAttrs 的权威 Route 字段派生（不变量 6）：Label 为
+// "pool"（池选择未定，如上游连接复用）时记 "pool"，其余取动作的观测写法
+// （direct / proxy / reject）。入站保证 ConnDone 只携带拨号产物、明确的路由
+// 判定或未定标记；未进入服务的终态（认证失败、过载等）走 ConnRejected，
+// 不经本方法，因此不会把零值 Route 伪造成真实直连路径。
+func (m *Metrics) ConnDone(a core.ConnAttrs) {
 	if m == nil {
 		return
 	}
-	m.rejected.WithLabelValues(proto).Inc()
+	route := RouteLabel(a.Route)
+	m.requests.WithLabelValues(a.Proto, route, a.Result).Inc()
+	m.duration.WithLabelValues(a.Proto, route).Observe(a.Duration.Seconds())
+	m.active.WithLabelValues(a.Proto).Dec()
+}
+
+// RouteLabel 从权威 Route 派生 route 观测标签（requests_total /
+// request_duration_seconds / dns 口径共用）。Label 为 "pool"（池选择未定）
+// 时原样使用，其余取动作的观测写法。
+func RouteLabel(r core.Route) string {
+	if r.Label == "pool" {
+		return "pool"
+	}
+	return r.Action.String()
 }
 
 // —— dnsgw.DNSObserver 适配 ——
 
 // QueryDone 记录一次 DNS 网关查询（含失败与被拒绝的非法查询）。
-// route 取 core 的遥测词汇（direct / proxy / none）；耗时直方图只按
-// 实际转发路径统计。
+// route 取 core.RouteAction 的观测写法（direct / proxy）；非法查询（未转发
+// 给任何上游）路由维度留空，耗时直方图只按实际转发路径统计。
 func (m *Metrics) QueryDone(route, result string, d time.Duration) {
 	if m == nil {
 		return
 	}
 	m.dnsQueries.WithLabelValues(route, result).Inc()
-	if route == core.RouteDirect || route == core.RouteProxy {
+	if route == core.RouteDirect.String() || route == core.RouteProxy.String() {
 		m.dnsDuration.WithLabelValues(route).Observe(d.Seconds())
 	}
 }

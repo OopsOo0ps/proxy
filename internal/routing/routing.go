@@ -1,5 +1,10 @@
 // Package routing 实现基于规则的目标分流：直连（direct）或走代理（proxy）。
 //
+// 判定输出直接产出 core.RouteAction（L2 → L1 合法依赖）：core 是共享词汇，
+// routing 是判定引擎，两者共同构成「分流」领域，不存在第二套动作类型。
+// 规则文档（YAML）的解析归 internal/config（全仓唯一 yaml 属主），本包
+// 只消费纯结构（Rules / Rule）。
+//
 // 规则按书写顺序匹配，先命中者生效；未命中时使用默认动作。
 // 支持的通配条目：
 //   - 精确域名："example.com"（仅匹配裸域名本身）
@@ -13,76 +18,58 @@ import (
 	"net/netip"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"github.com/OopsOo0ps/proxy/internal/core"
 )
-
-// Action 是分流决策结果。
-type Action uint8
-
-const (
-	// Direct 表示目标直连。
-	Direct Action = iota
-	// Proxy 表示目标经出口节点转发。
-	Proxy
-)
-
-// String 返回动作的配置写法。
-func (a Action) String() string {
-	switch a {
-	case Direct:
-		return "direct"
-	case Proxy:
-		return "proxy"
-	default:
-		return "unknown"
-	}
-}
 
 // ParseAction 解析配置中的动作字符串（direct / proxy，大小写不敏感）。
-func ParseAction(s string) (Action, error) {
+func ParseAction(s string) (core.RouteAction, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "direct":
-		return Direct, nil
+		return core.RouteDirect, nil
 	case "proxy":
-		return Proxy, nil
+		return core.RouteProxy, nil
 	default:
 		return 0, fmt.Errorf("invalid routing action %q: want direct or proxy", s)
 	}
 }
 
-// UnmarshalYAML 支持规则文件中的 "default: direct|proxy" 写法。
-func (a *Action) UnmarshalYAML(node *yaml.Node) error {
-	action, err := ParseAction(node.Value)
-	if err != nil {
-		return err
-	}
-	*a = action
-	return nil
-}
-
 // Options 控制引擎行为。
 type Options struct {
 	// Default 是未命中任何规则时的默认动作。
-	Default Action
+	Default core.RouteAction
 	// PrivateDirect 为 true 时，环回 / 私网 / 链路本地 / 组播 / 未指定地址
 	// 以及 localhost 一律直连，避免把内网流量误发到远端节点。
 	PrivateDirect bool
 }
 
+// Rules 是规则文档的纯结构形态（解析归 config 包）。
+type Rules struct {
+	// Default 是规则文档指定的默认动作；为 nil 时由调用方决定。
+	Default *core.RouteAction
+	// Rules 按书写顺序匹配，先命中者生效。
+	Rules []Rule
+}
+
+// Rule 是一条分流规则。
+type Rule struct {
+	Action core.RouteAction
+	Match  []string
+}
+
 // Engine 是基于编译后规则的只读分流引擎，可安全并发使用。
 type Engine struct {
 	rules         []compiledRule
-	def           Action
+	def           core.RouteAction
 	privateDirect bool
 }
 
 type compiledRule struct {
-	action   Action
+	action   core.RouteAction
 	matchers []matcher
 }
 
 // NewEngine 编译规则构建引擎；rules 可以为 nil（仅用内置行为与默认动作）。
-// 规则文件中的 default（若存在）优先于 opts.Default。
+// 规则文档中的 default（若存在）优先于 opts.Default。
 func NewEngine(rules *Rules, opts Options) (*Engine, error) {
 	e := &Engine{def: opts.Default, privateDirect: opts.PrivateDirect}
 	if rules == nil {
@@ -106,13 +93,13 @@ func NewEngine(rules *Rules, opts Options) (*Engine, error) {
 }
 
 // Decide 返回 host（域名或 IP 字面量，不含端口）的分流动作。
-func (e *Engine) Decide(host string) Action {
+func (e *Engine) Decide(host string) core.RouteAction {
 	host = normalizeHost(host)
 	if host == "" {
 		return e.def
 	}
 	if e.privateDirect && isLocalTarget(host) {
-		return Direct
+		return core.RouteDirect
 	}
 	for _, rule := range e.rules {
 		for _, m := range rule.matchers {
@@ -176,6 +163,13 @@ func (m cidrMatcher) match(host string) bool {
 		return false
 	}
 	return m.prefix.Contains(ip)
+}
+
+// CheckEntry 校验一个 match 条目是否合法；config 包解析规则文档时以它做
+// 前置校验（错误带文档行号），引擎编译复用同一实现，两侧语义同源。
+func CheckEntry(entry string) error {
+	_, err := compileMatcher(entry)
+	return err
 }
 
 func compileMatcher(entry string) (matcher, error) {

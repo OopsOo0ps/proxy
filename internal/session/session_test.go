@@ -14,8 +14,22 @@ import (
 	"time"
 )
 
+// handlerFunc 是测试用处理函数：保留双 ctx 形状便于断言 serveCtx 与
+// connCtx 的语义差异。
+type handlerFunc func(serveCtx, connCtx context.Context, conn net.Conn)
+
+// testHandler 把双 ctx 处理函数适配为 ConnHandler（捕获 Serve 的 serveCtx）。
+type testHandler struct {
+	serveCtx context.Context
+	fn       handlerFunc
+}
+
+func (h testHandler) ServeConn(connCtx context.Context, conn net.Conn) {
+	h.fn(h.serveCtx, connCtx, conn)
+}
+
 // startServe 在回环 listener 上启动 Serve，返回地址、关停函数与完成信号。
-func startServe(t *testing.T, o Options, handle func(serveCtx, connCtx context.Context, conn net.Conn)) (addr string, cancel context.CancelFunc, finished <-chan error) {
+func startServe(t *testing.T, o Options, fn handlerFunc) (addr string, cancel context.CancelFunc, finished <-chan error) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -23,7 +37,7 @@ func startServe(t *testing.T, o Options, handle func(serveCtx, connCtx context.C
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	fin := make(chan error, 1)
-	go func() { fin <- Serve(ctx, ln, o, handle) }()
+	go func() { fin <- Serve(ctx, ln, testHandler{serveCtx: ctx, fn: fn}, o) }()
 	return ln.Addr().String(), cancel, fin
 }
 
@@ -179,7 +193,7 @@ func TestServeReturnsAcceptError(t *testing.T) {
 	}
 	fin := make(chan error, 1)
 	go func() {
-		fin <- Serve(context.Background(), ln, Options{}, func(context.Context, context.Context, net.Conn) {})
+		fin <- Serve(context.Background(), ln, nopHandler{}, Options{})
 	}()
 	_ = ln.Close()
 	select {
@@ -189,6 +203,113 @@ func TestServeReturnsAcceptError(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Serve did not return after listener closed")
+	}
+}
+
+// nopHandler 是空操作 ConnHandler（机械语义测试用）。
+type nopHandler struct{}
+
+func (nopHandler) ServeConn(context.Context, net.Conn) {}
+
+// TestServeGateRejectsOverload 钉住背压闸语义：Gate 在 accept 与握手之间
+// 检查，false 时调用 Reject（协议拒绝响应与关闭由该闭包负责，不计入
+// handler），且后续连接继续被接受处理。
+func TestServeGateRejectsOverload(t *testing.T) {
+	var mu sync.Mutex
+	rejected := 0
+	allow := false // 第一条连接过载，之后放行
+
+	entered := make(chan struct{})
+	handler := handlerFunc(func(serveCtx, connCtx context.Context, conn net.Conn) {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		defer func() { _ = conn.Close() }()
+		var got [1]byte
+		if _, err := conn.Read(got[:]); err != nil {
+			return
+		}
+		if _, err := conn.Write(got[:]); err != nil {
+			return
+		}
+	})
+
+	addr, cancel, finished := startServe(t, Options{
+		Gate: func() bool {
+			mu.Lock()
+			defer mu.Unlock()
+			return allow
+		},
+		Reject: func(conn net.Conn) {
+			mu.Lock()
+			rejected++
+			allow = true // 模拟限额恢复
+			mu.Unlock()
+			_ = conn.Close()
+		},
+	}, handler)
+
+	// 第一条连接：被 Gate 拒绝（Reject 关闭），handler 不进入。
+	overloaded, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = overloaded.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := overloaded.Read(make([]byte, 1)); err == nil {
+		t.Fatal("overloaded connection should be closed by Reject")
+	}
+	_ = overloaded.Close()
+
+	mu.Lock()
+	if rejected != 1 {
+		mu.Unlock()
+		t.Fatalf("rejected = %d, want 1", rejected)
+	}
+	mu.Unlock()
+
+	// 第二条连接：Gate 放行，handler 正常服务。
+	served, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = served.Close() }()
+	_ = served.SetDeadline(time.Now().Add(2 * time.Second))
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second connection was not served")
+	}
+	if _, err := served.Write([]byte{0x01}); err != nil {
+		t.Fatal(err)
+	}
+	var got [1]byte
+	if _, err := io.ReadFull(served, got[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("Serve: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after shutdown")
+	}
+}
+
+// TestServeGateRequiresReject 钉住配对约束：Gate 非 nil 时 Reject 缺失
+// 必须在启动期报错（过载必须是协议明确的拒绝而非静默丢弃）。
+func TestServeGateRequiresReject(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	if err := Serve(context.Background(), ln, nopHandler{}, Options{Gate: func() bool { return false }}); err == nil {
+		t.Fatal("Serve should reject Gate without Reject")
 	}
 }
 

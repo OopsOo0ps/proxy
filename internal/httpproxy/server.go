@@ -27,7 +27,6 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/relay"
-	"github.com/OopsOo0ps/proxy/internal/routing"
 	"github.com/OopsOo0ps/proxy/internal/session"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
 )
@@ -193,12 +192,14 @@ func (h *handler) dialContext(ctx context.Context, _, addr string) (net.Conn, er
 	if err != nil || port == 0 {
 		return nil, fmt.Errorf("httpproxy: invalid port %q", portString)
 	}
+	// 不变量 6（路径权威）：转发路径也以 DialTarget 返回的 Route 为准，
+	// 记录成功与失败两条路径（失败时 DialTarget 仍返回实际尝试的路径）。
 	conn, route, err := h.srv.dialerNow().DialTarget(ctx, core.Target{Host: host, Port: uint16(port)})
+	if rec, ok := ctx.Value(dialRecordKey{}).(*dialRecord); ok {
+		rec.set(route)
+	}
 	if err != nil {
 		return nil, err
-	}
-	if rec, ok := ctx.Value(dialRecordKey{}).(*dialRecord); ok {
-		rec.set(route.Upstream)
 	}
 	return conn, nil
 }
@@ -206,18 +207,24 @@ func (h *handler) dialContext(ctx context.Context, _, addr string) (net.Conn, er
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	reqID := logging.NewRequestID()
-	logger := h.logger().With("request_id", reqID, "proto", "http", "client_ip", netutil.RemoteIP(remoteAddrOf(r)))
+	clientIP := netutil.RemoteIP(remoteAddrOf(r))
+	logger := h.logger().With("request_id", reqID, "proto", core.ProtoHTTP, "client_ip", clientIP)
+	tel := h.srv.telemetryNow()
+
+	// accept（net/http 接受）后即计（active +1）；终态由 ConnDone / ConnRejected 配对回收。
+	tel.ConnOpened(core.ProtoHTTP)
 
 	if !h.authorize(w, r, logger) {
-		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, core.RouteNone, core.ResultAuthFail, time.Since(start))
+		// 未进入服务即被拒（认证失败）：按拒绝计，无路由维度。
+		tel.ConnRejected(core.ProtoHTTP, core.ResultDenied)
 		return
 	}
 
 	if r.Method == http.MethodConnect {
-		h.serveConnect(w, r, logger, start)
+		h.serveConnect(w, r, logger, start, reqID, clientIP)
 		return
 	}
-	h.serveForward(w, r, logger, start, reqID)
+	h.serveForward(w, r, logger, start, reqID, clientIP)
 }
 
 // authorize 校验代理认证；失败时返回 407（固定文案，不泄露内部信息）。
@@ -227,7 +234,7 @@ func (h *handler) authorize(w http.ResponseWriter, r *http.Request, logger *slog
 		return true
 	}
 	username, password, ok := parseBasicAuth(r.Header.Get("Proxy-Authorization"))
-	if !ok || !store.Verify(username, password) {
+	if !ok || !store.Authenticate(username, password) {
 		logger.Warn("proxy authentication failed")
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
@@ -237,7 +244,8 @@ func (h *handler) authorize(w http.ResponseWriter, r *http.Request, logger *slog
 }
 
 // serveConnect 处理 CONNECT：拨号目标、回应 200 并双向转发。
-func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *slog.Logger, start time.Time) {
+func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *slog.Logger, start time.Time, reqID, clientIP string) {
+	tel := h.srv.telemetryNow()
 	target := r.URL.Host
 	if target == "" {
 		target = r.Host
@@ -246,47 +254,104 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 	if err != nil {
 		logger.Warn("invalid CONNECT target", "target", target, "error", err)
 		http.Error(w, "bad request", http.StatusBadRequest)
-		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, core.RouteNone, core.ResultError, time.Since(start))
+		// 未发生拨号：按拒绝计，不伪造路由维度。
+		tel.ConnRejected(core.ProtoHTTP, core.ResultError)
 		return
 	}
-	target = net.JoinHostPort(host, strconv.Itoa(int(port)))
+	reqTarget := core.Target{Host: host, Port: port}
 
 	h.wg.Add(1)
 	defer h.wg.Done()
-	h.srv.telemetryNow().ConnOpened(core.ProtoHTTP)
-	defer h.srv.telemetryNow().ConnClosed(core.ProtoHTTP)
 
-	conn, route, err := h.srv.dialerNow().DialTarget(r.Context(), core.Target{Host: host, Port: port})
+	conn, route, err := h.srv.dialerNow().DialTarget(r.Context(), reqTarget)
 	if err != nil {
 		// 错误细节只进日志，对客户端统一 502。
-		logger.Warn("dial target failed", "target", target, "error", err)
+		logger.Warn("dial target failed", "target", reqTarget.String(), "route", route.Action.String(), "error", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
-		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), core.ResultDialFail, time.Since(start))
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoHTTP,
+			Target:    reqTarget,
+			Route:     route,
+			Result:    core.ResultDialFail,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	defer func() { _ = conn.Close() }()
+
+	if route.Action == core.RouteReject {
+		// 路由拒绝：按协议回明确拒绝，结果记 denied（Route 是权威判定）。
+		logger.Warn("routing rejected target", "target", reqTarget.String())
+		http.Error(w, "forbidden", http.StatusForbidden)
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoHTTP,
+			Target:    reqTarget,
+			Route:     route,
+			Result:    core.ResultDenied,
+			Duration:  time.Since(start),
+		})
+		return
+	}
 
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		logger.Error("response writer does not support hijacking")
 		http.Error(w, "internal error", http.StatusInternalServerError)
-		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), core.ResultError, time.Since(start))
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoHTTP,
+			Target:    reqTarget,
+			Route:     route,
+			Result:    core.ResultError,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	clientConn, brw, err := hijacker.Hijack()
 	if err != nil {
 		logger.Error("hijack failed", "error", err)
-		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), core.ResultError, time.Since(start))
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoHTTP,
+			Target:    reqTarget,
+			Route:     route,
+			Result:    core.ResultError,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	defer func() { _ = clientConn.Close() }()
 
 	if _, err := brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		logger.Debug("write connect response failed", "error", err)
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoHTTP,
+			Target:    reqTarget,
+			Route:     route,
+			Result:    core.ResultError,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	if err := brw.Flush(); err != nil {
 		logger.Debug("flush connect response failed", "error", err)
+		tel.ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoHTTP,
+			Target:    reqTarget,
+			Route:     route,
+			Result:    core.ResultError,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 
@@ -298,25 +363,40 @@ func (h *handler) serveConnect(w http.ResponseWriter, r *http.Request, logger *s
 		result = core.ResultError
 	}
 	elapsed := time.Since(start)
+	label := route.Label
+	if label == "" {
+		label = route.Action.String()
+	}
 	attrs := append([]any{
 		"method", "CONNECT",
-		"target", target,
+		"target", reqTarget.String(),
 		"route", route.Action.String(),
-		"upstream", route.Label(),
+		"upstream", label,
 	}, session.RelayAttrs(elapsed, stats.ClientToUpstream, stats.UpstreamToClient, result, relayErr)...)
 	logger.Info("request completed", attrs...)
-	h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.Action.String(), result, elapsed)
+	tel.ConnDone(core.ConnAttrs{
+		RequestID: reqID,
+		ClientIP:  clientIP,
+		Proto:     core.ProtoHTTP,
+		Target:    reqTarget,
+		Route:     route,
+		Result:    result,
+		Duration:  elapsed,
+		BytesUp:   stats.ClientToUpstream,
+		BytesDown: stats.UpstreamToClient,
+	})
 }
 
 // serveForward 处理绝对地址形式的普通 HTTP 请求。
-func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *slog.Logger, start time.Time, reqID string) {
+func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *slog.Logger, start time.Time, reqID, clientIP string) {
+	tel := h.srv.telemetryNow()
 	if !r.URL.IsAbs() || r.URL.Host == "" || r.URL.Scheme != "http" {
 		logger.Warn("rejecting unsupported request form", "method", r.Method, "url", r.URL.String())
 		http.Error(w, "bad request", http.StatusBadRequest)
-		h.srv.telemetryNow().RequestDone(core.ProtoHTTP, core.RouteNone, core.ResultError, time.Since(start))
+		// 未发生拨号：按拒绝计，不伪造路由维度。
+		tel.ConnRejected(core.ProtoHTTP, core.ResultError)
 		return
 	}
-	route := h.srv.dialerNow().RouteFor(r.URL.Hostname())
 	rec := &dialRecord{}
 	ctx := logging.WithRequestID(context.WithValue(r.Context(), dialRecordKey{}, rec), reqID)
 
@@ -328,17 +408,50 @@ func (h *handler) serveForward(w http.ResponseWriter, r *http.Request, logger *s
 		result = core.ResultError
 	}
 	elapsed := time.Since(start)
+	route, dialed := rec.get()
+	if !dialed {
+		// 本次请求未触发拨号：上游连接为既有连接复用（或拨号前置校验失败），
+		// 单条请求实际走过的路径不可判定——按规范“池选择未定”的词汇标记
+		//（Route{Proxy, "pool"}），不预判、不把未知伪造成真实直连/代理路径。
+		route = core.Route{Action: core.RouteProxy, Label: "pool"}
+	}
 	logger.Info("request completed",
 		"method", r.Method,
 		"target", r.URL.Host,
-		"route", route.String(),
-		"upstream", rec.label(route),
+		"route", obsRouteLabel(route),
+		"upstream", obsUpstreamLabel(route),
 		"status", sw.code(),
 		"duration", elapsed.Round(time.Microsecond).String(),
 		"duration_ms", elapsed.Milliseconds(),
 		"result", result,
 	)
-	h.srv.telemetryNow().RequestDone(core.ProtoHTTP, route.String(), result, elapsed)
+	tel.ConnDone(core.ConnAttrs{
+		RequestID: reqID,
+		ClientIP:  clientIP,
+		Proto:     core.ProtoHTTP,
+		Target:    core.Target{Host: r.URL.Hostname()},
+		Route:     route,
+		Result:    result,
+		Duration:  elapsed,
+	})
+}
+
+// obsRouteLabel 返回观测用的 route 词汇：Label 为 "pool"（池选择未定）
+// 时原样使用，其余取动作的观测写法。与 metrics 的 requests_total 口径一致。
+func obsRouteLabel(r core.Route) string {
+	if r.Label == "pool" {
+		return "pool"
+	}
+	return r.Action.String()
+}
+
+// obsUpstreamLabel 返回日志的 upstream 字段：有出口标签用标签，
+// 直连无标签时回退动作写法（"direct"）。
+func obsUpstreamLabel(r core.Route) string {
+	if r.Label != "" {
+		return r.Label
+	}
+	return r.Action.String()
 }
 
 // onUpstreamError 处理 Transport 层的错误：对客户端统一 502，日志保留细节。
@@ -353,30 +466,24 @@ func (h *handler) onUpstreamError(w http.ResponseWriter, r *http.Request, err er
 	_, _ = w.Write([]byte("bad gateway\n"))
 }
 
-// dialRecord 记录请求实际命中的出口节点（供转发路径日志使用）。
+// dialRecord 记录转发请求实际走过的权威路径（不变量 6：来自 DialTarget
+// 的返回值，供日志与遥测使用；未发生拨号时保持未记录）。
 type dialRecord struct {
-	mu       sync.Mutex
-	upstream string
+	mu     sync.Mutex
+	route  core.Route
+	dialed bool
 }
 
-func (rec *dialRecord) set(upstream string) {
+func (rec *dialRecord) set(route core.Route) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	rec.upstream = upstream
+	rec.route, rec.dialed = route, true
 }
 
-// label 返回 upstream 日志字段：命中节点地址，直连为 "direct"，
-// 连接池复用无法得知具体节点时返回 "pool"。
-func (rec *dialRecord) label(action routing.Action) string {
+func (rec *dialRecord) get() (core.Route, bool) {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if rec.upstream != "" {
-		return rec.upstream
-	}
-	if action == routing.Proxy {
-		return "pool"
-	}
-	return "direct"
+	return rec.route, rec.dialed
 }
 
 type dialRecordKey struct{}

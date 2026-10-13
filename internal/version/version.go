@@ -1,4 +1,4 @@
-// Package version 提供构建期注入的版本信息。
+// Package version 提供构建期注入的版本信息（L0 纯叶子包）。
 //
 // Version、Commit 与 BuildDate 由构建流程通过 -ldflags 注入，
 // 未注入时回退为开发占位值。

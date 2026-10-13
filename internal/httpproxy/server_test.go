@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,7 +21,6 @@ import (
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/core"
-	"github.com/OopsOo0ps/proxy/internal/routing"
 )
 
 // syncBuffer 是并发安全的日志缓冲（slog handler 可能与测试协程并发写入）。
@@ -65,7 +65,7 @@ func waitLogRecord(t *testing.T, buf *syncBuffer, substr string) map[string]any 
 // stubDialer 是可注入的 TargetDialer 测试桩。
 type stubDialer struct {
 	dial  func(ctx context.Context, t core.Target) (net.Conn, error)
-	route routing.Action
+	route core.RouteAction
 }
 
 func (d *stubDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
@@ -76,7 +76,15 @@ func (d *stubDialer) DialTarget(ctx context.Context, t core.Target) (net.Conn, c
 	return conn, core.Route{Action: d.route}, err
 }
 
-func (d *stubDialer) RouteFor(string) routing.Action { return d.route }
+// mustPort 解析端口字符串，失败即终止测试。
+func mustPort(t *testing.T, s string) uint16 {
+	t.Helper()
+	p, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		t.Fatalf("parse port %q: %v", s, err)
+	}
+	return uint16(p)
+}
 
 // startProxy 启动 HTTP 代理服务并返回其地址。
 func startProxy(t *testing.T, srv *Server) string {
@@ -127,7 +135,7 @@ func startEcho(t *testing.T) string {
 
 func echoDialer(t *testing.T) *stubDialer {
 	t.Helper()
-	return &stubDialer{route: routing.Direct, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+	return &stubDialer{route: core.RouteDirect, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
 		return net.Dial("tcp", t.String())
 	}}
 }
@@ -361,7 +369,7 @@ func readAll(t *testing.T, r io.Reader) string {
 }
 
 func TestConnectDialFailure(t *testing.T) {
-	srv := &Server{Dialer: &stubDialer{route: routing.Proxy, dial: func(context.Context, core.Target) (net.Conn, error) {
+	srv := &Server{Dialer: &stubDialer{route: core.RouteProxy, dial: func(context.Context, core.Target) (net.Conn, error) {
 		return nil, errors.New("connection refused")
 	}}}
 	proxyAddr := startProxy(t, srv)
@@ -380,7 +388,7 @@ func TestForwardAbsoluteForm(t *testing.T) {
 	}))
 	defer target.Close()
 
-	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
+	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: core.RouteDirect, dial: func(ctx context.Context, t core.Target) (net.Conn, error) {
 		return net.Dial("tcp", t.String())
 	}}})
 
@@ -414,7 +422,7 @@ func TestForwardAbsoluteForm(t *testing.T) {
 }
 
 func TestForwardRejectsRelativeForm(t *testing.T) {
-	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct}})
+	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: core.RouteDirect}})
 
 	conn, err := net.Dial("tcp", proxyAddr)
 	if err != nil {
@@ -436,7 +444,7 @@ func TestForwardRejectsRelativeForm(t *testing.T) {
 }
 
 func TestForwardUpstreamError(t *testing.T) {
-	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, core.Target) (net.Conn, error) {
+	proxyAddr := startProxy(t, &Server{Dialer: &stubDialer{route: core.RouteDirect, dial: func(context.Context, core.Target) (net.Conn, error) {
 		return nil, errors.New("boom")
 	}}})
 
@@ -507,6 +515,136 @@ func TestParseBasicAuth(t *testing.T) {
 			t.Fatalf("parseBasicAuth(%q) should fail", bad)
 		}
 	}
+}
+
+// recTelemetry 记录 core.Telemetry 三类事件（事件序列与 ConnAttrs 组装断言用）。
+type recTelemetry struct {
+	mu       sync.Mutex
+	opened   []string
+	rejected []string
+	done     []core.ConnAttrs
+}
+
+func (r *recTelemetry) ConnOpened(proto string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.opened = append(r.opened, proto)
+}
+
+func (r *recTelemetry) ConnRejected(proto, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rejected = append(r.rejected, proto+"/"+reason)
+}
+
+func (r *recTelemetry) ConnDone(a core.ConnAttrs) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done = append(r.done, a)
+}
+
+func (r *recTelemetry) snapshot() (opened, rejected []string, done []core.ConnAttrs) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.opened...), append([]string(nil), r.rejected...), append([]core.ConnAttrs(nil), r.done...)
+}
+
+// TestTelemetryConnectEventSequence 钉住 CONNECT 隧道的三事件口径：
+// ConnOpened 后恰好一个 ConnDone，Route 取 DialTarget 的权威路径，
+// 字节数来自双向转发的统计。
+func TestTelemetryConnectEventSequence(t *testing.T) {
+	echoAddr := startEcho(t)
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	port := mustPort(t, portStr)
+
+	tel := &recTelemetry{}
+	proxyAddr := startProxy(t, &Server{
+		Dialer:    &stubDialer{route: core.RouteProxy, dial: func(ctx context.Context, t core.Target) (net.Conn, error) { return net.Dial("tcp", t.String()) }},
+		Telemetry: tel,
+	})
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", echoAddr, echoAddr); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(conn)
+	if status, err := br.ReadString('\n'); err != nil || !strings.Contains(status, "200") {
+		t.Fatalf("status = %q err = %v, want 200", status, err)
+	}
+	payload := []byte("telemetry payload")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, got); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		opened, _, done := tel.snapshot()
+		if len(opened) == 1 && len(done) == 1 {
+			if done[0].Route.Action != core.RouteProxy {
+				t.Fatalf("route = %v, want proxy（权威路径来自 DialTarget）", done[0].Route.Action)
+			}
+			if done[0].Proto != core.ProtoHTTP || done[0].Result != core.ResultOK {
+				t.Fatalf("attrs = %+v, want http/ok", done[0])
+			}
+			if done[0].Target.Host != host || done[0].Target.Port != port {
+				t.Fatalf("target = %s, want %s", done[0].Target, echoAddr)
+			}
+			if done[0].BytesUp != int64(len(payload)) || done[0].BytesDown != int64(len(payload)) {
+				t.Fatalf("bytes = %d/%d, want %d/%d", done[0].BytesUp, done[0].BytesDown, len(payload), len(payload))
+			}
+			if done[0].RequestID == "" || done[0].ClientIP == "" || done[0].Duration <= 0 {
+				t.Fatalf("attrs = %+v, want request_id/client_ip/duration filled", done[0])
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	opened, rejected, done := tel.snapshot()
+	t.Fatalf("telemetry events did not pair: opened=%v rejected=%v done=%+v", opened, rejected, done)
+}
+
+// TestTelemetryAuthFailureRejected 钉住认证失败的口径：未进入服务即被拒，
+// 记 ConnRejected(denied)，不产生 ConnDone（无路由维度）。
+func TestTelemetryAuthFailureRejected(t *testing.T) {
+	echoAddr := startEcho(t)
+	store, err := auth.NewStore([]auth.User{{Username: "alice", Password: "secret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tel := &recTelemetry{}
+	proxyAddr := startProxy(t, &Server{Auth: store, Dialer: echoDialer(t), Telemetry: tel})
+
+	resp := rawConnect(t, proxyAddr, echoAddr, "")
+	if resp.StatusCode != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want 407", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		opened, rejected, done := tel.snapshot()
+		if len(rejected) == 1 {
+			if rejected[0] != core.ProtoHTTP+"/"+core.ResultDenied {
+				t.Fatalf("rejected = %v, want http/denied", rejected)
+			}
+			if len(opened) != 1 || len(done) != 0 {
+				t.Fatalf("events = opened=%v done=%+v, want opened×1 and no done", opened, done)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	opened, rejected, done := tel.snapshot()
+	t.Fatalf("rejection not observed: opened=%v rejected=%v done=%+v", opened, rejected, done)
 }
 
 // startProxyControlled 启动代理并暴露关停触发与 Serve 结束信号，供关停测试使用。
@@ -681,7 +819,7 @@ func TestWriteOverloaded(t *testing.T) {
 // 建连 → 解析请求 → 出站拨号（内存管道上游）→ 200 响应 → 关闭。
 // 上游用内存管道隔离网络变量，度量代理自身处理开销；每次迭代会新建一条本机 TCP 连接。
 func BenchmarkConnectHandshake(b *testing.B) {
-	srv := &Server{Dialer: &stubDialer{route: routing.Direct, dial: func(context.Context, core.Target) (net.Conn, error) {
+	srv := &Server{Dialer: &stubDialer{route: core.RouteDirect, dial: func(context.Context, core.Target) (net.Conn, error) {
 		upstream, peer := net.Pipe()
 		// 立即关闭对端：上游方向读到 EOF 后转发自然结束，不会因管道不可半关闭而死等。
 		_ = peer.Close()

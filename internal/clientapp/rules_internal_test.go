@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/OopsOo0ps/proxy/internal/routing"
+	"github.com/OopsOo0ps/proxy/internal/core"
 )
 
 func writeRules(t *testing.T, path, body string) {
@@ -36,10 +36,10 @@ func TestReloadReusesRulesProviderWhenSourceUnchanged(t *testing.T) {
 	if after != before {
 		t.Fatal("rules provider must be reused when the source is unchanged")
 	}
-	if got := after.Decide("a.example.net"); got != routing.Direct {
+	if got := after.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("new file content not applied: decide = %v", got)
 	}
-	if got := after.Decide("a.example.org"); got != routing.Proxy {
+	if got := after.Decide("a.example.org"); got != core.RouteProxy {
 		t.Fatalf("old rules leaked: decide = %v", got)
 	}
 }
@@ -69,10 +69,10 @@ func TestReloadSwitchesRulesProviderWhenSourceChanges(t *testing.T) {
 	if after.Spec().Target != rulesB {
 		t.Fatalf("spec target = %q, want %q", after.Spec().Target, rulesB)
 	}
-	if got := after.Decide("a.example.net"); got != routing.Direct {
+	if got := after.Decide("a.example.net"); got != core.RouteDirect {
 		t.Fatalf("new source rules not applied: decide = %v", got)
 	}
-	if got := after.Decide("a.example.org"); got != routing.Proxy {
+	if got := after.Decide("a.example.org"); got != core.RouteProxy {
 		t.Fatalf("old source rules leaked: decide = %v", got)
 	}
 }

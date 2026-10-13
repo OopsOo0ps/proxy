@@ -25,7 +25,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/netutil"
 	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
-	"github.com/OopsOo0ps/proxy/pkg/version"
+	"github.com/OopsOo0ps/proxy/internal/version"
 )
 
 // App 是组装完成的 proxy-server 实例。
@@ -142,7 +142,10 @@ func (a *App) Listen() error {
 		return fmt.Errorf("serverapp: listen %s: %w", cfg.Listen, err)
 	}
 	ln = connlimit.WrapListener(ln, a.limiter, func(conn net.Conn) {
-		a.metrics.ConnRejected(core.ProtoTunnel)
+		// 过载拒绝也是一次 accept 后的终态：先开后拒，保持 active 口径平衡
+		//（active = ConnOpened − (ConnDone+ConnRejected)）。
+		a.metrics.ConnOpened(core.ProtoTunnel)
+		a.metrics.ConnRejected(core.ProtoTunnel, core.ResultOverload)
 		a.logTunnelReject(conn)
 		_ = conn.Close()
 	})

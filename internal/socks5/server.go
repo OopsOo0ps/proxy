@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -78,45 +77,44 @@ type Server struct {
 
 // Serve 在 ln 上接受并处理 SOCKS5 连接；ctx 取消后优雅关停：
 // 先停止接受新连接，让存量连接在关停期限内自然结束，超时后强制断开。
-// accept/drain 机械部分委托 internal/session（与 trojan 服务端共用同一实现）。
+// accept/drain 机械部分委托 internal/session（与 trojan 服务端共用同一实现），
+// 本包实现 session.ConnHandler 提供协议逻辑。
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
-	return session.Serve(ctx, ln, session.Options{
+	return session.Serve(ctx, ln, s, session.Options{
 		Logger:       s.Logger,
 		DrainTimeout: s.shutdownTimeout,
-	}, func(serveCtx, connCtx context.Context, conn net.Conn) {
-		s.handle(connCtx, conn)
 	})
 }
 
-func (s *Server) handle(ctx context.Context, raw net.Conn) {
+// ServeConn 处理一条已接受的连接（session.ConnHandler）：握手 → 认证 →
+// 提取 Target → 拨号 → relay；拒绝路径与遥测事件发射都在这里。
+// connCtx 承载强制断开期限（排空超时后被取消）。
+func (s *Server) ServeConn(connCtx context.Context, raw net.Conn) {
 	defer func() { _ = raw.Close() }()
 
 	// 强制关停时打断握手期连接，保证进程按期退出。
-	stopForce := context.AfterFunc(ctx, func() { _ = raw.SetDeadline(time.Now()) })
+	stopForce := context.AfterFunc(connCtx, func() { _ = raw.SetDeadline(time.Now()) })
 	defer stopForce()
 
 	start := time.Now()
 	reqID := logging.NewRequestID()
-	logger := s.logger().With("request_id", reqID, "proto", "socks5", "client_ip", netutil.RemoteIP(raw.RemoteAddr()))
+	clientIP := netutil.RemoteIP(raw.RemoteAddr())
+	logger := s.logger().With("request_id", reqID, "proto", core.ProtoSOCKS5, "client_ip", clientIP)
 
+	// accept 后即计（active +1）；终态由 ConnDone / ConnRejected 配对回收。
 	s.telemetryNow().ConnOpened(core.ProtoSOCKS5)
-	defer s.telemetryNow().ConnClosed(core.ProtoSOCKS5)
-
-	result := core.ResultError
-	route := core.RouteNone
-	defer func() {
-		s.telemetryNow().RequestDone(core.ProtoSOCKS5, route, result, time.Since(start))
-	}()
 
 	_ = raw.SetDeadline(time.Now().Add(s.handshakeTimeout()))
 
 	br := bufio.NewReader(raw)
 	if err := s.negotiate(br, raw); err != nil {
 		if errors.Is(err, errAuthFailed) || errors.Is(err, errNoAcceptableMethod) {
-			result = core.ResultAuthFail
 			logger.Warn("socks5 authentication failed", "error", err)
+			// 未进入服务即被拒（认证失败）：按拒绝计，无路由维度。
+			s.telemetryNow().ConnRejected(core.ProtoSOCKS5, core.ResultDenied)
 		} else {
 			logger.Debug("socks5 handshake failed", "error", err)
+			s.telemetryNow().ConnRejected(core.ProtoSOCKS5, core.ResultError)
 		}
 		return
 	}
@@ -124,9 +122,10 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	host, port, cmd, err := readRequest(br)
 	if err != nil {
 		logger.Debug("socks5 request parse failed", "error", err)
+		s.telemetryNow().ConnRejected(core.ProtoSOCKS5, core.ResultError)
 		return
 	}
-	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	target := core.Target{Host: host, Port: port}
 
 	switch cmd {
 	case CmdConnect:
@@ -134,44 +133,98 @@ func (s *Server) handle(ctx context.Context, raw net.Conn) {
 	case CmdUDPAssociate:
 		logger.Warn("socks5 UDP ASSOCIATE is not supported yet")
 		_ = writeReply(raw, ReplyCmdNotSupported)
+		s.telemetryNow().ConnRejected(core.ProtoSOCKS5, core.ResultError)
 		return
 	default: // BIND 及其他未知命令
 		_ = writeReply(raw, ReplyCmdNotSupported)
+		s.telemetryNow().ConnRejected(core.ProtoSOCKS5, core.ResultError)
 		return
 	}
 
-	conn, r, err := s.dialerNow().DialTarget(ctx, core.Target{Host: host, Port: port})
-	route = r.Action.String()
+	conn, route, err := s.dialerNow().DialTarget(connCtx, target)
 	if err != nil {
-		result = core.ResultDialFail
-		logger.Warn("dial target failed", "target", target, "error", err)
+		if route.Action != core.RouteProxy && route.Action != core.RouteDirect {
+			// 未发生拨号的终态：按拒绝计，不伪造路由维度。
+			_ = writeReply(raw, ReplyGeneralFailure)
+			s.telemetryNow().ConnRejected(core.ProtoSOCKS5, core.ResultError)
+			return
+		}
+		logger.Warn("dial target failed", "target", target.String(), "route", route.Action.String(), "error", err)
 		reply := byte(ReplyGeneralFailure)
 		if errors.Is(err, syscall.ECONNREFUSED) {
 			reply = ReplyConnRefused
 		}
 		_ = writeReply(raw, reply)
+		s.telemetryNow().ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoSOCKS5,
+			Target:    target,
+			Route:     route,
+			Result:    core.ResultDialFail,
+			Duration:  time.Since(start),
+		})
+		return
+	}
+	if route.Action == core.RouteReject {
+		// 路由拒绝：按协议回明确失败，结果记 denied（Route 是权威判定）。
+		logger.Warn("routing rejected target", "target", target.String())
+		_ = writeReply(raw, ReplyNotAllowed)
+		s.telemetryNow().ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoSOCKS5,
+			Target:    target,
+			Route:     route,
+			Result:    core.ResultDenied,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	defer func() { _ = conn.Close() }()
 
 	if err := writeReply(raw, ReplySuccess); err != nil {
 		logger.Debug("socks5 write reply failed", "error", err)
+		s.telemetryNow().ConnDone(core.ConnAttrs{
+			RequestID: reqID,
+			ClientIP:  clientIP,
+			Proto:     core.ProtoSOCKS5,
+			Target:    target,
+			Route:     route,
+			Result:    core.ResultError,
+			Duration:  time.Since(start),
+		})
 		return
 	}
 	_ = raw.SetDeadline(time.Time{})
 
-	stats, relayErr := relay.BiCopy(ctx, relay.PrefixConn(raw, br), conn, s.idleTimeout())
-	result = core.ResultOK
+	stats, relayErr := relay.BiCopy(connCtx, relay.PrefixConn(raw, br), conn, s.idleTimeout())
+	result := core.ResultOK
 	if relay.IsFailure(relayErr) {
 		result = core.ResultError
 	}
 	elapsed := time.Since(start)
+	label := route.Label
+	if label == "" {
+		label = route.Action.String()
+	}
 	attrs := append([]any{
-		"target", target,
-		"route", route,
-		"upstream", r.Label(),
+		"target", target.String(),
+		"route", route.Action.String(),
+		"upstream", label,
 	}, session.RelayAttrs(elapsed, stats.ClientToUpstream, stats.UpstreamToClient, result, relayErr)...)
 	logger.Info("request completed", attrs...)
+	s.telemetryNow().ConnDone(core.ConnAttrs{
+		RequestID: reqID,
+		ClientIP:  clientIP,
+		Proto:     core.ProtoSOCKS5,
+		Target:    target,
+		Route:     route,
+		Result:    result,
+		Duration:  elapsed,
+		BytesUp:   stats.ClientToUpstream,
+		BytesDown: stats.UpstreamToClient,
+	})
 }
 
 // negotiate 完成版本/方法协商与（可选的）用户名密码认证。
@@ -230,7 +283,7 @@ func (s *Server) authenticate(br *bufio.Reader, w io.Writer) error {
 		return fmt.Errorf("socks5: read password: %w", err)
 	}
 
-	ok := s.authNow().Verify(string(username), string(password))
+	ok := s.authNow().Authenticate(string(username), string(password))
 	status := byte(UserPassStatusOK)
 	if !ok {
 		status = UserPassStatusFail

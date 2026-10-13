@@ -269,6 +269,17 @@ func (p *Pool) Dial(ctx context.Context, t core.Target) (net.Conn, Node, error) 
 	return nil, Node{}, fmt.Errorf("all exit nodes failed: %w", errors.Join(errs...))
 }
 
+// DialTarget 实现 core.TargetDialer（出站组合树的节点池子树，设计文档 §5.3）：
+// 按轮询与健康状态选择节点建立隧道，返回权威路径 Route{Proxy, 节点地址}；
+// 全部候选失败（未选出节点）时 Label 回退为 "pool"。
+func (p *Pool) DialTarget(ctx context.Context, t core.Target) (net.Conn, core.Route, error) {
+	conn, node, err := p.Dial(ctx, t)
+	if err != nil {
+		return nil, core.Route{Action: core.RouteProxy, Label: "pool"}, err
+	}
+	return conn, core.Route{Action: core.RouteProxy, Label: node.Addr}, nil
+}
+
 // annotateChainAbort 为「链被中断」标注原因：预算耗尽与调用方取消（父上下文
 // 先到期或被取消）需要能区分，便于线上判断最坏等待是否已收敛到预算内。
 func (p *Pool) annotateChainAbort(parent context.Context, err error, tried int) error {

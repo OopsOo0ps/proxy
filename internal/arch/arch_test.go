@@ -20,7 +20,7 @@ const wildcard = "*"
 //
 // 阶段 1 落位：入站三包（httpproxy / socks5 / dnsgw）只经 core 契约触达
 // 出站能力；nodes / connpool 保持协议无关（不碰 trojan）且不反向依赖 config；
-// core 是只依赖 routing 的纯契约层。
+// core 是只依赖标准库的纯契约层（Target / Route / TargetDialer / Telemetry）。
 // 阶段 2 落位：遥测解耦完成——组件经各自的 Observer 窄接口发出领域事件，
 // Prometheus 编码收敛到 metrics（L4 适配层）；L4 以下（含传递依赖）禁止
 // import metrics，无需暂缓名单，全部为硬约束（core 的 wildcard 已覆盖）。
@@ -28,16 +28,16 @@ const wildcard = "*"
 // 协议无关（仍禁 trojan）；outbound 只依赖 core + stdlib；trojan 经编译期
 // 断言实现契约（协议实现可以 import 契约，反向不允许）。
 // 阶段 4 落位：session 统一 socks5/trojan 的 accept/drain 机械部分——生命周期
-// 层除 shutdown 排空原语外零依赖（协议细节不进 session）；入站三包改经
-// session 获得统一关停语义（httpproxy 仅复用完成日志辅助函数）。
+// 层除 shutdown 排空原语外零依赖（协议细节不进 session）；socks5 / trojan
+// 以 ConnHandler 接入 session.Serve，httpproxy 保持独立排空路径。
 var forbidden = map[string][]string{
 	"internal/httpproxy": {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
 	"internal/socks5":    {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
-	"internal/dnsgw":     {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config"},
+	"internal/dnsgw":     {"nodes", "connpool", "trojan", "dialer", "outbound", "metrics", "config", "routing"},
 	"internal/nodes":     {"metrics", "config", "trojan"},
 	"internal/connpool":  {"metrics", "config", "trojan", "nodes"},
 	"internal/trojan":    {"metrics"},
-	"internal/ruleset":   {"metrics"},
+	"internal/ruleset":   {"metrics", "config"},
 	"internal/dialer":    {"metrics"},
 	"internal/core":      {wildcard},
 	"internal/outbound":  {wildcard},
@@ -46,10 +46,10 @@ var forbidden = map[string][]string{
 
 // allowAny 是 wildcard 规则的例外名单：键为包，值为其仍允许依赖的 internal 包。
 var allowAny = map[string][]string{
-	"internal/core": {"routing"}, // routing.Action 是共享词汇（L0 纯叶子包）
-	// outbound 契约消费 core.Target；routing 经 core 传递进入依赖闭包，
-	// 一并在例外中放行（outbound 自身不直接 import routing）。
-	"internal/outbound": {"core", "routing"},
+	// core 是共享词汇层：只依赖标准库，不允许任何 internal 依赖。
+	"internal/core": {},
+	// outbound 契约只消费 core（Target / Target 的形状）；wildcard 之外放行 core。
+	"internal/outbound": {"core"},
 	// session 只承载 accept/drain 机械部分：除 shutdown 排空原语外
 	// 不依赖任何 internal 包（协议细节与契约词汇都不进生命周期层）。
 	"internal/session": {"shutdown"},
