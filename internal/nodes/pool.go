@@ -89,11 +89,12 @@ const DefaultFailoverBudget = defaults.FailoverBudget
 type HealthOptions struct {
 	// Interval 是探测周期；<= 0 关闭主动探测。
 	Interval time.Duration
-	// Timeout 是单次探测超时；<= 0 时取 3s。
+	// Timeout 是单次探测超时；<= 0 时使用 defaults.HealthTimeout（与配置层
+	// 文档化缺省同源）。
 	Timeout time.Duration
-	// Failures 是连续失败多少次后摘除；<= 0 时取 3。
+	// Failures 是连续失败多少次后摘除；<= 0 时使用 defaults.HealthFailures。
 	Failures int
-	// Successes 是摘除后连续成功多少次加回；<= 0 时取 2。
+	// Successes 是摘除后连续成功多少次加回；<= 0 时使用 defaults.HealthSuccesses。
 	Successes int
 }
 
@@ -202,13 +203,13 @@ func New(cfgs []Node, dial DialFunc, opts Options) (*Pool, error) {
 			return nil, errors.New("nodes: probe func is required when health check is enabled")
 		}
 		if opts.Health.Timeout <= 0 {
-			opts.Health.Timeout = 3 * time.Second
+			opts.Health.Timeout = defaults.HealthTimeout
 		}
 		if opts.Health.Failures <= 0 {
-			opts.Health.Failures = 3
+			opts.Health.Failures = defaults.HealthFailures
 		}
 		if opts.Health.Successes <= 0 {
-			opts.Health.Successes = 2
+			opts.Health.Successes = defaults.HealthSuccesses
 		}
 	}
 	p := &Pool{opts: opts}

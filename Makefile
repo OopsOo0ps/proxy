@@ -4,6 +4,7 @@
 #   make build      构建全部二进制到 bin/
 #   make test       运行全部单元测试
 #   make cover      运行测试并打印总覆盖率
+#   make bench      运行热路径基准测试（internal/，不含集成测试）
 #   make lint       运行 golangci-lint（首次自动下载到 .bin/，带校验）
 #   make demo       一条命令跑通本地三节点演示（构建 → 启动 → 验证）
 #   make demo-up    本地三节点演示：后台启动 3 节点 + 客户端（日志在 var/demo/）
@@ -53,7 +54,7 @@ GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
-.PHONY: all build test cover lint fmt vet run run-server run-client dev-cert \
+.PHONY: all build test cover bench lint fmt vet run run-server run-client dev-cert \
 	version demo demo-up demo-check demo-down \
 	docker-build docker-build-debug clean help
 
@@ -74,6 +75,9 @@ test:
 cover:
 	$(GO) test -coverprofile=coverage.out ./...
 	@$(GO) tool cover -func=coverage.out | tail -1
+
+bench:
+	$(GO) test -bench=. -benchmem -run='^$$' ./internal/...
 
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run
@@ -230,6 +234,7 @@ help:
 		'  version         构建并打印两个二进制的版本信息' \
 		'  test            运行全部单元测试' \
 		'  cover           运行测试并打印总覆盖率' \
+		'  bench           运行热路径基准测试（go test -bench，不含集成测试）' \
 		'  lint            运行 golangci-lint' \
 		'  fmt             格式化代码（go fmt）' \
 		'  vet             运行 go vet' \
