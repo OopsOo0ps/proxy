@@ -153,8 +153,9 @@ func checkPrewarm(ctx context.Context, tr Transport, pw Prewarmer, target core.T
 		}
 	}
 
-	// Discard 后 Bind 必须报错：池在 TTL 淘汰/关停时释放句柄，
-	// 假实现若不跟踪句柄状态，在这里返回假成功即被识别。
+	// Discard 后 Bind 必须报错：预热池释放句柄（当前以等价 Close 履行，
+	// 见 Prepared.Discard 注释），假实现若不跟踪句柄状态，在这里返回
+	// 假成功即被识别。
 	discarded, err := pw.ConnectIdle(ctx)
 	if err != nil {
 		errs = append(errs, fmt.Errorf("ConnectIdle (discard case): %w", err))
