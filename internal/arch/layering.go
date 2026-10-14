@@ -25,6 +25,7 @@ var Layers = map[string]int{
 	"defaults": 0, // 纯常量，零依赖
 	// L1 契约/机械
 	"core": 1, "outbound": 1, "session": 1,
+	"lifecycle": 1, // 组装根共有生命周期核心：只依赖 stdlib（与 session 同语义）
 	// L2 领域引擎
 	"routing": 2, "ruleset": 2, "nodes": 2, "connpool": 2, "dialer": 2,
 	// L3 协议端点
