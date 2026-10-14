@@ -39,12 +39,13 @@ func TestServeAfterCloseDoesNotPanic(t *testing.T) {
 	}
 	select {
 	case err := <-errCh:
-		// 外部 Close 与 ctx 取消零间隔时存在竞争：若本 Serve 自身的
-		// Shutdown 尚未把 http.Server 置为 inShutdown，accept 报错会以
-		// net.ErrClosed 包装原样返回（status.Serve 仅把 ErrServerClosed
-		// 归一为 nil）；是否命中取决于微秒级调度，两者皆可接受。
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("serve = %v, want nil 或 net.ErrClosed", err)
+		// 两种时序皆可接受：(a) 本 Serve 自身的关停协程先于外部 Close
+		// 生效，accept 报错以 net.ErrClosed 包装原样返回（status.Serve
+		// 仅把 ErrServerClosed 归一为 nil）；(b) 协程入口延迟到 cancel
+		// → Close 之后才执行，Serve 看到 ctx 已取消直接返回 context.
+		// Canceled，不触碰任何监听器。命中哪种取决于 µs 级调度。
+		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve = %v, want nil、net.ErrClosed 或 context.Canceled", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve 未在 5s 内返回（疑似 hang）")
@@ -172,14 +173,18 @@ func TestRebindAfterCloseServesNewListener(t *testing.T) {
 	}
 
 	cancel2()
-	// (ii) 两个 Serve 都返回：errCh1 允许 nil 或 net.ErrClosed（见下），errCh2 严格 nil。
+	// (ii) 两个 Serve 都返回：errCh1 允许 nil、net.ErrClosed 或 context.
+	// Canceled（见下），errCh2 严格 nil。
 	select {
 	case err := <-errCh1:
-		// cancel1 后立即 Close（零间隔链）：关停协程的 Shutdown 与
-		// accept 报错存在竞争——Serve 可能返回 nil 或 net.ErrClosed
-		// 包装错误，取决于 µs 级调度，两者皆可接受。
-		if err != nil && !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("serve1 = %v, want nil 或 net.ErrClosed", err)
+		// cancel1 后立即 Close（零间隔链），两种时序皆可接受：(a) 关停
+		// 协程的 Shutdown 与 accept 报错存在竞争，Serve 返回 nil 或
+		// net.ErrClosed 包装错误；(b) 协程入口延迟到 Close → 重绑之后
+		// 才执行，Serve 看到 ctx1 已取消直接返回 context.Canceled，不
+		// 认领重绑后的新监听（这正是 /health 断言仍能通过的原因）。
+		// 命中哪种取决于 µs 级调度，三者皆可接受。
+		if err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve1 = %v, want nil、net.ErrClosed 或 context.Canceled", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("serve1 未在 5s 内返回（疑似 hang）")

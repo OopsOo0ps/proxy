@@ -293,9 +293,14 @@ func (s *Server) Bind(addr string) error {
 }
 
 // Serve 阻塞服务直到 ctx 取消（3s 内排空在途请求）；未绑定时立即返回 nil，
-// 且不启动任何协程。入口对 ln 与 handler 做一次性快照，此后不再读取任何
-// s. 字段；http.Server 为本调用局部值，因此 ctx 关停协程与 Close 的字段
-// 置 nil（Swap）并发安全。监听被外部先关闭时可能返回底层 accept 错误
+// 且不启动任何协程。调用时 ctx 已取消则直接返回 ctx.Err()，同样不启动任何
+// 协程、不触碰当前监听器：热加载 switchTo 的 cancel 严格先于 Close，旧代
+// Serve 的协程入口可能延迟到 cancel → Close → 重绑之后才执行，此时入口
+// Load 到的已是重绑后的新监听器——若无此检查，旧代会认领新监听器，其关停
+// 协程的 Shutdown 会把新监听一并关闭，导致新代无法 accept（CI 实证窗口，
+// restore 回滚路径同理）。入口对 ln 与 handler 做一次性快照，此后不再读取
+// 任何 s. 字段；http.Server 为本调用局部值，因此 ctx 关停协程与 Close 的
+// 字段置 nil（Swap）并发安全。监听被外部先关闭时可能返回底层 accept 错误
 // （net.ErrClosed），调用方在 ctx 已取消时应忽略该错误。
 func (s *Server) Serve(ctx context.Context) error {
 	if s == nil {
@@ -304,6 +309,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	lnp := s.ln.Load()
 	if lnp == nil {
 		return nil
+	}
+	// 本代 ctx 已取消：不认领当前监听器，避免旧代 Serve 延迟进入入口时
+	// 认领重绑后的新监听器、随后其 Shutdown 把新监听关闭。
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	ln := *lnp
 	handler := s.handler
