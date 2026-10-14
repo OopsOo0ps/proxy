@@ -186,18 +186,44 @@ func opsThrough(t *testing.T, ops []string, op string) []string {
 	return out
 }
 
+// findEvent 返回快照中首个 op 匹配的事件（无则 nil）。
+func findEvent(events []event, op string) *event {
+	for i := range events {
+		if events[i].op == op {
+			return &events[i]
+		}
+	}
+	return nil
+}
+
 // firstEvent 返回快照中首个 op 匹配的事件：服务协程的 Serve 记录异步落账，
 // 可能插在任意钩子之间，因此对钩子事件的参数断言必须按 op 名首次匹配，
 // 不能对原始快照用固定下标。
 func firstEvent(t *testing.T, events []event, op string) event {
 	t.Helper()
-	for _, e := range events {
-		if e.op == op {
-			return e
-		}
+	if e := findEvent(events, op); e != nil {
+		return *e
 	}
 	t.Fatalf("事件快照缺少 %s：%v", op, events)
 	return event{}
+}
+
+// waitEvent 带期限轮询 recorder 直到 op 对应的事件落账并返回之：应用级
+// 关停（Serve 内的关停 goroutine）异步调用 CloseResources 等钩子，落账与
+// Serve 返回之间无 happens-before——对「关停后事件」断言前必须显式等待，
+// 不能对即时快照断言。
+func waitEvent(t *testing.T, r *recorder, op string) event {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if e := findEvent(r.snapshot(), op); e != nil {
+			return *e
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("事件 %s 未在期限内落账：%v", op, r.ops())
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func startServing(t *testing.T, app *App[fakeRT, string]) (context.CancelFunc, <-chan error) {
@@ -295,17 +321,10 @@ func TestReloadSwitchSequence(t *testing.T) {
 	if err := waitServeReturn(t, served); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
-	closed := false
-	for _, e := range h.rec.snapshot() {
-		if e.op == "CloseResources" {
-			closed = true
-			if e.rt != rt2 {
-				t.Fatalf("close resources on %v, want the current runtime", e.rt)
-			}
-		}
-	}
-	if !closed {
-		t.Fatal("shutdown must close background resources of the current runtime")
+	// CloseResources 由 Serve 内的关停 goroutine 异步落账（与 Serve 返回
+	// 之间无同步）：先等它出现再断言参数，等待不弱化断言内容。
+	if e := waitEvent(t, &h.rec, "CloseResources"); e.rt != rt2 {
+		t.Fatalf("close resources on %v, want the current runtime", e.rt)
 	}
 }
 
@@ -448,6 +467,10 @@ func TestReloadRejectedWhileShuttingDown(t *testing.T) {
 	if err := waitServeReturn(t, served); err != nil {
 		t.Fatalf("serve: %v", err)
 	}
+	// 关停 goroutine 异步落账 CloseResources：若在清空快照后才落账，会与本
+	// 用例的 OnReloadResult:false 以不确定的相对顺序混入同一快照（产品语义
+	// 不保证二者顺序）。先等它出现再 reset，把异步记录隔离在本用例窗口外。
+	waitEvent(t, &h.rec, "CloseResources")
 	h.rec.reset()
 
 	err = app.Reload("v2")
