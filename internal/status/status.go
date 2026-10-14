@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -237,10 +238,19 @@ type ServerOptions struct {
 // Server 是运维端点（/metrics /health /stats /log/level）的宿主：
 // 组装根注入各处理器，本包承载监听与服务生命周期。监听绑定属于组装根的
 // 构建步骤（不变量 3），Bind 失败由调用方决定整体回滚。
+//
+// 并发语义：ln 为原子快照字段（Load/Swap 访问），Addr 与 Close 可与 Serve
+// 并发调用；http.Server 不作为字段保存，而是每次 Serve 调用的局部值，入口
+// 一次性快照后不再读取任何 s. 字段，彻底消除热加载（cancel → Close 零间隔）
+// 路径上的并发空指针。使用契约：每个监听恰好一个 Serve 消费者；重新 Bind
+// 前必须先 Close（Bind 不关闭旧监听，旧监听仍持有时同地址绑定会失败），但
+// 无需等待旧 Serve 返回——Serve 在入口快照监听，旧 Serve 只作用于自己的旧
+// 监听，并在该监听被关闭后返回（restore 回滚路径即依赖此性质）。
 type Server struct {
 	handler http.Handler
-	ln      net.Listener
-	srv     *http.Server
+	// ln 是监听器的原子快照；nil 表示未绑定。经由 Load/Swap 访问，
+	// 保证 Addr/Close 与 Serve 并发时的内存安全。
+	ln atomic.Pointer[net.Listener]
 }
 
 // NewServer 组装运维端点处理器（零副作用；绑定监听见 Bind）。
@@ -267,8 +277,9 @@ func NewServer(opts ServerOptions) *Server {
 	return &Server{handler: mux}
 }
 
-// Bind 绑定运维端点监听；addr 为空表示不启用（空操作）。
-// 重复 Bind 前须先 Close（旧监听仍持有时会绑定失败）。
+// Bind 绑定运维端点监听；addr 为空表示不启用（空操作）。成功后监听以原子
+// 快照存入 ln，后续由恰好一个 Serve 消费。重复 Bind 前必须先 Close 旧监听
+// ——本方法不关闭旧监听；无需等待旧 Serve 返回（Serve 入口已快照监听）。
 func (s *Server) Bind(addr string) error {
 	if addr == "" {
 		return nil
@@ -277,18 +288,28 @@ func (s *Server) Bind(addr string) error {
 	if err != nil {
 		return fmt.Errorf("status: listen %s: %w", addr, err)
 	}
-	s.ln = ln
-	s.srv = &http.Server{
-		Handler:           s.handler,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	s.ln.Store(&ln)
 	return nil
 }
 
-// Serve 阻塞服务直到 ctx 取消（3s 内排空在途请求）；未绑定时立即返回 nil。
+// Serve 阻塞服务直到 ctx 取消（3s 内排空在途请求）；未绑定时立即返回 nil，
+// 且不启动任何协程。入口对 ln 与 handler 做一次性快照，此后不再读取任何
+// s. 字段；http.Server 为本调用局部值，因此 ctx 关停协程与 Close 的字段
+// 置 nil（Swap）并发安全。监听被外部先关闭时可能返回底层 accept 错误
+// （net.ErrClosed），调用方在 ctx 已取消时应忽略该错误。
 func (s *Server) Serve(ctx context.Context) error {
-	if s == nil || s.srv == nil {
+	if s == nil {
 		return nil
+	}
+	lnp := s.ln.Load()
+	if lnp == nil {
+		return nil
+	}
+	ln := *lnp
+	handler := s.handler
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 	done := make(chan struct{})
 	defer close(done)
@@ -297,32 +318,40 @@ func (s *Server) Serve(ctx context.Context) error {
 		case <-ctx.Done():
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
-			_ = s.srv.Shutdown(shutdownCtx)
+			_ = srv.Shutdown(shutdownCtx)
 		case <-done:
 		}
 	}()
-	err := s.srv.Serve(s.ln)
+	err := srv.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
 }
 
-// Close 关闭监听（停止接受新连接）；幂等，重置绑定状态以便失败恢复路径重绑。
+// Close 关闭监听（停止接受新连接）；幂等。原子 Swap 取出监听后置空快照，
+// 重复调用（或与 Addr/Serve 并发）返回 nil；监听关闭错误原样返回，且首次
+// 失败后快照仍为 nil，再次调用依旧幂等。在途连接的排空由 Serve 的 ctx
+// 关停协程负责，本方法不做 Shutdown。
 func (s *Server) Close() error {
-	if s == nil || s.ln == nil {
+	if s == nil {
 		return nil
 	}
-	err := s.ln.Close()
-	s.ln = nil
-	s.srv = nil
-	return err
+	ln := s.ln.Swap(nil)
+	if ln == nil {
+		return nil
+	}
+	return (*ln).Close()
 }
 
-// Addr 返回绑定地址；未绑定时为空串。
+// Addr 返回绑定地址；未绑定时为空串。原子读取，可与 Close/Serve 并发调用。
 func (s *Server) Addr() string {
-	if s == nil || s.ln == nil {
+	if s == nil {
 		return ""
 	}
-	return s.ln.Addr().String()
+	ln := s.ln.Load()
+	if ln == nil {
+		return ""
+	}
+	return (*ln).Addr().String()
 }
