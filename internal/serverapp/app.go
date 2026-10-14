@@ -270,6 +270,11 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 			return InboundServer{}, fmt.Errorf("trojan inbound %s: decoy file is empty", ic.Listen)
 		}
 		decoy = data
+	} else {
+		// 内置伪装页保证默认可用，但它是公开的固定内容，存在被指纹识别
+		// 的风险：生产部署建议显式配置 decoy-file（每次 assemble 重放一条
+		// warning，不节流）。
+		b.logger.Warn("using built-in decoy page; set decoy-file to avoid fingerprinting in production", "listen", ic.Listen)
 	}
 
 	live := liveView{live: b.live, verifier: store, decoy: decoy}
