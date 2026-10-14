@@ -454,10 +454,11 @@ func (b *builder) buildRouting(cfg *config.Config, reuse *Runtime) (*routeTable,
 				return nil, nil, err
 			}
 		} else {
-			file, url, interval := rulesetSourceOf(&rs)
+			file, url, sha256, interval := rulesetSourceOf(&rs)
 			prov, err = ruleset.New(ruleset.Options{
 				FilePath:        file,
 				URL:             url,
+				ExpectedSHA256:  sha256,
 				RefreshInterval: interval,
 				Parse:           config.ParseRules,
 				Default:         inlineDefault(cfg.Routing),
@@ -499,16 +500,16 @@ func inlineDefault(r *config.Routing) core.RouteAction {
 
 // rulesetSpecOf 把规则源配置映射为 ruleset 的 Spec（复用判定依据）。
 func rulesetSpecOf(rs *config.Ruleset) ruleset.Spec {
-	file, url, interval := rulesetSourceOf(rs)
-	return ruleset.SpecOf(file, url, interval)
+	file, url, sha256, interval := rulesetSourceOf(rs)
+	return ruleset.SpecOf(file, url, sha256, interval)
 }
 
 // rulesetSourceOf 把规则源配置映射为 ruleset 的来源参数。
-func rulesetSourceOf(rs *config.Ruleset) (file, url string, interval time.Duration) {
+func rulesetSourceOf(rs *config.Ruleset) (file, url, sha256 string, interval time.Duration) {
 	if rs.Type == "file" {
-		return rs.Path, "", 0
+		return rs.Path, "", "", 0
 	}
-	return "", rs.URL, rs.EffectiveInterval()
+	return "", rs.URL, rs.SHA256, rs.EffectiveInterval()
 }
 
 // buildOutbound 构建出口链路（节点池 + 预热池）；未配置节点时保持 nil

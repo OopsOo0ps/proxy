@@ -4,12 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 
 	"github.com/OopsOo0ps/proxy/internal/version"
 )
+
+// maxRedirects 是单次拉取允许的最大重定向跳数（与 net/http 缺省一致）。
+const maxRedirects = 10
 
 // fetchConfig 是远程规则拉取的固定约束。
 type fetchConfig struct {
@@ -29,12 +34,46 @@ func resolveFetchConfig(opts Options) fetchConfig {
 	}
 	client := opts.fetchClient
 	if client == nil {
-		client = &http.Client{Timeout: timeout}
+		client = &http.Client{
+			Timeout:       timeout,
+			CheckRedirect: rulesRedirectChecker,
+		}
 	}
 	return fetchConfig{
 		client:   client,
 		maxBytes: maxBytes,
 	}
+}
+
+// rulesRedirectChecker 是拉取客户端的重定向守卫（CheckRedirect）：拦截
+// https → http 的重定向降级（明文 http 仅允许环回地址，本地演示场景），
+// 与 config 层的 URL 校验同一从严语义；并保留缺省的 10 跳上限。
+func rulesRedirectChecker(req *http.Request, via []*http.Request) error {
+	if req.URL.Scheme == "http" && !isLoopbackHost(req.URL.Host) {
+		return fmt.Errorf("redirect to plain http is only allowed for loopback addresses (got %q)", req.URL.String())
+	}
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	return nil
+}
+
+// isLoopbackHost 判断 URL 的 Host（可能含端口、IPv6 需去括号）是否指向
+// 本机环回；主机名（localhost 除外）按非环回处理（fail-closed）。本包为
+// L2 不可依赖 config（L4），与 config 层的同名从严语义保持一致。
+func isLoopbackHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
 }
 
 // fetchRules 拉取远程规则内容：仅允许 http/https，校验状态码并限制响应体大小。
