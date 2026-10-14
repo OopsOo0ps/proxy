@@ -354,7 +354,7 @@ func startServingApp(t *testing.T, app *App) <-chan error {
 		}
 	})
 	deadline := time.Now().Add(2 * time.Second)
-	for !app.serving.Load() {
+	for !app.Serving() {
 		if time.Now().After(deadline) {
 			t.Fatal("app did not start serving")
 		}

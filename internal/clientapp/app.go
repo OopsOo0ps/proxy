@@ -10,7 +10,7 @@
 // 新快照中生效（"需重启字段"分类不存在）；规则表与日志级别走运行期热更；
 // 上游栈（节点 + params + 池 + 超时）指纹未变时复用节点池 / 预热池实例。
 // 关停期拒绝重载；重载失败时旧配置仍在原端口继续服务（同端口重绑冲突的
-// 处置见 switchTo）。
+// 处置见 internal/lifecycle 的 switchTo）。
 package clientapp
 
 import (
@@ -23,7 +23,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +34,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/dialer"
 	"github.com/OopsOo0ps/proxy/internal/dnsgw"
 	"github.com/OopsOo0ps/proxy/internal/httpproxy"
+	"github.com/OopsOo0ps/proxy/internal/lifecycle"
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/nodes"
@@ -847,38 +847,18 @@ func (b *builder) runtimeStats() status.Runtime {
 	return out
 }
 
-// —— App：生命周期与重载流水线 ——
-
-// generation 是一次快照上线后的服务代际：代际 ctx 取消触发该代际全部入站
-// 与运维端点的既有 drain/force 语义（session / httpproxy 机械）。每个代际
-// 持有独立的服务协程计数与 done 信号：Serve 等待“当前代际”退出，重载以
-// 新代际整体替换——跨代际共享一个 WaitGroup 会在新旧交替的间隙归零，
-// 使 Wait 提前返回（Add-after-Wait 竞态），这是按代际计数的根本原因。
-type generation struct {
-	rt     *Runtime
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
-	done   chan struct{} // 全部服务协程退出后关闭
-}
+// —— App：薄包装（生命周期核心见 internal/lifecycle）——
 
 // App 是组装完成的 proxy-client 实例。
 // 生命周期：New（构建快照并绑定监听）→ Serve（阻塞服务直到 ctx 取消）。
 // 配置热加载见 Reload：先完整构建新快照，全部成功后原子切换并排空旧快照；
-// 任何失败都保持旧配置在原端口继续服务。
+// 任何失败都保持旧配置在原端口继续服务。顺序与关停语义（代际切换、失败
+// 回滚、fail-closed、按代际计数防 Add-after-Wait）全部由 internal/lifecycle
+// 核心承载；本组装根只注入应用语义（组装、绑定、服务端点、运行期热更）。
 type App struct {
+	core *lifecycle.App[Runtime, *config.Config]
 	b    builder
-	live atomic.Pointer[Runtime]
-	gen  atomic.Pointer[generation]
-
-	reloadMu  sync.Mutex
-	closing   atomic.Bool
-	serving   atomic.Bool
-	serveCtx  context.Context // Serve 启动后写入；重载以此为父 ctx
-	appCancel context.CancelFunc
-
-	errMu    sync.Mutex
-	firstErr error
+	live atomic.Pointer[Runtime] // 借给核心的组装根 live 指针（生效边界 = 新拨号）
 }
 
 // New 校验并组装应用：构建完整运行时快照并绑定全部监听（不变量 3：
@@ -894,17 +874,95 @@ func New(cfg *config.Config, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 		LogCtrl:       logCtrl,
 		OnRulesChange: app.dropForwardIdleConns,
 	}, &app.live)
-
-	rt, err := app.b.assemble(cfg, nil)
+	core, _, err := lifecycle.New(lifecycleOptions(&app.b), cfg, &app.live)
 	if err != nil {
 		return nil, err
 	}
-	if err := app.b.bindRuntime(rt, nil); err != nil {
-		rt.closeOwned(nil)
+	app.core = core
+	return app, nil
+}
+
+// lifecycleOptions 把 clientapp 的应用语义注入生命周期核心：闭包一律经
+// builder 指针运行期读取（测试会在 New 后替换 logger / logCtrl，钩子不得
+// 捕获构造期值）。Name 前缀 "clientapp" 逐字复现既有错误与日志文案。
+func lifecycleOptions(b *builder) lifecycle.Options[Runtime, *config.Config] {
+	return lifecycle.Options[Runtime, *config.Config]{
+		Name:     "clientapp",
+		Assemble: b.assemble,
+		Load:     loadConfigFile,
+		Port: lifecycle.Port[Runtime]{
+			// Clone 返回浅拷贝（c := *rt; return &c）：restore 回滚路径以
+			// 克隆上线，旧代际（及其服务协程闭包）仍持原指针。
+			Clone: func(rt *Runtime) *Runtime {
+				c := *rt
+				return &c
+			},
+			Services:       runtimeServices,
+			Bind:           b.bindRuntime,
+			CloseListeners: func(rt *Runtime) { rt.closeListeners() },
+			CloseOwned:     func(cur, next *Runtime) { next.closeOwned(cur) },
+			ReleaseReplaced: func(cur, next *Runtime) {
+				cur.releaseReplaced(next)
+			},
+			StartResources: func(rt *Runtime, parent context.Context) {
+				rt.startResources(parent)
+			},
+			CloseResources: func(rt *Runtime) { rt.closeResources() },
+		},
+		OnReloaded: func(next *config.Config) {
+			b.limiter.SetMax(next.Limits.EffectiveMaxConnections())
+			// DNS 专用查询闸与全局闸同源：热加载时同步调整上限。
+			b.dnsLimiter.SetMax(next.Limits.EffectiveMaxConnections())
+			if b.logCtrl != nil {
+				b.logCtrl.SetLevel(next.Log.Level)
+				b.logCtrl.SetFormat(next.Log.Format)
+			}
+			b.logger.Info("configuration reloaded",
+				"inbounds", len(next.Inbounds),
+				"nodes", len(nodesOf(next)),
+				"max_connections", next.Limits.EffectiveMaxConnections(),
+				"dns_gateway", dnsGatewayListen(next) != "",
+			)
+		},
+		OnReloadResult: func(success bool) {
+			if success {
+				b.metrics.ConfigReload(metrics.ReloadSuccess)
+				return
+			}
+			b.metrics.ConfigReload(metrics.ReloadError)
+		},
+		OnRollbackFailed: func(err error) {
+			b.logger.Error("reload rollback failed; previous listeners could not be rebound", "error", err)
+		},
+	}
+}
+
+// runtimeServices 把运行时快照的服务端点暴露给生命周期核心（每次代际
+// 上线时读取）：入站按声明顺序，错误前缀 "clientapp: inbound %s" 的 %s
+// 即入站 type；运维端点错误前缀 "clientapp: admin endpoint"。
+func runtimeServices(rt *Runtime) lifecycle.Services {
+	svc := lifecycle.Services{Admin: lifecycle.Service{Serve: rt.Admin.Serve}}
+	for i := range rt.Inbounds {
+		is := &rt.Inbounds[i]
+		svc.Inbounds = append(svc.Inbounds, lifecycle.Service{
+			Kind:  is.Config.Type,
+			Serve: is.Serve,
+		})
+	}
+	return svc
+}
+
+// loadConfigFile 读取并解析客户端配置（lifecycle Load 钩子）；levelOverride
+// 是启动参数 -log-level 的显式覆盖，非空时优先于文件值。
+func loadConfigFile(path, levelOverride string) (*config.Config, error) {
+	cfg, err := config.Load(path, KnownProtocols)
+	if err != nil {
 		return nil, err
 	}
-	app.live.Store(rt)
-	return app, nil
+	if levelOverride != "" {
+		cfg.Log.Level = levelOverride
+	}
+	return cfg, nil
 }
 
 // Build 依据配置构建完整运行时快照（含监听绑定）：除绑定外无副作用；
@@ -913,16 +971,7 @@ func New(cfg *config.Config, logger *slog.Logger, logCtrl *logging.Control) (*Ap
 func Build(cfg *config.Config, opts BuildOptions) (*Runtime, error) {
 	var live atomic.Pointer[Runtime]
 	b := newBuilder(opts, &live)
-	rt, err := b.assemble(cfg, nil)
-	if err != nil {
-		return nil, err
-	}
-	if err := b.bindRuntime(rt, nil); err != nil {
-		rt.closeOwned(nil)
-		return nil, err
-	}
-	live.Store(rt)
-	return rt, nil
+	return lifecycle.Build(lifecycleOptions(&b), cfg, &live)
 }
 
 // enabledProtos 返回已启用的入站协议集合（metrics 按集合预初始化时间序列）。
@@ -967,118 +1016,28 @@ func (a *App) dropForwardIdleConns() {
 // Serve 阻塞服务直到 ctx 取消或任一监听出错；返回前完成优雅关停
 // （存量连接按排空期限收尾）。重载产出的新代际在切换时即上线，
 // 不经过本函数的再次调度。
-func (a *App) Serve(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+func (a *App) Serve(ctx context.Context) error { return a.core.Serve(ctx) }
 
-	a.reloadMu.Lock()
-	a.serveCtx = ctx
-	a.appCancel = cancel
-	gen := a.gen.Load()
-	if gen == nil {
-		gen = a.startGeneration(a.live.Load())
-	}
-	a.serving.Store(true)
-	a.reloadMu.Unlock()
-	defer func() {
-		a.reloadMu.Lock()
-		a.serving.Store(false)
-		a.closing.Store(true)
-		a.reloadMu.Unlock()
-	}()
+// Reload 应用一份新配置（重载流水线，§8.2）：读文件与解析在上层完成；
+// 这里先完整构建新运行时（规则源重检、指纹复用、协议传输与凭据重建），
+// 全部成功后原子切换（先停旧监听再绑新监听，见 internal/lifecycle 的
+// switchTo），旧快照排空。任何失败都返回错误并保持旧配置在原端口继续
+// 服务——配置错误不会波及线上。
+//
+// 生效边界为“新拨号”：a.live 是全局原子快照，切换对新拨号立即生效，包括
+// 被替换世代在途请求的后续拨号；请求级快照冻结不是本模型的语义。
+func (a *App) Reload(next *config.Config) error { return a.core.Reload(next) }
 
-	// 应用级关停：取消当前代际（触发 drain/force）并立即释放池内空闲连接
-	//（它们没有在途数据，提前关闭既让服务端尽快回收，也避免排空期的新请求
-	// 再领取）。
-	go func() {
-		<-ctx.Done()
-		if g := a.gen.Load(); g != nil {
-			g.cancel()
-		}
-		if rt := a.live.Load(); rt != nil {
-			rt.closeResources()
-		}
-	}()
-
-	for {
-		<-gen.done
-		// 当前代际退出：应用级关停、被重载替换、或服务协程全部意外结束。
-		if ctx.Err() != nil {
-			// 等待当前代际排空完成（重载可能刚替换过代际）。
-			a.reloadMu.Lock()
-			latest := a.gen.Load()
-			a.reloadMu.Unlock()
-			if latest != nil && latest != gen {
-				<-latest.done
-			}
-			return a.firstError()
-		}
-		a.reloadMu.Lock()
-		latest := a.gen.Load()
-		a.reloadMu.Unlock()
-		if latest == gen {
-			// 未被替换且无关停信号：全部服务协程结束（如监听被外部关闭）。
-			return a.firstError()
-		}
-		gen = latest
-	}
+// ReloadFile 读取、解析并应用配置文件（path 与启动时相同）。
+// levelOverride 是启动参数 -log-level 的显式覆盖，非空时同样优先于文件值。
+// 解析失败与构建失败一样保持旧配置继续服务，
+// 并且每次尝试（无论失败在哪一步）都恰好计入一次 config_reloads_total。
+func (a *App) ReloadFile(path, levelOverride string) error {
+	return a.core.ReloadFile(path, levelOverride)
 }
 
-// startGeneration 让快照上线：启动后台资源并 spawn 全部服务协程。
-// 必须在 reloadMu 持有时调用。
-func (a *App) startGeneration(rt *Runtime) *generation {
-	parent := a.serveCtx
-	if parent == nil {
-		parent = context.Background()
-	}
-	gctx, cancel := context.WithCancel(parent)
-	gen := &generation{rt: rt, ctx: gctx, cancel: cancel, done: make(chan struct{})}
-	// 后台资源（预热池/健康探测/规则源刷新）绑定应用级 ctx：其寿命 =
-	// 实例寿命，由 Close（closeResources）终结，不随代际结束而停止——
-	// 否则热加载复用的实例（restore 回滚路径共享同一指针）后台循环会被
-	// gen.cancel() 永久停摆。
-	rt.startResources(parent)
-	gen.wg.Add(len(rt.Inbounds) + 1) // 入站 + 运维端点（先计数后 spawn，done 关闭不早于计数）
-	for i := range rt.Inbounds {
-		is := &rt.Inbounds[i]
-		go func() {
-			defer gen.wg.Done()
-			if err := is.Serve(gctx); err != nil && gctx.Err() == nil && parent.Err() == nil {
-				a.fail(fmt.Errorf("clientapp: inbound %s: %w", is.Config.Type, err))
-			}
-		}()
-	}
-	go func() {
-		defer gen.wg.Done()
-		if err := rt.Admin.Serve(gctx); err != nil && gctx.Err() == nil && parent.Err() == nil {
-			a.fail(fmt.Errorf("clientapp: admin endpoint: %w", err))
-		}
-	}()
-	go func() {
-		gen.wg.Wait()
-		close(gen.done)
-	}()
-	a.gen.Store(gen)
-	return gen
-}
-
-// fail 记录首个致命服务错误并触发应用级关停（全部代际随之排空）。
-func (a *App) fail(err error) {
-	a.errMu.Lock()
-	if a.firstErr == nil {
-		a.firstErr = err
-	}
-	a.errMu.Unlock()
-	if a.appCancel != nil {
-		a.appCancel()
-	}
-}
-
-func (a *App) firstError() error {
-	a.errMu.Lock()
-	defer a.errMu.Unlock()
-	return a.firstErr
-}
+// Serving 报告应用是否正在服务（测试接缝：代际上线 / 关停的判定点）。
+func (a *App) Serving() bool { return a.core.Serving() }
 
 // —— 观测访问器 ——
 
@@ -1108,121 +1067,4 @@ func (a *App) MetricsAddr() string {
 		return rt.Admin.Addr()
 	}
 	return ""
-}
-
-// Reload 应用一份新配置（重载流水线，§8.2）：读文件与解析在上层完成；
-// 这里先完整构建新运行时（规则源重检、指纹复用、协议传输与凭据重建），
-// 全部成功后原子切换（先停旧监听再绑新监听，见 switchTo），旧快照排空。
-// 任何失败都返回错误并保持旧配置在原端口继续服务——配置错误不会波及线上。
-//
-// 生效边界为“新拨号”：a.live 是全局原子快照，切换对新拨号立即生效，包括
-// 被替换世代在途请求的后续拨号；请求级快照冻结不是本模型的语义。
-func (a *App) Reload(next *config.Config) (err error) {
-	a.reloadMu.Lock()
-	defer a.reloadMu.Unlock()
-	if a.closing.Load() || (a.serveCtx != nil && a.serveCtx.Err() != nil) || a.shuttingDown() {
-		return errors.New("clientapp: shutting down; reload ignored")
-	}
-
-	cur := a.live.Load()
-	result := metrics.ReloadError
-	defer func() { a.b.metrics.ConfigReload(result) }()
-
-	rt, err := a.b.assemble(next, cur)
-	if err != nil {
-		return fmt.Errorf("clientapp: build new configuration: %w", err)
-	}
-	if err := a.switchTo(cur, rt); err != nil {
-		return err
-	}
-
-	a.b.limiter.SetMax(next.Limits.EffectiveMaxConnections())
-	// DNS 专用查询闸与全局闸同源：热加载时同步调整上限。
-	a.b.dnsLimiter.SetMax(next.Limits.EffectiveMaxConnections())
-	if a.b.logCtrl != nil {
-		a.b.logCtrl.SetLevel(next.Log.Level)
-		a.b.logCtrl.SetFormat(next.Log.Format)
-	}
-	result = metrics.ReloadSuccess
-	a.b.logger.Info("configuration reloaded",
-		"inbounds", len(next.Inbounds),
-		"nodes", len(nodesOf(next)),
-		"max_connections", next.Limits.EffectiveMaxConnections(),
-		"dns_gateway", dnsGatewayListen(next) != "",
-	)
-	return nil
-}
-
-// shuttingDown 报告当前代际是否已进入关停（排空中拒绝重载）。
-func (a *App) shuttingDown() bool {
-	if gen := a.gen.Load(); gen != nil {
-		return gen.ctx.Err() != nil
-	}
-	return false
-}
-
-// switchTo 原子切换运行时（reloadMu 持有）：
-//  1. 停旧：先取消旧代际 ctx（触发既有 drain/force 语义——session/http
-//     机械会自行关闭监听并排空存量），再同步关闭旧监听释放端口；
-//  2. 绑新：旧监听已停，同端口可重绑；任何失败回滚——关闭新运行时刚绑定
-//     的监听与新建资源，用旧运行时保存的入站配置重建旧监听并恢复服务
-//     （最终效果：reload 失败时旧配置仍在原端口继续服务）；回滚也失败时
-//     fail-closed（fail → 应用级关停，Serve 返回，进程交由进程管理器重启）；
-//  3. 提交：新快照上线（新代际），被替换的旧资源释放，旧存量连接排空。
-func (a *App) switchTo(cur, next *Runtime) error {
-	if gen := a.gen.Load(); gen != nil && gen.rt == cur {
-		gen.cancel()
-	}
-	cur.closeListeners()
-
-	if err := a.b.bindRuntime(next, cur); err != nil {
-		next.closeListeners()
-		next.closeOwned(cur)
-		if rerr := a.restore(cur); rerr != nil {
-			a.b.logger.Error("reload rollback failed; previous listeners could not be rebound", "error", rerr)
-			// Fail-closed：零监听存活是不可服务状态——记录首个致命错误并触发
-			// 应用级关停，Serve 随之返回、进程按现有关停流程退出，交由进程
-			// 管理器重启。
-			a.fail(fmt.Errorf("clientapp: reload rollback failed: %w", rerr))
-			return fmt.Errorf("clientapp: bind new configuration: %v; rollback failed: %w", err, rerr)
-		}
-		return fmt.Errorf("clientapp: bind new configuration: %w", err)
-	}
-
-	a.live.Store(next)
-	if a.serving.Load() {
-		a.startGeneration(next)
-	}
-	cur.releaseReplaced(next)
-	return nil
-}
-
-// restore 在绑定失败后恢复旧配置服务：用旧运行时保存的入站配置重建监听
-// 并重新上线（旧组件全部存活——切换失败路径只关闭了新运行时新建的资源）。
-func (a *App) restore(cur *Runtime) error {
-	if err := a.b.bindRuntime(cur, nil); err != nil {
-		return err
-	}
-	if a.serving.Load() {
-		restored := *cur
-		a.live.Store(&restored)
-		a.startGeneration(&restored)
-	}
-	return nil
-}
-
-// ReloadFile 读取、解析并应用配置文件（path 与启动时相同）。
-// levelOverride 是启动参数 -log-level 的显式覆盖，非空时同样优先于文件值。
-// 解析失败与构建失败一样保持旧配置继续服务，
-// 并且每次尝试（无论失败在哪一步）都恰好计入一次 config_reloads_total。
-func (a *App) ReloadFile(path, levelOverride string) error {
-	cfg, err := config.Load(path, KnownProtocols)
-	if err != nil {
-		a.b.metrics.ConfigReload(metrics.ReloadError)
-		return err
-	}
-	if levelOverride != "" {
-		cfg.Log.Level = levelOverride
-	}
-	return a.Reload(cfg)
 }
