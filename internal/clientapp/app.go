@@ -1033,7 +1033,11 @@ func (a *App) startGeneration(rt *Runtime) *generation {
 	}
 	gctx, cancel := context.WithCancel(parent)
 	gen := &generation{rt: rt, ctx: gctx, cancel: cancel, done: make(chan struct{})}
-	rt.startResources(gctx)
+	// 后台资源（预热池/健康探测/规则源刷新）绑定应用级 ctx：其寿命 =
+	// 实例寿命，由 Close（closeResources）终结，不随代际结束而停止——
+	// 否则热加载复用的实例（restore 回滚路径共享同一指针）后台循环会被
+	// gen.cancel() 永久停摆。
+	rt.startResources(parent)
 	gen.wg.Add(len(rt.Inbounds) + 1) // 入站 + 运维端点（先计数后 spawn，done 关闭不早于计数）
 	for i := range rt.Inbounds {
 		is := &rt.Inbounds[i]

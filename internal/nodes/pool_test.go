@@ -766,3 +766,52 @@ func TestNewRequiresProbeWhenHealthCheckEnabled(t *testing.T) {
 		t.Fatalf("error = %v, want 提及 probe func", err)
 	}
 }
+
+// TestHealthCheckLoopSurvivesGenerationCancel 钉住 B-1 契约：探测循环绑定
+// 首次 Start 传入的应用级 ctx，寿命由 Close 终结——代际 ctx（其子 ctx）取消
+// 后循环仍按周期探测（热加载复用实例的后台循环不随 gen.cancel() 停摆）；
+// 重复 Start（restore 浅拷贝路径）不重建循环（首次调用生效）；Close 后计数
+// 冻结。
+func TestHealthCheckLoopSurvivesGenerationCancel(t *testing.T) {
+	var probes atomic.Int64
+	pool, err := New(testNodes()[:1], newRecorder().dial, Options{
+		Health: HealthOptions{Interval: 5 * time.Millisecond, Timeout: 50 * time.Millisecond, Failures: 2, Successes: 2},
+		Probe: func(context.Context, Node) error {
+			probes.Add(1)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := context.Background()              // 应用级 ctx（startResources 绑定它）
+	gctx, gcancel := context.WithCancel(parent) // 代际 ctx
+	t.Cleanup(pool.Close)
+
+	pool.StartHealthChecks(parent)
+	waitFor(t, 3*time.Second, func() bool { return probes.Load() >= 3 })
+
+	// 代际结束：复用实例的探测循环仍继续探测。
+	gcancel()
+	baseline := probes.Load()
+	waitFor(t, 3*time.Second, func() bool { return probes.Load() > baseline })
+
+	// 重复 Start（restore 浅拷贝路径）：首次调用生效，不重建第二个循环——
+	// 用 done 通道同一性机械固化「不重建」，用计数继续增长固化「原循环仍活」，
+	// 两者合起来即计数增速不会翻倍。
+	doneBefore := pool.hcDone
+	pool.StartHealthChecks(gctx) // 传入已取消的代际 ctx 也必须被忽略
+	if pool.hcDone != doneBefore {
+		t.Fatal("重复 Start 重建了探测循环（应首次调用生效）")
+	}
+	more := probes.Load()
+	waitFor(t, 3*time.Second, func() bool { return probes.Load() > more })
+
+	// Close 后计数冻结。
+	pool.Close()
+	frozen := probes.Load()
+	time.Sleep(50 * time.Millisecond)
+	if got := probes.Load(); got != frozen {
+		t.Fatalf("probes after Close = %d, want frozen at %d", got, frozen)
+	}
+}

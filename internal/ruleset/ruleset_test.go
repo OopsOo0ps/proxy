@@ -518,3 +518,42 @@ func TestStartAndCloseIdempotent(t *testing.T) {
 	once.Start(ctx)
 	once.Close()
 }
+
+// TestRefreshLoopSurvivesGenerationCancel 钉住 B-1 契约：URL 刷新循环绑定
+// 首次 Start 传入的应用级 ctx，寿命由 Close 终结——代际 ctx（其子 ctx）取消
+// 后 fetch 计数继续增长（热加载复用实例的刷新循环不随 gen.cancel() 停摆）；
+// 重复 Start（restore 浅拷贝路径）不重建循环（首次调用生效）；Close 后计数
+// 冻结。
+func TestRefreshLoopSurvivesGenerationCancel(t *testing.T) {
+	tr := &fakeTransport{status: 200, body: rulesV1}
+	p := newURLProvider(t, tr, nil, 10*time.Millisecond)
+	parent := context.Background()              // 应用级 ctx（startResources 绑定它）
+	gctx, gcancel := context.WithCancel(parent) // 代际 ctx
+
+	p.Start(parent)
+	waitFor(t, 3*time.Second, "refresh loop started fetching", func() bool { return tr.requests() >= 2 })
+
+	// 代际结束：复用实例的刷新循环仍继续 fetch。
+	gcancel()
+	baseline := tr.requests()
+	waitFor(t, 3*time.Second, "fetch continues after generation cancel", func() bool { return tr.requests() > baseline })
+
+	// 重复 Start（restore 浅拷贝路径）：首次调用生效，不重建第二个循环——
+	// 用 done 通道同一性机械固化「不重建」，用计数继续增长固化「原循环仍活」，
+	// 两者合起来即 fetch 计数不会翻倍增长。
+	doneBefore := p.done
+	p.Start(gctx) // 传入已取消的代际 ctx 也必须被忽略
+	if p.done != doneBefore {
+		t.Fatal("重复 Start 重建了刷新循环（应首次调用生效）")
+	}
+	more := tr.requests()
+	waitFor(t, 3*time.Second, "fetch continues after redundant start", func() bool { return tr.requests() > more })
+
+	// Close 后计数冻结。
+	p.Close()
+	frozen := tr.requests()
+	time.Sleep(60 * time.Millisecond)
+	if got := tr.requests(); got != frozen {
+		t.Fatalf("fetches after Close = %d, want frozen at %d", got, frozen)
+	}
+}
