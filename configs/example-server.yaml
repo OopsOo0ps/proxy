@@ -32,7 +32,10 @@ inbounds:
           password: change-me-alice
         - username: bob
           password: change-me-bob
-      # decoy-file: /etc/proxy/decoy.html   # 可选：自定义伪装页面
+      # decoy-file: /etc/proxy/decoy.html
+      # ↑ 建议显式配置自定义伪装页面：未配置时使用内置伪装页（仅适用于
+      #   本地试验——内置模板是公开的固定内容，可能被指纹识别），此时启动
+      #   会记录一条 warning。
 
 # 过载保护：进程级并发隧道上限；0 = 不限制。
 # 超限连接直接关闭（TLS 层无法携带错误语义），并计入 connections_rejected_total。

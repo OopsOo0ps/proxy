@@ -1,10 +1,13 @@
 package serverapp_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -225,5 +228,48 @@ func TestHealthReportsExpiredCertificate(t *testing.T) {
 	}
 	if health.Status != "unavailable" || !strings.Contains(health.Reason, "tls certificate expired") {
 		t.Fatalf("/health = %+v", health)
+	}
+}
+
+// TestBuiltInDecoyWarning 验证 P2-5：未配置 decoy-file（使用内置伪装页）
+// 时 assemble 记录 warning；显式配置后不再告警。
+func TestBuiltInDecoyWarning(t *testing.T) {
+	logWarn := func(t *testing.T, cfg *config.Config) string {
+		t.Helper()
+		var buf bytes.Buffer
+		if _, err := serverapp.New(cfg, slog.New(slog.NewJSONHandler(&buf, nil)), nil); err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return buf.String()
+	}
+
+	// 缺省（内置伪装页）：出现 warning。
+	if logs := logWarn(t, baseServerCfg(t)); !strings.Contains(logs, "using built-in decoy page; set decoy-file to avoid fingerprinting in production") {
+		t.Fatalf("built-in decoy warning missing in logs: %s", logs)
+	}
+
+	// 显式 decoy-file：不再告警。
+	cfg := baseServerCfg(t)
+	dir := t.TempDir()
+	decoyFile := filepath.Join(dir, "decoy.html")
+	if err := os.WriteFile(decoyFile, []byte("<html>custom decoy</html>\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	params := map[string]any{}
+	if err := cfg.Inbounds[0].Params.Decode(&params); err != nil {
+		t.Fatal(err)
+	}
+	params["decoy-file"] = decoyFile
+	raw, err := json.Marshal(params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Inbounds[0].Params = *doc.Content[0]
+	if logs := logWarn(t, cfg); strings.Contains(logs, "using built-in decoy page") {
+		t.Fatalf("explicit decoy-file must not warn: %s", logs)
 	}
 }

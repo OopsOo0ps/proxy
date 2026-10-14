@@ -23,6 +23,7 @@ var Layers = map[string]int{
 	"relay": 0, "sockswire": 0, "netutil": 0, "logging": 0,
 	"shutdown": 0, "connlimit": 0, "auth": 0, "version": 0,
 	"defaults": 0, // 纯常量，零依赖
+	"throttle": 0, // 认证失败按 IP 指数退避：纯 stdlib，零模块内依赖
 	// L1 契约/机械
 	"core": 1, "outbound": 1, "session": 1,
 	"lifecycle": 1, // 组装根共有生命周期核心：只依赖 stdlib（与 session 同语义）

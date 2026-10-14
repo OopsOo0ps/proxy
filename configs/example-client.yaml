@@ -92,12 +92,15 @@ routing:
     - { match: cidr, value: 10.0.0.0/8, action: direct }
     - { default: proxy }
   # 规则源（来源可替换，当前至多一个；与内联规则按序组合匹配）。
-  # type 省缺 url（定时刷新，失败保持现有规则）；file 为本地文件（构建期
+  # type 省缺 url（定时刷新，失败保持现有规则）；远程源仅允许 https
+  # （明文 http 仅环回地址可用，本地演示场景）；file 为本地文件（构建期
   # 严格读取），文件格式与 configs/example-rules.yaml 一致。
   # rulesets:
   #   - name: cn-list
   #     url: "https://rules.example.com/proxy-rules.yaml"
   #     interval: 24h              # 刷新周期；省缺 30m
+  #     # sha256: <64-hex expected digest>   # 可选：内容钉扎摘要，
+  #     #          拉取内容与它不一致时按刷新失败处理（保留现有规则）
   #   - name: local
   #     type: file
   #     path: configs/example-rules.yaml

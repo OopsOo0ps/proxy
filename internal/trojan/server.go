@@ -16,6 +16,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/session"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
+	"github.com/OopsOo0ps/proxy/internal/throttle"
 )
 
 // DefaultDecoyPage 是认证失败/非协议流量时返回的伪装页面。
@@ -73,6 +74,27 @@ type Server struct {
 	Logger *slog.Logger
 	// Telemetry 是遥测出口；nil 时使用 core.NopTelemetry。
 	Telemetry core.Telemetry
+	// Throttle 是认证失败的按 IP 指数退避器；nil = 使用包级默认实例
+	//（100ms 起、2s 封顶、容量 4096），开箱即用；测试可注入自定义实例。
+	Throttle *throttle.IPThrottle
+}
+
+// defaultThrottle 是缺省的认证退避器（nil Throttle 时共用）。
+var defaultThrottle = throttle.NewDefaultIPThrottle()
+
+// throttleNow 返回生效的退避器（Throttle 优先，缺省默认实例）。
+func (s *Server) throttleNow() *throttle.IPThrottle {
+	if s.Throttle != nil {
+		return s.Throttle
+	}
+	return defaultThrottle
+}
+
+// backoff 记录一次认证失败并按返回时长有界睡眠（d = 0 时不等待）。
+func (s *Server) backoff(ip string) {
+	if d := s.throttleNow().Delay(ip); d > 0 {
+		time.Sleep(d)
+	}
 }
 
 // Serve 在 ln 上接受并处理隧道连接；ctx 取消后优雅关停：
@@ -149,10 +171,15 @@ func (s *Server) handle(ctx, connCtx context.Context, conn net.Conn) {
 	user, ok := s.verifierNow().VerifyTunnel(req.PasswordHash)
 	if !ok {
 		logger.Warn("tunnel authentication failed")
+		// 认证失败：按 IP 指数退避（有界）后再回伪装页面，抑制口令爆破；
+		// 伪装页面语义保持不变（与正常 Web 服务的时序差异被 2s 封顶约束）。
+		s.backoff(clientIP)
 		s.serveDecoy(conn)
 		tel.ConnRejected(core.ProtoTunnel, core.ResultDenied)
 		return
 	}
+	// 认证成功：清除该来源 IP 的失败记录（退避从头计）。
+	s.throttleNow().Success(clientIP)
 	if req.Command != sockswire.CmdConnect {
 		// UDP ASSOCIATE 等命令暂不支持：直接关闭并记录。
 		logger.Warn("unsupported tunnel command", "command", req.Command)

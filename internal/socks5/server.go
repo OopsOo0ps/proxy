@@ -19,6 +19,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/session"
 	"github.com/OopsOo0ps/proxy/internal/sockswire"
+	"github.com/OopsOo0ps/proxy/internal/throttle"
 )
 
 var (
@@ -73,6 +74,27 @@ type Server struct {
 	IdleTimeout time.Duration
 	// ShutdownTimeout 关停时等待存量连接结束的最长时间；<=0 时使用 defaults.DrainTimeout。
 	ShutdownTimeout time.Duration
+	// Throttle 是认证失败的按 IP 指数退避器；nil = 使用包级默认实例
+	//（100ms 起、2s 封顶、容量 4096），开箱即用；测试可注入自定义实例。
+	Throttle *throttle.IPThrottle
+}
+
+// defaultThrottle 是缺省的认证退避器（nil Throttle 时共用）。
+var defaultThrottle = throttle.NewDefaultIPThrottle()
+
+// throttleNow 返回生效的退避器（Throttle 优先，缺省默认实例）。
+func (s *Server) throttleNow() *throttle.IPThrottle {
+	if s.Throttle != nil {
+		return s.Throttle
+	}
+	return defaultThrottle
+}
+
+// backoff 记录一次认证失败并按返回时长有界睡眠（d = 0 时不等待）。
+func (s *Server) backoff(ip string) {
+	if d := s.throttleNow().Delay(ip); d > 0 {
+		time.Sleep(d)
+	}
 }
 
 // Serve 在 ln 上接受并处理 SOCKS5 连接；ctx 取消后优雅关停：
@@ -107,7 +129,7 @@ func (s *Server) ServeConn(connCtx context.Context, raw net.Conn) {
 	_ = raw.SetDeadline(time.Now().Add(s.handshakeTimeout()))
 
 	br := bufio.NewReader(raw)
-	if err := s.negotiate(br, raw); err != nil {
+	if err := s.negotiate(br, raw, clientIP); err != nil {
 		if errors.Is(err, errAuthFailed) || errors.Is(err, errNoAcceptableMethod) {
 			logger.Warn("socks5 authentication failed", "error", err)
 			// 未进入服务即被拒（认证失败）：按拒绝计，无路由维度。
@@ -118,6 +140,8 @@ func (s *Server) ServeConn(connCtx context.Context, raw net.Conn) {
 		}
 		return
 	}
+	// 认证成功：清除该来源 IP 的失败记录（退避从头计）。
+	s.throttleNow().Success(clientIP)
 
 	host, port, cmd, err := readRequest(br)
 	if err != nil {
@@ -227,8 +251,9 @@ func (s *Server) ServeConn(connCtx context.Context, raw net.Conn) {
 	})
 }
 
-// negotiate 完成版本/方法协商与（可选的）用户名密码认证。
-func (s *Server) negotiate(br *bufio.Reader, w io.Writer) error {
+// negotiate 完成版本/方法协商与（可选的）用户名密码认证。ip 是来源 IP
+// （认证失败时用于按 IP 指数退避）。
+func (s *Server) negotiate(br *bufio.Reader, w io.Writer, ip string) error {
 	var head [2]byte // VER, NMETHODS
 	if _, err := io.ReadFull(br, head[:]); err != nil {
 		return fmt.Errorf("socks5: read greeting: %w", err)
@@ -253,16 +278,18 @@ func (s *Server) negotiate(br *bufio.Reader, w io.Writer) error {
 			return fmt.Errorf("socks5: write method selection: %w", err)
 		}
 		if want == MethodUserPass {
-			return s.authenticate(br, w)
+			return s.authenticate(br, w, ip)
 		}
 		return nil
 	}
+	// 未提供可接受的方法同样是认证失败：先按 IP 退避，再回拒绝响应。
+	s.backoff(ip)
 	_, _ = w.Write([]byte{Version, MethodNoAcceptable})
 	return errNoAcceptableMethod
 }
 
-// authenticate 执行 RFC 1929 用户名/密码子协商。
-func (s *Server) authenticate(br *bufio.Reader, w io.Writer) error {
+// authenticate 执行 RFC 1929 用户名/密码子协商（ip 用于认证失败退避）。
+func (s *Server) authenticate(br *bufio.Reader, w io.Writer, ip string) error {
 	var head [2]byte // VER, ULEN
 	if _, err := io.ReadFull(br, head[:]); err != nil {
 		return fmt.Errorf("socks5: read auth header: %w", err)
@@ -286,6 +313,8 @@ func (s *Server) authenticate(br *bufio.Reader, w io.Writer) error {
 	ok := s.authNow().Authenticate(string(username), string(password))
 	status := byte(UserPassStatusOK)
 	if !ok {
+		// 认证失败：按 IP 指数退避（有界）后再回拒绝响应，抑制口令爆破。
+		s.backoff(ip)
 		status = UserPassStatusFail
 	}
 	if _, err := w.Write([]byte{UserPassVersion, status}); err != nil {

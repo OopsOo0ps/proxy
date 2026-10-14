@@ -94,14 +94,15 @@ type Spec struct {
 	Kind     SourceKind
 	Target   string // 文件路径或 URL
 	Interval time.Duration
+	SHA256   string // 可选的内容钉扎摘要（空 = 不钉扎）；变更即重建 Provider
 }
 
 // SpecOf 依据配置字段构造 Spec（至多一个来源非空）。
 // interval 是已被调用方解释过的生效刷新周期（0 = 仅启动拉取一次）。
-func SpecOf(filePath, rawURL string, interval time.Duration) Spec {
+func SpecOf(filePath, rawURL, sha256 string, interval time.Duration) Spec {
 	switch {
 	case rawURL != "":
-		return Spec{Kind: SourceURL, Target: rawURL, Interval: interval}
+		return Spec{Kind: SourceURL, Target: rawURL, Interval: interval, SHA256: sha256}
 	case filePath != "":
 		return Spec{Kind: SourceFile, Target: filePath}
 	default:
@@ -116,6 +117,9 @@ type Options struct {
 	URL      string
 	// RefreshInterval 是 URL 源的刷新周期，0 = 仅启动拉取一次；其余来源忽略。
 	RefreshInterval time.Duration
+	// ExpectedSHA256 是可选的内容钉扎摘要（64 位 hex；空 = 不钉扎）：
+	// 每次拉取成功后先比对内容摘要，不一致按刷新失败处理（保留现有规则）。
+	ExpectedSHA256 string
 	// FetchTimeout / MaxFetchBytes 为 0 时取包内缺省值（15s / 8 MiB）。
 	FetchTimeout  time.Duration
 	MaxFetchBytes int64
@@ -156,6 +160,8 @@ type Snapshot struct {
 // 刷新成功时整体替换。零值不可用，请使用 New 构造。
 type Provider struct {
 	spec Spec
+
+	expectedSHA256 string // 内容钉扎摘要（空 = 不钉扎）
 
 	mu          sync.Mutex
 	opts        routing.Options // 当前引擎参数（UpdateOptions 可更新）
@@ -211,14 +217,15 @@ func New(opts Options) (*Provider, error) {
 		obs = NopObserver
 	}
 	p := &Provider{
-		spec:     SpecOf(opts.FilePath, opts.URL, opts.RefreshInterval),
-		opts:     routing.Options{Default: opts.Default, PrivateDirect: opts.PrivateDirect},
-		parse:    opts.Parse,
-		log:      logger,
-		obs:      obs,
-		now:      now,
-		onChange: opts.OnChange,
-		fetch:    resolveFetchConfig(opts),
+		spec:           SpecOf(opts.FilePath, opts.URL, opts.ExpectedSHA256, opts.RefreshInterval),
+		expectedSHA256: opts.ExpectedSHA256,
+		opts:           routing.Options{Default: opts.Default, PrivateDirect: opts.PrivateDirect},
+		parse:          opts.Parse,
+		log:            logger,
+		obs:            obs,
+		now:            now,
+		onChange:       opts.OnChange,
+		fetch:          resolveFetchConfig(opts),
 	}
 
 	empty, err := routing.NewEngine(nil, p.opts)
@@ -408,6 +415,15 @@ func (p *Provider) attempt(ctx context.Context) error {
 	if err != nil {
 		p.recordError(err)
 		return err
+	}
+	// 内容钉扎：摘要不一致与拉取失败同语义（保留现有规则、计错误、
+	// 不切换内容），防止规则源被静默篡改。
+	if p.expectedSHA256 != "" {
+		if got := hashOf(data); got != p.expectedSHA256 {
+			err := fmt.Errorf("content sha256 mismatch: got %s, want %s", got, p.expectedSHA256)
+			p.recordError(err)
+			return err
+		}
 	}
 	rules, err := p.parse(data)
 	if err != nil {

@@ -2,6 +2,8 @@ package ruleset
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -480,17 +482,19 @@ func TestFetchRulesConstraints(t *testing.T) {
 
 func TestSpecOf(t *testing.T) {
 	cases := []struct {
-		file, url string
-		interval  time.Duration
-		want      Spec
+		file, url, sha256 string
+		interval          time.Duration
+		want              Spec
 	}{
-		{"", "", 0, Spec{}},
-		{"/tmp/rules.yaml", "", 0, Spec{Kind: SourceFile, Target: "/tmp/rules.yaml"}},
-		{"", "https://r.test/r.yaml", time.Minute, Spec{Kind: SourceURL, Target: "https://r.test/r.yaml", Interval: time.Minute}},
+		{"", "", "", 0, Spec{}},
+		{"/tmp/rules.yaml", "", "", 0, Spec{Kind: SourceFile, Target: "/tmp/rules.yaml"}},
+		{"", "https://r.test/r.yaml", "", time.Minute, Spec{Kind: SourceURL, Target: "https://r.test/r.yaml", Interval: time.Minute}},
+		{"", "https://r.test/r.yaml", strings.Repeat("ab", 32), time.Minute,
+			Spec{Kind: SourceURL, Target: "https://r.test/r.yaml", Interval: time.Minute, SHA256: strings.Repeat("ab", 32)}},
 	}
 	for _, tc := range cases {
-		if got := SpecOf(tc.file, tc.url, tc.interval); got != tc.want {
-			t.Fatalf("SpecOf(%q, %q, %v) = %+v, want %+v", tc.file, tc.url, tc.interval, got, tc.want)
+		if got := SpecOf(tc.file, tc.url, tc.sha256, tc.interval); got != tc.want {
+			t.Fatalf("SpecOf(%q, %q, %q, %v) = %+v, want %+v", tc.file, tc.url, tc.sha256, tc.interval, got, tc.want)
 		}
 	}
 }
@@ -555,5 +559,120 @@ func TestRefreshLoopSurvivesGenerationCancel(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if got := tr.requests(); got != frozen {
 		t.Fatalf("fetches after Close = %d, want frozen at %d", got, frozen)
+	}
+}
+
+// sha256HexOf 计算内容 SHA-256 摘要（hex），供钉扎用例构造期望值。
+func sha256HexOf(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestURLSourceSHA256Pinning 验证内容钉扎：摘要匹配正常加载；内容被篡改
+// （摘要不匹配）按刷新失败语义处理——保留现有规则、计错误、不切换内容。
+func TestURLSourceSHA256Pinning(t *testing.T) {
+	want := sha256HexOf(rulesV1)
+	tr := &fakeTransport{status: 200, body: rulesV1}
+	obs := &fakeObserver{}
+	p, err := New(Options{
+		URL:             "http://rules.test/rules.yaml",
+		ExpectedSHA256:  want,
+		RefreshInterval: 10 * time.Millisecond,
+		Parse:           testParse,
+		Default:         core.RouteProxy,
+		Logger:          discardLogger(),
+		Observer:        obs,
+		fetchClient:     &http.Client{Transport: tr},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer p.Close()
+
+	// 摘要匹配：初始加载成功，引擎生效；Spec 记录钉扎摘要（热加载复用判定）。
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
+		t.Fatalf("pinned load failed: decide = %v", got)
+	}
+	if p.Spec().SHA256 != want {
+		t.Fatalf("Spec.SHA256 = %q, want %q", p.Spec().SHA256, want)
+	}
+
+	// 内容被篡改：attempt 记录摘要不匹配错误，现有规则保留（Recheck 对
+	// URL 源容错吞错，只留告警与错误状态）。
+	tr.set(200, rulesV2)
+	if err := p.attempt(context.Background()); err == nil || !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("err = %v, want sha256 mismatch", err)
+	}
+	if got := p.Decide("a.example.com"); got != core.RouteDirect {
+		t.Fatalf("rules replaced despite pinning: decide = %v", got)
+	}
+	snap := p.Snapshot()
+	if snap.LastError == "" || strings.Contains(snap.LastError, "boom") {
+		t.Fatalf("snapshot last error = %q, want mismatch reason", snap.LastError)
+	}
+
+	// 周期刷新同样按失败语义：计数错误且不换内容（保持现有规则）。
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.Start(ctx)
+	waitFor(t, 3*time.Second, "refresh errors counted", func() bool {
+		return obs.refreshCount(RefreshError) >= 2
+	})
+	if got := p.Decide("a.example.net"); got != core.RouteProxy {
+		t.Fatalf("tampered content leaked into engine: decide = %v", got)
+	}
+	p.Close()
+
+	// 恢复匹配内容：刷新恢复成功，错误状态清空。
+	tr.set(200, rulesV1)
+	if err := p.Recheck(context.Background()); err != nil {
+		t.Fatalf("recheck after restore: %v", err)
+	}
+	if snap := p.Snapshot(); snap.LastError != "" {
+		t.Fatalf("last error not cleared after restore: %q", snap.LastError)
+	}
+}
+
+// TestRulesRedirectChecker 验证 https-only 护栏（CheckRedirect）：重定向到
+// 非环回明文 http 被拒绝（拦 https → http 降级）；环回 http 重定向豁免
+// （本地演示）；并保留缺省的 10 跳上限。
+func TestRulesRedirectChecker(t *testing.T) {
+	mkreq := func(raw string) *http.Request {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, raw, nil)
+		if err != nil {
+			t.Fatalf("new request %s: %v", raw, err)
+		}
+		return req
+	}
+
+	// 非环回明文 http：拒绝。
+	for _, raw := range []string{"http://evil.test/rules.yaml", "http://10.0.0.5:8080/rules.yaml"} {
+		err := rulesRedirectChecker(mkreq(raw), nil)
+		if err == nil || !strings.Contains(err.Error(), "redirect to plain http is only allowed for loopback addresses") {
+			t.Fatalf("%s: err = %v, want plain-http redirect rejection", raw, err)
+		}
+	}
+
+	// 环回 http：豁免。
+	for _, raw := range []string{"http://127.0.0.1:1/rules.yaml", "http://localhost:8081/rules.yaml", "http://[::1]:8081/rules.yaml"} {
+		if err := rulesRedirectChecker(mkreq(raw), nil); err != nil {
+			t.Fatalf("%s: loopback redirect rejected: %v", raw, err)
+		}
+	}
+
+	// https 重定向：不受影响。
+	if err := rulesRedirectChecker(mkreq("https://rules.test/rules.yaml"), nil); err != nil {
+		t.Fatalf("https redirect rejected: %v", err)
+	}
+
+	// 10 跳上限保留。
+	via := make([]*http.Request, maxRedirects)
+	for i := range via {
+		via[i] = mkreq("https://rules.test/rules.yaml")
+	}
+	err := rulesRedirectChecker(mkreq("https://rules.test/rules.yaml"), via)
+	if err == nil || !strings.Contains(err.Error(), "stopped after 10 redirects") {
+		t.Fatalf("err = %v, want redirect limit", err)
 	}
 }

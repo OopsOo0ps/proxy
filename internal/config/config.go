@@ -12,6 +12,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -218,6 +219,9 @@ type Ruleset struct {
 	// Interval 是 url 源的刷新周期；缺省 defaults.RulesetRefreshInterval，
 	// 仅对 url 源有效（显式给出时必须 > 0）。
 	Interval *Duration `yaml:"interval,omitempty"`
+	// SHA256 是可选的内容钉扎摘要（64 位 hex；空 = 不钉扎），仅对 url 源
+	// 有效：拉取内容摘要与它不一致时按刷新失败处理（保留现有规则）。
+	SHA256 string `yaml:"sha256,omitempty"`
 }
 
 // EffectiveInterval 返回 url 源的刷新周期（缺省 30m）。
@@ -783,6 +787,9 @@ func (r Ruleset) validate() error {
 		if r.Interval != nil && r.Interval.Std() <= 0 {
 			return errors.New("interval: must be positive (the default refresh interval applies when omitted)")
 		}
+		if r.SHA256 != "" && !isHex64(r.SHA256) {
+			return errors.New("sha256: must be a 64-character hex digest")
+		}
 	case "file":
 		if r.URL != "" {
 			return errors.New("file source: url is not allowed (use path)")
@@ -792,6 +799,9 @@ func (r Ruleset) validate() error {
 		}
 		if r.Interval != nil {
 			return errors.New("interval only applies to url sources")
+		}
+		if r.SHA256 != "" {
+			return errors.New("sha256 only applies to url sources")
 		}
 	default:
 		return fmt.Errorf("unknown type %q: want url or file", r.Type)
@@ -959,7 +969,38 @@ func validateRulesURL(raw string) error {
 	if u.Host == "" {
 		return fmt.Errorf("missing host in %q", raw)
 	}
+	// https-only 护栏：明文 http 仅允许环回地址（本地演示）；远程规则源
+	// 一律要求 https，避免规则内容被明文篡改。
+	if u.Scheme == "http" && !isLoopbackHost(u.Host) {
+		return fmt.Errorf("plain http is only allowed for loopback addresses (got %q); use https", raw)
+	}
 	return nil
+}
+
+// isLoopbackHost 判断 URL 的 Host（可能含端口、IPv6 需去括号）是否指向
+// 本机环回。无法确认（主机名，localhost 除外）时按非环回处理（fail-closed）。
+func isLoopbackHost(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+// isHex64 判断 s 是否恰为 64 个十六进制字符（sha256 摘要形状）。
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // validateListenAddr 校验 host:port 形式的监听地址（允许空 host 与端口 0）。

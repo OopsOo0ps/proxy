@@ -30,6 +30,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/relay"
 	"github.com/OopsOo0ps/proxy/internal/session"
 	"github.com/OopsOo0ps/proxy/internal/shutdown"
+	"github.com/OopsOo0ps/proxy/internal/throttle"
 )
 
 // TargetDialer 建立到目标的连接（由路由与出口节点决定直连或经隧道）。
@@ -83,9 +84,23 @@ type Server struct {
 	ReadHeaderTimeout time.Duration
 	// ShutdownTimeout 关停时等待存量请求结束的最长时间，默认 defaults.DrainTimeout。
 	ShutdownTimeout time.Duration
+	// Throttle 是认证失败的按 IP 指数退避器；nil = 使用包级默认实例
+	//（100ms 起、2s 封顶、容量 4096），开箱即用；测试可注入自定义实例。
+	Throttle *throttle.IPThrottle
 
 	handlerMu sync.Mutex
 	handler   *handler // Serve 启动后写入；CloseIdleConnections 读取
+}
+
+// defaultThrottle 是缺省的认证退避器（nil Throttle 时共用）。
+var defaultThrottle = throttle.NewDefaultIPThrottle()
+
+// throttleNow 返回生效的退避器（Throttle 优先，缺省默认实例）。
+func (s *Server) throttleNow() *throttle.IPThrottle {
+	if s.Throttle != nil {
+		return s.Throttle
+	}
+	return defaultThrottle
 }
 
 // CloseIdleConnections 丢弃转发路径（绝对地址请求）的空闲上游连接。
@@ -215,7 +230,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// accept（net/http 接受）后即计（active +1）；终态由 ConnDone / ConnRejected 配对回收。
 	tel.ConnOpened(core.ProtoHTTP)
 
-	if !h.authorize(w, r, logger) {
+	if !h.authorize(w, r, logger, clientIP) {
 		// 未进入服务即被拒（认证失败）：按拒绝计，无路由维度。
 		tel.ConnRejected(core.ProtoHTTP, core.ResultDenied)
 		return
@@ -228,8 +243,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveForward(w, r, logger, start, reqID, clientIP)
 }
 
-// authorize 校验代理认证；失败时返回 407（固定文案，不泄露内部信息）。
-func (h *handler) authorize(w http.ResponseWriter, r *http.Request, logger *slog.Logger) bool {
+// authorize 校验代理认证；失败时先按来源 IP 指数退避（有界），再返回
+// 407（固定文案，不泄露内部信息）。认证成功清除该 IP 的失败记录。
+func (h *handler) authorize(w http.ResponseWriter, r *http.Request, logger *slog.Logger, clientIP string) bool {
 	store := h.srv.authNow()
 	if store == nil {
 		return true
@@ -237,10 +253,15 @@ func (h *handler) authorize(w http.ResponseWriter, r *http.Request, logger *slog
 	username, password, ok := parseBasicAuth(r.Header.Get("Proxy-Authorization"))
 	if !ok || !store.Authenticate(username, password) {
 		logger.Warn("proxy authentication failed")
+		// 认证失败：按 IP 指数退避（有界）后再回 407，抑制口令爆破。
+		if d := h.srv.throttleNow().Delay(clientIP); d > 0 {
+			time.Sleep(d)
+		}
 		w.Header().Set("Proxy-Authenticate", `Basic realm="proxy"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return false
 	}
+	h.srv.throttleNow().Success(clientIP)
 	return true
 }
 

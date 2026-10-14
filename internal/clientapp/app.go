@@ -224,9 +224,15 @@ func buildTransport(n config.Node, dialTimeout, handshakeTimeout time.Duration) 
 // clientTLSConfig 从协议参数组装 TLS 客户端配置（CA 信任与 SNI 是 trojan
 // 传输的协议素材；SNI 为空时由 crypto/tls 取拨号地址主机名）。
 func clientTLSConfig(p trojan.Params) (*tls.Config, error) {
+	// 护栏：insecure-skip-verify 仅允许环回地址（本地自签演示场景）；远程
+	// 节点 fail-closed——必须改用 ca-file 做证书校验。复用 config 的
+	// IsLoopbackListen 从严语义：主机名（localhost 除外）一律按非环回处理。
+	if p.InsecureSkipVerify && !config.IsLoopbackListen(p.Addr) {
+		return nil, fmt.Errorf("insecure-skip-verify is only allowed for loopback addresses (got %q); configure ca-file instead", p.Addr)
+	}
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: p.InsecureSkipVerify, // 仅测试 / 自签调试
+		InsecureSkipVerify: p.InsecureSkipVerify, // 仅环回自签调试
 	}
 	if p.SNI != "" {
 		tlsCfg.ServerName = p.SNI
@@ -448,10 +454,11 @@ func (b *builder) buildRouting(cfg *config.Config, reuse *Runtime) (*routeTable,
 				return nil, nil, err
 			}
 		} else {
-			file, url, interval := rulesetSourceOf(&rs)
+			file, url, sha256, interval := rulesetSourceOf(&rs)
 			prov, err = ruleset.New(ruleset.Options{
 				FilePath:        file,
 				URL:             url,
+				ExpectedSHA256:  sha256,
 				RefreshInterval: interval,
 				Parse:           config.ParseRules,
 				Default:         inlineDefault(cfg.Routing),
@@ -493,16 +500,16 @@ func inlineDefault(r *config.Routing) core.RouteAction {
 
 // rulesetSpecOf 把规则源配置映射为 ruleset 的 Spec（复用判定依据）。
 func rulesetSpecOf(rs *config.Ruleset) ruleset.Spec {
-	file, url, interval := rulesetSourceOf(rs)
-	return ruleset.SpecOf(file, url, interval)
+	file, url, sha256, interval := rulesetSourceOf(rs)
+	return ruleset.SpecOf(file, url, sha256, interval)
 }
 
 // rulesetSourceOf 把规则源配置映射为 ruleset 的来源参数。
-func rulesetSourceOf(rs *config.Ruleset) (file, url string, interval time.Duration) {
+func rulesetSourceOf(rs *config.Ruleset) (file, url, sha256 string, interval time.Duration) {
 	if rs.Type == "file" {
-		return rs.Path, "", 0
+		return rs.Path, "", "", 0
 	}
-	return "", rs.URL, rs.EffectiveInterval()
+	return "", rs.URL, rs.SHA256, rs.EffectiveInterval()
 }
 
 // buildOutbound 构建出口链路（节点池 + 预热池）；未配置节点时保持 nil

@@ -423,6 +423,37 @@ routing:
 	}
 }
 
+// TestRulesetsHTTPSLockAndSHA256 验证规则源的 https-only 护栏与 sha256
+// 钉扎字段：明文 http 仅环回地址可用；sha256 须为 64 位 hex 且仅 url 源。
+func TestRulesetsHTTPSLockAndSHA256(t *testing.T) {
+	base := `
+inbounds: [{ type: http, listen: "127.0.0.1:8080" }]
+outbound: { nodes: [{ name: a, protocol: trojan }] }
+routing:
+  rulesets:
+`
+	// 非环回明文 http 拒绝。
+	mustFail(t, base+"    - { name: a, url: \"http://example.com/rules.yaml\" }\n", clientProtocols, "plain http is only allowed for loopback addresses")
+	mustFail(t, base+"    - { name: a, url: \"http://10.0.0.5:8080/rules.yaml\" }\n", clientProtocols, "plain http is only allowed for loopback addresses")
+
+	// 环回明文 http 豁免（本地演示）。
+	for _, url := range []string{"http://127.0.0.1:8080/rules.yaml", "http://localhost:8080/rules.yaml", "http://[::1]:8080/rules.yaml"} {
+		mustParse(t, base+"    - { name: a, url: \""+url+"\" }\n", clientProtocols)
+	}
+
+	// sha256 形状校验：仅接受 64 位 hex。
+	digest := "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+	mustFail(t, base+"    - { name: a, url: \"https://example.com/rules.yaml\", sha256: \"nothex\" }\n", clientProtocols, "sha256: must be a 64-character hex digest")
+	mustFail(t, base+"    - { name: a, url: \"https://example.com/rules.yaml\", sha256: \""+digest+"ff\" }\n", clientProtocols, "sha256: must be a 64-character hex digest")
+	mustFail(t, base+"    - { name: a, type: file, path: rules.yaml, sha256: \""+digest+"\" }\n", clientProtocols, "sha256 only applies to url sources")
+
+	// 合法钉扎摘要被解析保留。
+	cfg := mustParse(t, base+"    - { name: a, url: \"https://example.com/rules.yaml\", sha256: \""+digest+"\" }\n", clientProtocols)
+	if got := cfg.Routing.Rulesets[0].SHA256; got != digest {
+		t.Fatalf("ruleset sha256 = %q, want %q", got, digest)
+	}
+}
+
 func TestRoutingDNSValidation(t *testing.T) {
 	base := `
 inbounds:
