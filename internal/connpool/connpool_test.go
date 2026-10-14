@@ -691,3 +691,67 @@ func BenchmarkClaimHit(b *testing.B) {
 		_ = conn
 	}
 }
+
+// TestRefillAndCleanLoopSurviveGenerationCancel 钉住 B-1 契约：池的后台任务
+// 绑定首次 Start 传入的应用级 ctx，寿命由 Close 终结——代际 ctx（其子 ctx）
+// 取消后 cleanLoop 仍淘汰过期空闲连接、refill 仍能补到 MaxIdle（热加载复用
+// 实例的后台循环不随 gen.cancel() 停摆）；重复 Start（restore 浅拷贝路径）
+// 被忽略（首次调用生效）；Close 后拨号计数冻结。
+func TestRefillAndCleanLoopSurviveGenerationCancel(t *testing.T) {
+	var dials atomic.Int64
+	node := Node{
+		Addr: "n1",
+		Dial: func(ctx context.Context) (net.Conn, error) {
+			dials.Add(1)
+			if err := ctx.Err(); err != nil {
+				return nil, err // 真实拨号会因 ctx 取消而失败
+			}
+			client, server := net.Pipe()
+			_ = server.Close()
+			return client, nil
+		},
+		Start: func(context.Context, net.Conn, core.Target) error { return nil },
+	}
+	p, err := New([]Node{node}, Options{MaxIdle: 2, IdleTTL: 100 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := context.Background()           // 应用级 ctx（startResources 绑定它）
+	_, gcancel := context.WithCancel(parent) // 代际 ctx（Start 不接收它：池绑定应用级 ctx）
+
+	p.Start(parent)
+	waitIdle(t, p, "n1", 2)
+
+	// 代际结束：cleanLoop 仍淘汰过期空闲连接（TTL 100ms，清理周期 250ms）。
+	gcancel()
+	waitIdle(t, p, "n1", 0)
+
+	// 代际取消后领取未命中：refill 仍以存活的池 ctx 补到 MaxIdle。
+	before := dials.Load()
+	if _, ok := p.Claim(context.Background(), "n1", core.Target{Host: "example.com", Port: 443}); ok {
+		t.Fatal("empty pool should miss")
+	}
+	waitIdle(t, p, "n1", 2)
+	if dials.Load() <= before {
+		t.Fatal("refill did not dial after generation cancel")
+	}
+
+	// 重复 Start（restore 浅拷贝路径）：首次调用生效，不替换池 ctx、
+	// 不重建清理循环。
+	ctxBefore := p.ctx
+	gctx2, gcancel2 := context.WithCancel(parent)
+	defer gcancel2()
+	p.Start(gctx2)
+	if p.ctx != ctxBefore {
+		t.Fatal("重复 Start 替换了池 ctx（应首次调用生效）")
+	}
+
+	// Close 后拨号计数冻结、空闲连接清空。
+	p.Close()
+	frozen := dials.Load()
+	waitIdle(t, p, "n1", 0)
+	time.Sleep(100 * time.Millisecond)
+	if got := dials.Load(); got != frozen {
+		t.Fatalf("dials after Close = %d, want frozen at %d", got, frozen)
+	}
+}

@@ -211,6 +211,63 @@ func TestReloadAppliesHealthCheckConfig(t *testing.T) {
 	}
 }
 
+// TestReloadKeepsReusedPoolHealthLoopRunning 验证热加载复用组件的后台循环
+// 不停摆：Reload 只改日志级别（节点池指纹不变 → 池被复用，指针复用已有
+// TestReloadReusesOrRebuildsUpstreamPools 覆盖），复用实例的健康探测循环
+// 必须继续按周期探测——后台资源绑定应用级 ctx，寿命 = 实例寿命，由 Close
+// 终结，不随代际结束而停止。
+func TestReloadKeepsReusedPoolHealthLoopRunning(t *testing.T) {
+	stable := startServer(t, "stable-secret", nil, false)
+
+	cfg := baseClientCfg([]config.Node{trojanNode(t, "stable", stable.addr, "stable-secret")})
+	cfg.API.Listen = "127.0.0.1:0"
+	cfg.Outbound.Pool = config.PoolConfig{
+		Prewarm: config.PrewarmConfig{Size: intPtr(1), TTL: config.Duration(30 * time.Second)},
+		Health: config.HealthConfig{
+			Interval:  durationPtr(100 * time.Millisecond),
+			Timeout:   config.Duration(300 * time.Millisecond),
+			Failures:  intPtr(2),
+			Successes: intPtr(2),
+		},
+	}
+	app := startClient(t, cfg, nil)
+
+	// 探测循环已运转：稳定节点的成功探测计数开始增长。
+	probeSeries := `upstream_health_probes_total{node="` + stable.addr + `",result="success"}`
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if metricSeriesValue(t, app.MetricsAddr(), probeSeries) > 0 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if metricSeriesValue(t, app.MetricsAddr(), probeSeries) == 0 {
+		t.Fatal("health probe loop did not start")
+	}
+
+	// Reload 只改日志级别：不得触碰 health/pool/nodes（保证指纹不变 → 池复用）。
+	next := cloneCfg(cfg)
+	next.Log.Level = "info"
+	if err := app.Reload(next); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+
+	// 基线在 Reload 返回后取：validate-then-swap 语义下旧配置在切换前持续
+	// 生效，切换瞬间最后一轮探测结果可能仍落在 Reload 返回之前。
+	baseline := metricSeriesValue(t, app.MetricsAddr(), probeSeries)
+
+	// ≥1s 观察窗口内两次采样，计数必须严格增长：复用实例的探测循环
+	// 绑定应用级 ctx，不随旧代际取消而停摆。
+	time.Sleep(400 * time.Millisecond)
+	first := metricSeriesValue(t, app.MetricsAddr(), probeSeries)
+	time.Sleep(700 * time.Millisecond)
+	second := metricSeriesValue(t, app.MetricsAddr(), probeSeries)
+	if second <= first {
+		t.Fatalf("探测循环在热加载后停摆：baseline=%d first=%d second=%d（窗口内计数应严格增长）",
+			baseline, first, second)
+	}
+}
+
 // TestReloadFailureKeepsOldConfig 验证“配置错误不炸线上”：
 // 解析校验失败（模拟 main 的加载路径）与构建失败（规则文件缺失）
 // 都不会改变运行中的配置，服务持续可用。

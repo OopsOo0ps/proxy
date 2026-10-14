@@ -95,8 +95,13 @@ func newInboundServer(proto string, ic config.Inbound) InboundServer {
 }
 
 // startResources 启动快照的后台资源（预热池、健康探测、规则源刷新）。
-// 各组件 Start 幂等；同一 Runtime 实例至多启动一次（restore 路径使用
-// 浅拷贝，天然获得新的启动状态）。
+//
+// 成文契约：后台资源绑定应用级 ctx（startGeneration 传入 parent），生命周期
+// 由 Close（closeResources）终结，不随代际结束而停止。各组件 Start 幂等
+// （首次调用生效，重复 Start 的 ctx 参数被忽略），因此 restore 回滚路径的
+// 浅拷贝共享同一 pool / provider 实例是安全的——重复 Start 不会重建循环。
+// 被替换实例由 releaseReplaced 显式 Close，新实例由 switchTo 以应用级 ctx
+// 启动。
 func (r *Runtime) startResources(ctx context.Context) {
 	r.pool.Start(ctx)
 	for _, p := range r.providers {
