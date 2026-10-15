@@ -30,8 +30,10 @@ var Layers = map[string]int{
 	// L2 领域引擎
 	"routing": 2, "ruleset": 2, "nodes": 2, "connpool": 2, "dialer": 2,
 	"accounts": 2, // 账户聚合（动态用户/订阅存储 + 门禁视图）：HTTP-free / core-free 领域包
+	"alipay":   2, // 支付宝线格式方言 owner（RSA2 编解码/签名 + 网关客户端）：stdlib-only，零模块内依赖
 	// L3 协议端点
 	"httpproxy": 3, "socks5": 3, "dnsgw": 3, "trojan": 3,
+	"alipaymock": 3, // 假支付宝网关（收银台页 + 验签 + 发签名 notify）：复用 alipay 编解码的协议端点，与 trojan 同类
 	// L4 组装/面/守护
 	"config": 4, "clientapp": 4, "serverapp": 4, "metrics": 4,
 	"status": 4, "testutil": 4,
@@ -39,6 +41,7 @@ var Layers = map[string]int{
 	"arch":    4, // 守护包自身：零内部依赖，登记以纳入完备性管理
 	// L5 入口
 	"cmd/client": 5, "cmd/server": 5, "test/integration": 5,
+	"cmd/mockpay": 5, // 假支付宝二进制：宿主 alipaymock + 自有最小配置（旗标，不走 config 主 schema）
 }
 
 // SameLayerEdges 是受控同层边：键为源包，值为允许它同层依赖的包。
@@ -76,4 +79,10 @@ var ProtocolPkgs = map[string][]string{
 	// accounts 是领域词汇（非线格式协议）：触达面 = 自身 + 两个组装根/控制面
 	//（clientapp 随客户端门禁迭代再扩；test/integration 走 HTTP 黑盒零 import）。
 	"accounts": {"accounts", "serverapp", "control"},
+	// alipay 是线格式方言词汇：触达面 = 自身 + 假网关 alipaymock + 控制面 +
+	// mockpay 二进制 + 黑盒集成；数据面 L0–L3 不得触达。
+	"alipay": {"alipay", "alipaymock", "control", "cmd/mockpay", "test/integration"},
+	// alipaymock 是假网关的 HTTP 面（迭代②）：触达面 = 自身 + 假件宿主
+	// cmd/mockpay + 控制面（迭代③）+ 黑盒集成；数据面 L0–L3 不得触达。
+	"alipaymock": {"alipay", "alipaymock", "control", "cmd/mockpay", "test/integration"},
 }
