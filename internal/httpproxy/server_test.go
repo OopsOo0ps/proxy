@@ -16,10 +16,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/auth"
+	"github.com/OopsOo0ps/proxy/internal/connlimit"
 	"github.com/OopsOo0ps/proxy/internal/core"
 )
 
@@ -878,4 +880,122 @@ func TestCloseIdleConnectionsNilSafe(t *testing.T) {
 	var s *Server
 	s.CloseIdleConnections()
 	(&Server{}).CloseIdleConnections()
+}
+
+// TestServeIdleKeepAliveReleased 验证转发路径（net/http）的 keep-alive 空闲
+// 连接会在 IdleTimeout 后被回收并归还 connlimit 名额：与 CONNECT 隧道共用
+// 同一份并发预算时，一条闲置的 keep-alive 连接不能永久占坑。
+func TestServeIdleKeepAliveReleased(t *testing.T) {
+	// 上游目标：一个普通 HTTP 服务，供绝对地址请求转发。
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello from target"))
+	}))
+	defer target.Close()
+
+	store, err := auth.NewStore([]auth.User{{Username: "u", Password: "p"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 名额只有 1：第一条 keep-alive 连接占用期间，第二条必须被拒绝/搁置；
+	// 空闲回收后名额归还，第二条才能被接受。
+	limiter := connlimit.New(1)
+	wrapped := connlimit.WrapListener(ln, limiter, nil)
+
+	srv := &Server{
+		Auth:        store,
+		Dialer:      echoDialer(t),
+		IdleTimeout: 300 * time.Millisecond,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(ctx, wrapped) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Serve returned %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("Serve did not stop")
+		}
+	})
+
+	cred := base64.StdEncoding.EncodeToString([]byte("u:p"))
+	sendForwardRequest := func(t *testing.T, conn net.Conn) {
+		t.Helper()
+		req := fmt.Sprintf("GET %s/ HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: Basic %s\r\n\r\n",
+			target.URL, strings.TrimPrefix(target.URL, "http://"), cred)
+		if _, err := conn.Write([]byte(req)); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+		if body := readAll(t, resp.Body); body != "hello from target" {
+			t.Fatalf("body = %q", body)
+		}
+	}
+
+	// 第一条连接：完成一次带认证的绝对地址请求后保持打开（不置 Connection: close）。
+	first, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = first.Close() }()
+	sendForwardRequest(t, first)
+
+	// 名额被第一条连接占用：第二条此时不应被服务（可能被拒或被搁置）。
+	blocked, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocked.Close() }()
+	_ = blocked.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := blocked.Write([]byte("GET http://ignored/ HTTP/1.1\r\nHost: ignored\r\n\r\n")); err != nil {
+		t.Fatalf("write blocked request: %v", err)
+	}
+	if resp, err := http.ReadResponse(bufio.NewReader(blocked), nil); err == nil {
+		// 被拒绝是允许的结局（直接关闭或 503），但绝不能给出正常代理响应。
+		if resp.StatusCode == http.StatusOK {
+			t.Fatal("second connection served while quota is held by idle keep-alive conn")
+		}
+		_ = resp.Body.Close()
+	}
+
+	// 空闲回收：约 300ms（IdleTimeout）后服务端应关闭该 keep-alive 连接。
+	// 断言"最终关闭"而非精确时刻，避免 CI 抖动。
+	_ = first.SetReadDeadline(time.Now().Add(2 * time.Second))
+	deadline := time.Now().Add(2 * time.Second)
+	buf := make([]byte, 1)
+	for {
+		_, err := first.Read(buf)
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, syscall.ECONNRESET) {
+				break
+			}
+			t.Fatalf("expected idle close (EOF/reset) within deadline, got %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("keep-alive connection not closed after idle timeout")
+		}
+	}
+
+	// 名额已归还：第二条连接应能被正常服务。
+	second, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close() }()
+	sendForwardRequest(t, second)
 }

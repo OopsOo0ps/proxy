@@ -49,8 +49,10 @@ const (
 	// 与配置层文档化缺省同源（internal/defaults.DNSTimeout）。
 	DefaultTimeout = defaults.DNSTimeout
 
-	// maxUDPPayload 是收发的 UDP 报文上限（覆盖 EDNS0 常用缓冲 4096）。
-	maxUDPPayload = 4096
+	// maxUDPPayload 是收发的 UDP 报文上限。UDP 载荷理论上限 65507；抬到
+	// 65535 以消除读侧静默截断（serveUDP 读客户端查询与 exchangeUDP 读
+	// 上游响应用同一常量）。
+	maxUDPPayload = 65535
 
 	// rejectReadTimeout 是过载拒绝路径读取首帧（并写回 REFUSED）的期限：
 	// 慢客户端 / 洪水连接不得卡住拒绝路径，超时后直接关闭。
@@ -330,9 +332,22 @@ func (s *Server) serveUDP(ctx context.Context, pc *net.UDPConn, wg *sync.WaitGro
 			defer wg.Done()
 			// 名额覆盖 handleQuery + 写回全程：查询完全结束才归还。
 			defer s.queryLimiter.Release()
-			resp := s.handleQuery(ctx, payload, net.UDPAddrFromAddrPort(from))
+			resp, q := s.handleQuery(ctx, payload, net.UDPAddrFromAddrPort(from))
 			if resp == nil {
 				return
+			}
+			// 写回侧截断（P2-9）：上游响应超出客户端声明的 UDP 上限时不静默
+			// 裁剪，改回 TC=1 的最小响应（头部 + 问题段），客户端按 RFC 1035
+			// 自行改走 TCP。查询本身成功，result 仍记 ok，不新增标签值。
+			if len(resp) > q.udpLimit {
+				upstreamBytes := len(resp)
+				resp = truncateForClient(resp, &q)
+				s.log().Info("dns gateway: response truncated to client udp limit",
+					"client_ip", netutil.RemoteIP(net.UDPAddrFromAddrPort(from)),
+					"response_bytes", upstreamBytes,
+					"udp_limit", q.udpLimit,
+					"truncated", true,
+				)
 			}
 			_ = pc.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			_, _ = pc.WriteToUDPAddrPort(resp, from)
@@ -373,7 +388,7 @@ func (s *Server) handleTCPConn(ctx context.Context, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		resp := s.handleQuery(ctx, payload, conn.RemoteAddr())
+		resp, _ := s.handleQuery(ctx, payload, conn.RemoteAddr())
 		if resp == nil {
 			// 非查询报文：不再等待同连接上的后续查询。
 			return
@@ -406,8 +421,10 @@ func RejectOverload(conn net.Conn) {
 	_ = writeFrame(conn, errorResponseEcho(q, rcodeRefused))
 }
 
-// handleQuery 处理一条查询并返回响应报文；resp 为 nil 表示不响应（静默丢弃）。
-func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr) []byte {
+// handleQuery 处理一条查询并返回响应报文与解析后的查询；resp 为 nil 表示
+// 不响应（静默丢弃）。报文无法解析时返回的 query 为零值形状（udpLimit 已
+// 按缺省 512 补齐，见 parseQuery）。
+func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr) ([]byte, query) {
 	start := time.Now()
 	logger := s.log().With(
 		"request_id", logging.NewRequestID(),
@@ -417,7 +434,7 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 
 	q, err := parseQuery(payload)
 	if err != nil {
-		return s.handleInvalid(logger, payload, err, start)
+		return s.handleInvalid(logger, payload, err, start), q
 	}
 
 	route := s.routerNow().Decide(core.Target{Host: q.name})
@@ -442,7 +459,7 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 			"duration", elapsed.Round(time.Microsecond).String(),
 			"duration_ms", elapsed.Milliseconds(),
 		)
-		return errorResponseEcho(q, rcodeRefused)
+		return errorResponseEcho(q, rcodeRefused), q
 	default:
 		resp, upstream, err = s.queryRemote(ctx, q)
 	}
@@ -466,7 +483,7 @@ func (s *Server) handleQuery(ctx context.Context, payload []byte, from net.Addr)
 		"duration_ms", elapsed.Milliseconds(),
 		"result", result,
 	)
-	return resp
+	return resp, q
 }
 
 // handleInvalid 处理无法转发的报文：响应报文静默丢弃；其它按错误分类回
