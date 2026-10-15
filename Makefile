@@ -54,7 +54,7 @@ GOLANGCI_LINT_VERSION ?= v2.14.0
 GOLANGCI_LINT_BASE    ?= https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(TOOL_DIR)/golangci-lint
 
-.PHONY: all build test cover bench lint fmt vet run run-server run-client dev-cert \
+.PHONY: all build test cover bench lint fmt vet run run-server run-client dev-cert dev-keys \
 	version demo demo-up demo-check demo-down \
 	docker-build docker-build-debug clean help
 
@@ -64,6 +64,7 @@ build:
 	@mkdir -p $(BIN_DIR)
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-server ./cmd/server
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/proxy-client ./cmd/client
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/mockpay ./cmd/mockpay
 
 version: build
 	@$(BIN_DIR)/proxy-server -version
@@ -126,6 +127,20 @@ dev-cert:
 		-days 365 -nodes -subj "/CN=localhost" \
 		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
 	@echo "已生成 var/dev-cert.pem 与 var/dev-key.pem"
+
+# 生成支付宝 RSA2 测试密钥对到 var/（mock 收单闭环用；var/ 已 gitignore，永不提交）。
+# 一套两对，对应真实对接的两个签名方向：
+#   商户密钥对   —— proxy 侧签名 alipay.trade.page.pay 请求 / 网关侧验签；
+#   支付宝密钥对 —— 网关侧签名异步通知 / proxy 侧验签（VerifyNotify）。
+dev-keys:
+	@mkdir -p var
+	openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out var/alipay-merchant-key.pem
+	openssl pkey -in var/alipay-merchant-key.pem -pubout -out var/alipay-merchant-pub.pem
+	openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out var/alipay-gateway-key.pem
+	openssl pkey -in var/alipay-gateway-key.pem -pubout -out var/alipay-gateway-pub.pem
+	@echo "已生成支付宝测试密钥（RSA2 2048，PKCS#8 PEM）："
+	@echo "  商户   var/alipay-merchant-key.pem + var/alipay-merchant-pub.pem（请求签名 / 网关验签）"
+	@echo "  支付宝 var/alipay-gateway-key.pem + var/alipay-gateway-pub.pem（通知签名 / 客户端验签）"
 
 # ---- 本地三节点演示 ----------------------------------------------------------
 # demo       一条命令跑通：构建 → 启动 3 节点 + 客户端 → 四项验证（进程保持运行）。
@@ -230,7 +245,7 @@ clean:
 help:
 	@printf '%s\n' \
 		'可用目标：' \
-		'  build           构建全部二进制到 bin/' \
+		'  build           构建全部二进制到 bin/（proxy-server / proxy-client / mockpay）' \
 		'  version         构建并打印两个二进制的版本信息' \
 		'  test            运行全部单元测试' \
 		'  cover           运行测试并打印总覆盖率' \
@@ -246,6 +261,7 @@ help:
 		'  run-server      前台运行 proxy-server（SERVER_CONFIG= 覆盖配置）' \
 		'  run-client      前台运行 proxy-client（CLIENT_CONFIG= 覆盖配置）' \
 		'  dev-cert        生成本地演示用自签证书到 var/' \
+		'  dev-keys        生成支付宝 RSA2 测试密钥对（商户 + 网关）到 var/' \
 		'  docker-build    构建最小运行镜像（linux/amd64，distroless）' \
 		'  docker-build-debug 构建排错镜像（alpine + 网络排查工具）' \
 		'  clean           清理 bin/ 与 .bin/'
