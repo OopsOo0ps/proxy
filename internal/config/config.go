@@ -471,6 +471,23 @@ type API struct {
 	AllowRemote bool `yaml:"allow-remote,omitempty"`
 }
 
+// Accounts 是账户库配置（accounts 模式：动态用户/订阅存储）。
+// 段省略 = 不启用账户模式，行为与现状一致；启用后与静态凭据
+// （auth.users / params.users）互斥（身份命名空间唯一）。
+type Accounts struct {
+	// File 是账户库 JSON 文件路径（版本化格式，严格加载：缺失/损坏即启动
+	// 失败；空账户列表合法）。不派生隐式路径，必须显式给出。
+	File string `yaml:"file,omitempty"`
+}
+
+// Control 是控制面 HTTP 配置（用户/订阅管理端点的监听）。
+// 仅允许环回监听（无 allow-remote 类逃生口——控制面承载账户写操作）。
+type Control struct {
+	// Listen 是控制面监听地址（host:port）。accounts 模式下必填
+	//（账户只能经控制面管理）；反向不要求（可先占位监听）。
+	Listen string `yaml:"listen,omitempty"`
+}
+
 // Config 是 proxy-client 与 proxy-server 共用的配置信封：客户端 schema 与
 // 服务端 schema 镜像同一模式（判别字段列表 + 协议自有 params），差异只在
 // 组装根传入的 ProtocolSet（client = {http, socks5, dns} 入站 + trojan 出站；
@@ -489,6 +506,10 @@ type Config struct {
 	Limits Limits `yaml:"limits,omitempty"`
 	// Timeouts 是各类超时。
 	Timeouts Timeouts `yaml:"timeouts,omitempty"`
+	// Accounts 是账户库配置（可省；省略 = 不启用账户模式）。
+	Accounts *Accounts `yaml:"accounts,omitempty"`
+	// Control 是控制面配置（可省；accounts 模式下必填）。
+	Control *Control `yaml:"control,omitempty"`
 }
 
 // ProtocolSet 是组装根能分派的协议全集（解析期校验依据，设计文档 §7.3）：
@@ -583,6 +604,13 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Log.Format) == "" {
 		c.Log.Format = defaults.LogFormat
 	}
+	// accounts / control 只做规范化（去空白），不派生隐式路径或隐式监听。
+	if c.Accounts != nil {
+		c.Accounts.File = strings.TrimSpace(c.Accounts.File)
+	}
+	if c.Control != nil {
+		c.Control.Listen = strings.TrimSpace(c.Control.Listen)
+	}
 }
 
 func (c *Config) validate(ps ProtocolSet) error {
@@ -590,6 +618,10 @@ func (c *Config) validate(ps ProtocolSet) error {
 		return err
 	}
 	if err := validateAPI(c.API); err != nil {
+		return err
+	}
+	// accounts / control 两段（缺省即功能整体不启用，维持现状行为）。
+	if err := c.validateAccountsControl(); err != nil {
 		return err
 	}
 	if len(c.Inbounds) == 0 {
@@ -627,6 +659,15 @@ func (c *Config) validate(ps ProtocolSet) error {
 	}
 	if c.API.Listen != "" {
 		if err := conflicts.add("api.listen", c.API.Listen); err != nil {
+			return err
+		}
+		if err := conflicts.check(); err != nil {
+			return err
+		}
+	}
+	// control.listen 登记进监听冲突集（地址合法性已在 validateAccountsControl 校验）。
+	if c.Control != nil {
+		if err := conflicts.add("control.listen", c.Control.Listen); err != nil {
 			return err
 		}
 		if err := conflicts.check(); err != nil {
@@ -894,6 +935,68 @@ func validateAPI(a API) error {
 		return fmt.Errorf("api.listen: binding to non-loopback address %q requires api.allow-remote: true (ops endpoints expose topology and runtime state)", a.Listen)
 	}
 	return nil
+}
+
+// validateAccountsControl 校验 accounts / control 两段（迭代①：门禁未启用，
+// 无 gate 配置段——函数按可扩展结构书写，gate.enabled 相关校验随④追加）：
+//   - accounts 模式与静态凭据（auth.users / params.users）互斥（身份命名空间唯一）；
+//   - control 仅环回（无逃生口）；
+//   - accounts 段存在 ⇒ control.listen 必填（账户只能经控制面管理），反向不要求。
+func (c *Config) validateAccountsControl() error {
+	if c.Accounts == nil {
+		if c.Control != nil {
+			return validateControlListen(c.Control.Listen)
+		}
+		return nil
+	}
+	if c.Accounts.File == "" {
+		return errors.New("accounts.file: must not be empty (no implicit path is derived)")
+	}
+	if c.Control == nil {
+		return errors.New("control.listen: required when accounts is configured (accounts are managed via the loopback-only control plane)")
+	}
+	if err := validateControlListen(c.Control.Listen); err != nil {
+		return err
+	}
+	for i := range c.Inbounds {
+		ic := &c.Inbounds[i]
+		if ic.Auth != nil && len(ic.Auth.Users) > 0 {
+			return fmt.Errorf("inbounds[%d] (%s): auth.users is mutually exclusive with accounts mode (the identity namespace must be unique)", i, ic.Type)
+		}
+		if paramsHasStaticUsers(&ic.Params) {
+			return fmt.Errorf("inbounds[%d] (%s): params.users is mutually exclusive with accounts mode (the identity namespace must be unique)", i, ic.Type)
+		}
+	}
+	return nil
+}
+
+// validateControlListen 校验控制面监听：必须显式给地址且仅环回。控制面承载
+// 用户/订阅管理写操作，不提供 allow-remote 类逃生口（设计书 §2.1）。
+func validateControlListen(listen string) error {
+	if listen == "" {
+		return errors.New("control.listen: must not be empty when the control section is present")
+	}
+	if err := validateListenAddr("control.listen", listen); err != nil {
+		return err
+	}
+	if !IsLoopbackListen(listen) {
+		return fmt.Errorf("control.listen: only loopback addresses are allowed (got %q): the control plane manages users and subscriptions and has no remote-access escape hatch", listen)
+	}
+	return nil
+}
+
+// paramsHasStaticUsers 报告 params 块顶层是否带 users 键（静态隧道凭据的
+// 通用形状；协议语义归协议，config 只认识这个身份命名空间的名字）。
+func paramsHasStaticUsers(n *yaml.Node) bool {
+	if n.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == "users" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateTimeouts(t Timeouts) error {

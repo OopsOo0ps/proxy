@@ -5,9 +5,9 @@
 // 本包只保留与协议无关的顺序与关停语义：
 //
 //   - startGeneration：先启动后台资源（绑定应用级 ctx，寿命 = 实例寿命，
-//     不随代际结束而停止），再按「入站数 + 1」先计数后 spawn 服务协程
-//     （done 关闭不早于计数，避免 Add-after-Wait 竞态）；代际 ctx 取消
-//     触发各端点既有 drain/force 语义；
+//     不随代际结束而停止），再按「入站数 + 运维端点 + 控制面（可选）」先
+//     计数后 spawn 服务协程（done 关闭不早于计数，避免 Add-after-Wait 竞态）；
+//     代际 ctx 取消触发各端点既有 drain/force 语义；
 //   - switchTo 三阶段：停旧（取消旧代际 ctx → 关旧监听）→ 绑新（失败
 //     回滚：关新监听 → CloseOwned → restore）→ 提交（live.Store → 上线
 //     新代际 → 最后释放被替换资源——顺序颠倒会误关新代际共享的池）；
@@ -41,12 +41,16 @@ type Service struct {
 	Serve func(ctx context.Context) error
 }
 
-// Services 是一次快照暴露给生命周期核心的全部服务端点（入站 + 运维端点）。
+// Services 是一次快照暴露给生命周期核心的全部服务端点（入站 + 运维端点 +
+// 控制面）。
 type Services struct {
 	// Inbounds 是全部入站端点（按声明顺序 spawn）。
 	Inbounds []Service
 	// Admin 是运维端点（错误前缀 "%s: admin endpoint"）。
 	Admin Service
+	// Control 是控制面端点（错误前缀 "%s: control endpoint"）；零值 = 无
+	// 控制面服务（不 spawn 协程、不计入代际协程数，语义与 Admin 一致）。
+	Control Service
 }
 
 // Port 是运行时快照的全部可操作面（组装根注入）：生命周期核心只经这些
@@ -280,7 +284,13 @@ func (a *App[RT, C]) startGeneration(rt *RT) *generation[RT] {
 	// 后台循环会被 gen.cancel() 永久停摆。
 	a.opts.Port.StartResources(rt, parent)
 	svc := a.opts.Port.Services(rt)
-	gen.wg.Add(len(svc.Inbounds) + 1) // 入站 + 运维端点（先计数后 spawn，done 关闭不早于计数）
+	// 显式三段计数：入站 + 运维端点 + 控制面（零值 = 无，不计数不 spawn）。
+	// 先计数后 spawn（done 关闭不早于计数，避免 Add-after-Wait 竞态）。
+	services := len(svc.Inbounds) + 1
+	if svc.Control.Serve != nil {
+		services++
+	}
+	gen.wg.Add(services)
 	for i := range svc.Inbounds {
 		s := svc.Inbounds[i]
 		go func() {
@@ -296,6 +306,15 @@ func (a *App[RT, C]) startGeneration(rt *RT) *generation[RT] {
 			a.fail(fmt.Errorf("%s: admin endpoint: %w", a.opts.Name, err))
 		}
 	}()
+	if svc.Control.Serve != nil {
+		s := svc.Control
+		go func() {
+			defer gen.wg.Done()
+			if err := s.Serve(gctx); err != nil && gctx.Err() == nil && parent.Err() == nil {
+				a.fail(fmt.Errorf("%s: control endpoint: %w", a.opts.Name, err))
+			}
+		}()
+	}
 	go func() {
 		gen.wg.Wait()
 		close(gen.done)

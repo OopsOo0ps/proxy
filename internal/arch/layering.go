@@ -29,12 +29,14 @@ var Layers = map[string]int{
 	"lifecycle": 1, // 组装根共有生命周期核心：只依赖 stdlib（与 session 同语义）
 	// L2 领域引擎
 	"routing": 2, "ruleset": 2, "nodes": 2, "connpool": 2, "dialer": 2,
+	"accounts": 2, // 账户聚合（动态用户/订阅存储 + 门禁视图）：HTTP-free / core-free 领域包
 	// L3 协议端点
 	"httpproxy": 3, "socks5": 3, "dnsgw": 3, "trojan": 3,
 	// L4 组装/面/守护
 	"config": 4, "clientapp": 4, "serverapp": 4, "metrics": 4,
 	"status": 4, "testutil": 4,
-	"arch": 4, // 守护包自身：零内部依赖，登记以纳入完备性管理
+	"control": 4, // 控制面 HTTP（用户/订阅管理）：gin 唯一属主，纯向下消费 accounts
+	"arch":    4, // 守护包自身：零内部依赖，登记以纳入完备性管理
 	// L5 入口
 	"cmd/client": 5, "cmd/server": 5, "test/integration": 5,
 }
@@ -48,12 +50,12 @@ var Layers = map[string]int{
 // Prewarmer.Bind 的入参与返回值）直接引用 core.Target，契约包消费共享
 // 词汇不是分层漂移。登记后同层边实为 6 个源包 / 11 条边。
 var SameLayerEdges = map[string][]string{
-	"dialer":    {"routing", "nodes"},            // 路由分派与节点选择是 dialer 的组成部件
-	"nodes":     {"connpool"},                    // 预热池是节点池的内部机制（§5.3 组合树：每节点 PrewarmPool）
-	"ruleset":   {"routing"},                     // 规则源产出路由引擎的规则表
-	"clientapp": {"config", "metrics", "status"}, // 组装根唯一可触配置/遥测/管理面
-	"serverapp": {"config", "metrics", "status"},
-	"outbound":  {"core"}, // 勘误：出口契约签名引用 core.Target（见上注释）
+	"dialer":    {"routing", "nodes"},                       // 路由分派与节点选择是 dialer 的组成部件
+	"nodes":     {"connpool"},                               // 预热池是节点池的内部机制（§5.3 组合树：每节点 PrewarmPool）
+	"ruleset":   {"routing"},                                // 规则源产出路由引擎的规则表
+	"clientapp": {"config", "metrics", "status"},            // 组装根唯一可触配置/遥测/管理面
+	"serverapp": {"config", "metrics", "status", "control"}, // serverapp 宿主控制面服务（同层，对齐 status）
+	"outbound":  {"core"},                                   // 勘误：出口契约签名引用 core.Target（见上注释）
 }
 
 // ExternalDeps 是第三方直接依赖的属主：键为 go.mod 的 module 路径，值为
@@ -62,12 +64,16 @@ var SameLayerEdges = map[string][]string{
 var ExternalDeps = map[string][]string{
 	"gopkg.in/yaml.v3":                    {"config"},
 	"github.com/prometheus/client_golang": {"metrics"},
+	"github.com/gin-gonic/gin":            {"control"}, // gin 只许控制面触达（组装根保持 gin-free）
 }
 
-// ProtocolPkgs 是协议词汇泄漏检查的 allowlist：键为协议包名，值为允许
+// ProtocolPkgs 是协议与领域词汇泄漏检查的 allowlist：键为协议/领域包名，值为允许
 // import 该协议包的包（含其外部测试的宿主包归属）。协议包只许被自己和
 // 组装根/测试地基触达；新增出口/入站协议时在此登记一行，泄漏防线自动
 // 覆盖它。
 var ProtocolPkgs = map[string][]string{
 	"trojan": {"trojan", "clientapp", "serverapp", "testutil", "test/integration"},
+	// accounts 是领域词汇（非线格式协议）：触达面 = 自身 + 两个组装根/控制面
+	//（clientapp 随客户端门禁迭代再扩；test/integration 走 HTTP 黑盒零 import）。
+	"accounts": {"accounts", "serverapp", "control"},
 }
