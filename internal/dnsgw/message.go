@@ -23,6 +23,14 @@ const (
 	rcodeFormatErr  = 1
 	rcodeServerFail = 2
 	rcodeRefused    = 5
+
+	// typeOPT 是 EDNS0 OPT 记录类型（RFC 6891 §6.1.2）。
+	typeOPT = 41
+
+	// minClientUDPLimit 是客户端 UDP 上限的缺省值（RFC 1035 4.2.1 的 UDP
+	// 消息硬上限）：查询未携带 EDNS0 OPT、无附加区或声明值非法（<512，
+	// CLASS 为 uint16 故上限 65535 天然满足）时按 512 处理。
+	minClientUDPLimit = 512
 )
 
 // 解析错误分类：决定是否回错误响应以及回哪种。
@@ -40,12 +48,18 @@ type query struct {
 	name        string // 归一化问题名（小写、无尾点）
 	qtype       uint16
 	questionEnd int // 问题段结束偏移，构造错误响应时用于回显问题段
+	// udpLimit 是客户端可接受的 UDP 响应上限（RFC 6891 §6.2.3：OPT 记录
+	// 的 CLASS 字段，即发送方 UDP 声明值）；无 OPT / 声明非法时为 512。
+	// 仅用于 UDP 写回侧的截断判定，不参与转发（payload 原样保留）。
+	udpLimit int
 }
 
 // parseQuery 解析查询的头部与唯一问题段。
 // 仅接受标准查询（QR=0、opcode=0、QDCOUNT=1）；其余返回对应的分类错误。
+// 附加区只读出 EDNS0 的声明上限（见 parseEDNS0Limit），不做改写、不参与
+// 合法性判定——附加区畸形不影响 errMalformed 分类。
 func parseQuery(payload []byte) (query, error) {
-	q := query{payload: payload}
+	q := query{payload: payload, udpLimit: minClientUDPLimit}
 	if len(payload) < headerLen {
 		return q, errMalformed
 	}
@@ -70,7 +84,58 @@ func parseQuery(payload []byte) (query, error) {
 	q.name = name
 	q.qtype = binary.BigEndian.Uint16(payload[off : off+2])
 	q.questionEnd = off + 4
+	q.udpLimit = parseEDNS0Limit(payload, off+4, int(binary.BigEndian.Uint16(payload[10:12])))
 	return q, nil
+}
+
+// parseEDNS0Limit 从附加区（ARCOUNT 条资源记录）读取 OPT 记录（TYPE=41）的
+// CLASS 字段，即客户端声明的 UDP 载荷上限（RFC 6891 §6.2.3）。
+// 无 OPT / 无附加区 / 声明值非法（<512）时返回 512；最终上限即
+// max(512, min(声明值, 65535))。只读 CLASS，不改写任何 OPT 字段（padding
+// 等原样保留）；附加区解析失败同样回退 512，不影响查询本身的合法性。
+func parseEDNS0Limit(payload []byte, off, arcount int) int {
+	const rrFixed = 10 // TYPE/CLASS/TTL/RDLENGTH 固定部分
+	limit := minClientUDPLimit
+	for i := 0; i < arcount && off < len(payload); i++ {
+		nameEnd, ok := skipRRName(payload, off)
+		if !ok || nameEnd+rrFixed > len(payload) {
+			return limit
+		}
+		typ := binary.BigEndian.Uint16(payload[nameEnd : nameEnd+2])
+		if typ == typeOPT {
+			// OPT 的 CLASS 即声明值；uint16 天然 ≤65535，只校验下限。
+			if declared := int(binary.BigEndian.Uint16(payload[nameEnd+2 : nameEnd+4])); declared >= minClientUDPLimit {
+				limit = declared
+			}
+			return limit
+		}
+		off = nameEnd + rrFixed + int(binary.BigEndian.Uint16(payload[nameEnd+8:nameEnd+10]))
+	}
+	return limit
+}
+
+// skipRRName 跳过资源记录的名字字段（根名 / 标签序列 / 压缩指针），
+// 返回名字字段之后的偏移；无法解析时 ok=false。
+func skipRRName(msg []byte, off int) (int, bool) {
+	for {
+		if off >= len(msg) {
+			return 0, false
+		}
+		n := int(msg[off])
+		switch {
+		case n == 0:
+			return off + 1, true
+		case n&0xC0 == 0xC0:
+			if off+2 > len(msg) {
+				return 0, false
+			}
+			return off + 2, true
+		case n&0xC0 != 0:
+			return 0, false
+		default:
+			off += 1 + n
+		}
+	}
 }
 
 // parseName 读取问题段中的域名，返回小写点分名字与结束偏移。
@@ -144,6 +209,22 @@ func applyResponseFlags(resp []byte, rcode uint16) []byte {
 		binary.BigEndian.PutUint16(resp[i:i+2], 0)
 	}
 	return resp
+}
+
+// truncateForClient 构造写回给客户端的最小截断响应（UDP 写回侧，P2-9）：
+// 复制上游响应的头部与查询的问题段，置 TC=1、清空各段计数（ANCOUNT=0，
+// 不含 OPT）。不得复用 applyResponseFlags——它会清 TC 位；RCODE 等其余
+// 标志位保留上游响应的语义。
+func truncateForClient(resp []byte, q *query) []byte {
+	out := make([]byte, headerLen, headerLen+q.questionEnd)
+	copy(out, resp[:headerLen])
+	flags := binary.BigEndian.Uint16(out[2:4]) | flagTC
+	binary.BigEndian.PutUint16(out[2:4], flags)
+	binary.BigEndian.PutUint16(out[4:6], 1)   // QDCOUNT：问题段保留
+	binary.BigEndian.PutUint16(out[6:8], 0)   // ANCOUNT：不携带回答
+	binary.BigEndian.PutUint16(out[8:10], 0)  // NSCOUNT
+	binary.BigEndian.PutUint16(out[10:12], 0) // ARCOUNT：TC 响应不放 OPT
+	return append(out, q.payload[headerLen:q.questionEnd]...)
 }
 
 // validResponse 校验上游响应：长度足够、ID 与查询一致且为响应报文。

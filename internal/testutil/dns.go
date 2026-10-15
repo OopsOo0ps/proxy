@@ -323,7 +323,14 @@ func (s *DNSServer) Close() {
 }
 
 // QueryUDP 向 addr 发送查询并等待响应（超时返回错误）。
+// 读缓冲固定 4096；需要接收更大的响应时使用 QueryUDPWithBuffer。
 func QueryUDP(addr string, query []byte, timeout time.Duration) ([]byte, error) {
+	return QueryUDPWithBuffer(addr, query, 4096, timeout)
+}
+
+// QueryUDPWithBuffer 向 addr 发送查询并等待响应，读缓冲为 bufSize
+// （QueryUDP 的可定制版本，机械完全一致）。
+func QueryUDPWithBuffer(addr string, query []byte, bufSize int, timeout time.Duration) ([]byte, error) {
 	conn, err := net.DialTimeout("udp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -333,7 +340,7 @@ func QueryUDP(addr string, query []byte, timeout time.Duration) ([]byte, error) 
 	if _, err := conn.Write(query); err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 4096)
+	buf := make([]byte, bufSize)
 	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, err
