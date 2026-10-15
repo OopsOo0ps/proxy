@@ -371,6 +371,7 @@ curl -s -X PUT "http://127.0.0.1:9100/log/level?level=debug"
 
 | 文档 | 内容 |
 | --- | --- |
+| [docs/design.md](docs/design.md) | 权威设计文档（v3）：分层、契约、组装根、热加载与测试验收（代码注释 `§X` 引用指向它） |
 | [Wiki：配置参考](https://github.com/OopsOo0ps/proxy/wiki/配置参考) | 客户端 / 服务端全部字段、默认值与语义 |
 | [Wiki：分流与规则](https://github.com/OopsOo0ps/proxy/wiki/分流与规则) | 规则语法、内网直连、远程规则动态加载 |
 | [Wiki：DNS-策略](https://github.com/OopsOo0ps/proxy/wiki/DNS-策略) | remote DNS、DNS 网关、与 fake-IP 的取舍 |

@@ -292,6 +292,38 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 	}
 }
 
+// TestReloadRebuildsPoolOnNodeWeightChange 验证节点 weight 参与 UpstreamFingerprint：
+// 仅改 weight（其余上游配置不变）即视为上游变更，热加载必须重建节点池。
+func TestReloadRebuildsPoolOnNodeWeightChange(t *testing.T) {
+	dir := t.TempDir()
+	rulesPath := filepath.Join(dir, "rules.yaml")
+	if err := os.WriteFile(rulesPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app, err := New(baseReloadCfg(t, rulesPath), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := app.live.Load()
+	if rt.pool == nil {
+		t.Fatal("test setup: node pool must be built")
+	}
+
+	// 仅变更节点 weight：Outbound 是共享指针，需克隆后再改，避免污染旧快照。
+	weighted := *rt.cfg
+	ob := *weighted.Outbound
+	ob.Nodes = append([]config.Node(nil), ob.Nodes...)
+	ob.Nodes[0].Weight = 7
+	weighted.Outbound = &ob
+	if err := app.Reload(&weighted); err != nil {
+		t.Fatalf("reload (weight change): %v", err)
+	}
+	rt2 := app.live.Load()
+	if rt2.pool == rt.pool {
+		t.Fatal("weight 变更必须重建节点池（weight 应参与出口指纹）")
+	}
+}
+
 // —— switchTo 阶段绑定失败 → 回滚（restore）路径 ——
 
 // rollbackCfg 构造显式端口的 HTTP 入站配置（回滚重绑按显式地址恢复原端口）：

@@ -100,8 +100,9 @@ type Node struct {
 	Name string `yaml:"name"`
 	// Protocol 是出口协议（trojan | <未来协议>）。
 	Protocol string `yaml:"protocol"`
-	// Weight 是节点权重；当前节点池为等权轮询，weight 仅要求 >= 0
-	//（加权轮询到来时无需改动配置模型）。
+	// Weight 是节点的 SWRR 调度权重（平滑加权轮询，nginx 经典算法）；
+	// <=0 按 1 处理，缺省（0）即等权普通轮询。负值被校验拒绝；weight 参与
+	// UpstreamFingerprint，变更会在热加载时触发节点池重建。
 	Weight int `yaml:"weight,omitempty"`
 	// Params 是协议自有参数块；config 不做协议校验。
 	Params yaml.Node `yaml:"params,omitempty"`

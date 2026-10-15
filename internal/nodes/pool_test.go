@@ -208,6 +208,120 @@ func TestFailoverToNextNode(t *testing.T) {
 	}
 }
 
+func TestWeightedRoundRobinDistribution(t *testing.T) {
+	rec := newRecorder()
+	const heavy, light = "heavy.example.com:443", "light.example.com:443"
+	pool, err := New([]Node{
+		{Addr: heavy, Transport: stubTransport{}, Weight: 2},
+		{Addr: light, Transport: stubTransport{}, Weight: 1},
+	}, rec.dial, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for i := 0; i < 6; i++ {
+		_, node, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		got = append(got, node.Addr)
+	}
+	// SWRR（平滑加权轮询）序列：weight 2:1 下 6 次拨号按 4:2 分布，
+	// 且平滑推进不出现连续集中以外的漂移。
+	want := []string{heavy, light, heavy, heavy, light, heavy}
+	if len(got) != len(want) {
+		t.Fatalf("sequence length = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dial %d selected %s, want %s（SWRR 序列 %v）", i, got[i], want[i], want)
+		}
+	}
+	if got := rec.callsFor(heavy); got != 4 {
+		t.Fatalf("heavy calls = %d, want 4（weight 2:1 ⇒ 4:2）", got)
+	}
+	if got := rec.callsFor(light); got != 2 {
+		t.Fatalf("light calls = %d, want 2（weight 2:1 ⇒ 4:2）", got)
+	}
+}
+
+func TestWeightNonPositiveDefaultsToOne(t *testing.T) {
+	rec := newRecorder()
+	const a, b = "a.example.com:443", "b.example.com:443"
+	pool, err := New([]Node{
+		{Addr: a, Transport: stubTransport{}, Weight: 0},
+		{Addr: b, Transport: stubTransport{}, Weight: -3},
+	}, rec.dial, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// weight<=0 一律按 1 处理：等权 ⇒ 严格退化为普通轮询交替。
+	var got []string
+	for i := 0; i < 4; i++ {
+		_, node, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		got = append(got, node.Addr)
+	}
+	want := []string{a, b, a, b}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dial %d selected %s, want %s（等权应交替轮询）", i, got[i], want[i])
+		}
+	}
+}
+
+func TestWeightedNodeCooldownFallsBackToLightNode(t *testing.T) {
+	rec := newRecorder()
+	const heavy, light = "heavy.example.com:443", "light.example.com:443"
+	now := time.Now()
+	rec.setErr(heavy, errors.New("boom"))
+	pool, err := New([]Node{
+		{Addr: heavy, Transport: stubTransport{}, Weight: 5},
+		{Addr: light, Transport: stubTransport{}, Weight: 1},
+	}, rec.dial, Options{Cooldown: time.Minute, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 首拨：高权重节点被首选但失败进入冷却，链回退到低权重节点。
+	_, node, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Addr != light {
+		t.Fatalf("selected %s, want %s（heavy 失败后应回退）", node.Addr, light)
+	}
+
+	// 冷却期内：高权重节点不参与候选，流量全部落到低权重节点。
+	for i := 0; i < 3; i++ {
+		_, node, err := pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
+		if err != nil {
+			t.Fatalf("dial %d during cooldown: %v", i, err)
+		}
+		if node.Addr != light {
+			t.Fatalf("during cooldown selected %s, want %s", node.Addr, light)
+		}
+	}
+	if got := rec.callsFor(heavy); got != 1 {
+		t.Fatalf("heavy calls during cooldown = %d, want 1", got)
+	}
+
+	// 冷却结束：高权重节点重新参与并按权重重新成为首选。
+	rec.setErr(heavy, nil)
+	now = now.Add(2 * time.Minute)
+	_, node, err = pool.Dial(context.Background(), core.Target{Host: "example.com", Port: 443})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.Addr != heavy {
+		t.Fatalf("after cooldown selected %s, want %s（冷却结束应恢复按权重调度）", node.Addr, heavy)
+	}
+}
+
 func TestCooldownSkipsFailedNode(t *testing.T) {
 	rec := newRecorder()
 	rec.setErr("node1.example.com:443", errors.New("boom"))
