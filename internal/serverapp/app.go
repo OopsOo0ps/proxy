@@ -22,9 +22,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/accounts"
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
+	"github.com/OopsOo0ps/proxy/internal/control"
 	"github.com/OopsOo0ps/proxy/internal/core"
 	"github.com/OopsOo0ps/proxy/internal/defaults"
 	"github.com/OopsOo0ps/proxy/internal/dialer"
@@ -55,6 +57,13 @@ type Runtime struct {
 	Telemetry core.Telemetry
 	// Admin 是运维端点（/metrics /health /stats /log/level）。
 	Admin *status.Server
+	// Control 是控制面端点（用户/订阅管理 API）；仅 accounts 模式构建，
+	// nil = 未启用（静态凭据模式维持现状行为）。
+	Control *control.Server
+
+	// gate 是账户门禁视图（accounts 模式的隧道凭据校验器，buildInbound 消费）；
+	// nil = 静态凭据模式。
+	gate *accounts.GateView
 
 	cfg *config.Config
 }
@@ -110,12 +119,15 @@ func (r *Runtime) Close() {
 	r.closeListeners()
 }
 
-// closeListeners 关闭全部监听（入站 + 运维端点；幂等）。
+// closeListeners 关闭全部监听（入站 + 运维端点 + 控制面；幂等）。
 func (r *Runtime) closeListeners() {
 	for i := range r.Inbounds {
 		r.Inbounds[i].Close()
 	}
 	_ = r.Admin.Close()
+	if r.Control != nil {
+		_ = r.Control.Close()
+	}
 }
 
 // resolvedAddrOf 返回与 ic 同（type, listen）的旧入站已解析地址：
@@ -157,6 +169,12 @@ type builder struct {
 	logCtrl *logging.Control
 	live    *atomic.Pointer[Runtime]
 
+	// accounts 是进程级账户存储（accounts 模式）：builder 持有、跨代际复用
+	//（同 metrics/limiter/logCtrl 的进程级组件先例）；accountsPath 是它的
+	// 构建路径（路径变更的热加载触发重读）。nil = 静态凭据模式。
+	accounts     *accounts.Store
+	accountsPath string
+
 	rejects rejectThrottle
 }
 
@@ -189,6 +207,12 @@ func (b *builder) assemble(cfg *config.Config) (*Runtime, error) {
 	// 服务端即出口：出站组合树就是共享的直连拨号器（§5.3 directDialer），
 	// 单请求期限由 trojan 服务端按当前快照收敛。
 	rt.Outbound = dialer.NewDirect(cfg.Timeouts.EffectiveDial())
+	// accounts / control（可省，缺省 = 静态凭据现状）：进程级账户存储 +
+	// 门禁视图 + 控制面端点。必须在入站构建之前完成——入站的隧道校验器
+	// 在 accounts 模式下取门禁视图（见 buildInbound）。
+	if err := b.buildAccountsControl(cfg, rt); err != nil {
+		return nil, err
+	}
 	for i := range cfg.Inbounds {
 		is, err := b.buildInbound(&cfg.Inbounds[i], rt)
 		if err != nil {
@@ -227,15 +251,28 @@ func (b *builder) bindRuntime(rt *Runtime, previous *Runtime) error {
 		rt.closeListeners()
 		return err
 	}
+	// 控制面监听（accounts 模式才有 Control）：仅环回由 config 校验层强制
+	//（无逃生口），此处不做非环回警告分支。空 addr = no-op（未配置时零行为）。
+	if rt.Control != nil {
+		listen := ""
+		if rt.cfg.Control != nil {
+			listen = rt.cfg.Control.Listen
+		}
+		if err := rt.Control.Bind(listen); err != nil {
+			rt.closeListeners()
+			return err
+		}
+	}
 	if addr := rt.cfg.API.Listen; addr != "" && !config.IsLoopbackListen(addr) {
 		b.logger.Warn("ops endpoints are bound to a non-loopback address; keep them behind a firewall and note PUT /log/level stays loopback-only", "listen", addr)
 	}
 	return nil
 }
 
-// buildInbound 是入站协议分派点（全仓唯一）：trojan 服务端凭据只存
-// SHA-224 摘要（auth.Store 构造时派生），协议语义校验在凭据构造处。
-// 返回的端点尚未绑定监听（绑定属构建步骤，不变量 3）。
+// buildInbound 是入站协议分派点（全仓唯一）：trojan 服务端凭据只存 SHA-224
+// 摘要（静态凭据模式由 auth.Store 构造时派生；accounts 模式取账户门禁视图，
+// 见 control.go），协议语义校验在凭据构造处。返回的端点尚未绑定监听（绑定
+// 属构建步骤，不变量 3）。
 func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, error) {
 	if ic.Type != config.TypeTrojan {
 		return InboundServer{}, fmt.Errorf("unknown inbound type %q", ic.Type)
@@ -252,13 +289,22 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 	if err != nil {
 		return InboundServer{}, fmt.Errorf("trojan inbound %s: parse tls certificate: %w", ic.Listen, err)
 	}
-	users := make([]auth.User, 0, len(params.Users))
-	for _, u := range params.Users {
-		users = append(users, auth.User{Username: u.Username, Password: u.Password})
-	}
-	store, err := auth.NewStore(users)
-	if err != nil {
-		return InboundServer{}, fmt.Errorf("trojan inbound %s: %w", ic.Listen, err)
+	// 隧道凭据校验器：accounts 模式取账户门禁视图（静态 users 已被配置校验
+	// 禁止，身份命名空间唯一；校验器是动态存储视图，账户变更即刻生效）；
+	// 否则按 params.users 构建静态凭据存储（构造后只读）。
+	var verifier trojan.Verifier
+	if rt.gate != nil {
+		verifier = rt.gate
+	} else {
+		users := make([]auth.User, 0, len(params.Users))
+		for _, u := range params.Users {
+			users = append(users, auth.User{Username: u.Username, Password: u.Password})
+		}
+		store, err := auth.NewStore(users)
+		if err != nil {
+			return InboundServer{}, fmt.Errorf("trojan inbound %s: %w", ic.Listen, err)
+		}
+		verifier = store
 	}
 	decoy := trojan.DefaultDecoyPage
 	if params.DecoyFile != "" {
@@ -277,7 +323,7 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 		b.logger.Warn("using built-in decoy page; set decoy-file to avoid fingerprinting in production", "listen", ic.Listen)
 	}
 
-	live := liveView{live: b.live, verifier: store, decoy: decoy}
+	live := liveView{live: b.live, verifier: verifier, decoy: decoy}
 	srv := &trojan.Server{
 		Dial:      rt.Outbound,
 		Live:      live,
@@ -332,10 +378,12 @@ func bindAddr(configured, previous string) string {
 // —— 热加载视图（运行期热更路径）——
 
 // liveView 是 trojan 服务端的热加载视图：凭据与伪装页锚定构建该入站时的
-// 快照（生效边界 = 新握手），超时读当前快照。
+// 快照（生效边界 = 新握手），超时读当前快照。verifier 为接口形态：静态凭据
+// 模式传 *auth.Store，accounts 模式传账户门禁视图（*accounts.GateView，
+// 见 control.go 的编译期断言）。
 type liveView struct {
 	live     *atomic.Pointer[Runtime]
-	verifier *auth.Store
+	verifier trojan.Verifier
 	decoy    []byte
 }
 
@@ -520,9 +568,16 @@ func lifecycleOptions(b *builder) lifecycle.Options[Runtime, *config.Config] {
 					users += len(params.Users)
 				}
 			}
+			// accounts 模式：并入账户库用户数（与静态 users 计数并列；互斥
+			// 校验保证二者不会同时非零）。
+			accountsUsers := 0
+			if next.Accounts != nil && b.accounts != nil && b.accountsPath == next.Accounts.File {
+				accountsUsers = b.accounts.Len()
+			}
 			b.logger.Info("configuration reloaded",
 				"inbounds", len(next.Inbounds),
 				"users", users,
+				"accounts_users", accountsUsers,
 				"max_connections", next.Limits.EffectiveMaxConnections(),
 			)
 		},
@@ -544,6 +599,10 @@ func lifecycleOptions(b *builder) lifecycle.Options[Runtime, *config.Config] {
 // 即入站 type；运维端点错误前缀 "serverapp: admin endpoint"。
 func runtimeServices(rt *Runtime) lifecycle.Services {
 	svc := lifecycle.Services{Admin: lifecycle.Service{Serve: rt.Admin.Serve}}
+	// 控制面端点（accounts 模式才有；nil = 零值 Control，不 spawn 协程）。
+	if rt.Control != nil {
+		svc.Control = lifecycle.Service{Kind: "control", Serve: rt.Control.Serve}
+	}
 	for i := range rt.Inbounds {
 		is := &rt.Inbounds[i]
 		svc.Inbounds = append(svc.Inbounds, lifecycle.Service{

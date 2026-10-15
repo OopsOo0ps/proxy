@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "users": [
+    {
+      "username": "alice",
+      "password_sha256": "c50c7a2d4b97ac53d95b5b08ea9eca416f81cd60594ff9d74de5511ce21352bb",
+      "password_sha224": "6babfa9a54a69da4d1a3b3feefd7a626ed3e8a6f0676ee7a564067a6",
+      "status": "active",
+      "subscription": {
+        "expires_at": "2027-10-01T00:00:00Z",
+        "granted_at": "2026-10-01T00:00:00Z"
+      }
+    }
+  ]
+}

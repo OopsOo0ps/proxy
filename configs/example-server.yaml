@@ -14,6 +14,20 @@ api:
   listen: "127.0.0.1:9200"
   # allow-remote: false
 
+# 控制面（用户/订阅管理 API）。只允许环回监听，无 allow-remote 类逃生口；
+# 监听地址登记进端口冲突集。缺省整个段 = 控制面不启用。
+control:
+  listen: "127.0.0.1:9300"
+
+# 账户库（accounts 模式：动态用户/订阅存储，经控制面管理）。
+# 段存在即启用账户模式，并与静态凭据互斥——启用前必须删除 trojan 入站
+# params 里的 users 列表（身份命名空间唯一，否则启动失败）。账户文件为
+# 版本化 JSON，严格加载：文件缺失/损坏即启动失败，空账户列表合法；
+# 形状示例见 configs/example-accounts.json。控制面端点：POST/GET /users、
+# PATCH /users/{name}、PUT /users/{name}/subscription。
+accounts:
+  file: configs/example-accounts.json
+
 # 入站端点（列表 + 判别字段 type；服务端为 trojan 隧道接受器，可配置多个）。
 # 建议通过防火墙/安全组限制来源；生产可监听 443 以融入普通 HTTPS 流量。
 inbounds:
@@ -24,14 +38,10 @@ inbounds:
       # 生产部署替换为 /etc/proxy/server.crt 等实际路径。
       cert-file: var/dev-cert.pem
       key-file: var/dev-key.pem
-      # 隧道凭据：为每个客户端分配独立的用户名与强口令（必填）。
+      # 隧道凭据：accounts 模式下不配置静态 users 列表（与账户库互斥），
+      # 用户经控制面（POST /users）创建并持久化到 accounts.file。
       # 服务端只保留 SHA-224 摘要；认证失败时返回中性伪装页面
       #（不泄露任何代理信息），可用 decoy-file 自定义页面。
-      users:
-        - username: alice
-          password: change-me-alice
-        - username: bob
-          password: change-me-bob
       # decoy-file: /etc/proxy/decoy.html
       # ↑ 建议显式配置自定义伪装页面：未配置时使用内置伪装页（仅适用于
       #   本地试验——内置模板是公开的固定内容，可能被指纹识别），此时启动
