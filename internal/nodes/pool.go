@@ -1,7 +1,8 @@
 // Package nodes 管理出口节点池：轮询选择、失败冷却、主动健康检查与自动切换。
 //
-// 选择策略为轮询 + 失败转移：每次拨号从游标位置开始依次尝试可用节点，
-// 节点失败后累计失败次数并进入指数退避冷却（基数 10s，上限 5m），
+// 选择策略为平滑加权轮询（SWRR）+ 失败转移：每次拨号按节点权重选出首选
+// （等权时即普通轮询，从游标位置开始），节点失败后累计失败次数并进入指数
+// 退避冷却（基数 10s，上限 5m），
 // 冷却期内跳过该节点；全部节点都处于冷却时降级为全量尝试，
 // 避免出现“有节点但永远不试”的黑洞。
 //
@@ -69,6 +70,9 @@ type Node struct {
 	Addr string
 	// Transport 是该节点的出口隧道能力（outbound.Transport，必填）。
 	Transport outbound.Transport
+	// Weight 是该节点的调度权重（平滑加权轮询，nginx 经典算法）；
+	// <=0 按 1 处理。等权（全部节点同权重或缺省 0）时退化为普通轮询。
+	Weight int
 }
 
 // DialFunc 是节点拨号函数：预热领取未命中后的回退路径。组装根通常传
@@ -154,7 +158,14 @@ type Pool struct {
 }
 
 type state struct {
-	cfg            Node
+	cfg Node
+	// weight 是 SWRR 调度权重：节点构造时归一（max(1, cfg.Weight)），
+	// 之后恒为正，避免零/负权重破坏平滑加权轮询的推进。
+	weight int
+	// currentWeight 是 SWRR 的平滑状态：每轮候选集合内 currentWeight +=
+	// weight，被选中者扣减候选集合总权重；冷却/摘除期间不累积（不进入
+	// 候选集合就不推进），跨拨号持久，长期按 weight 比例分布流量。
+	currentWeight  int
 	fails          int
 	unhealthyUntil time.Time
 	// removed 表示被主动健康检查摘除（硬摘除，不参与任何尝试）。
@@ -254,7 +265,7 @@ func New(cfgs []Node, dial DialFunc, opts Options) (*Pool, error) {
 			p.Close()
 			return nil, fmt.Errorf("nodes[%d]: %w", i, err)
 		}
-		p.nodes = append(p.nodes, &state{cfg: cfg})
+		p.nodes = append(p.nodes, &state{cfg: cfg, weight: max(1, cfg.Weight)})
 	}
 	return p, nil
 }
@@ -386,6 +397,16 @@ func (p *Pool) annotateChainAbort(parent context.Context, err error, tried int) 
 // candidates 返回本轮尝试顺序：先剔除被主动摘除的节点（硬摘除），
 // 其余节点中优先健康者；全部处于冷却时退化为对未摘除节点的全量轮询。
 // 全部节点被摘除时返回空切片，由 Dial 转为明确错误。
+//
+// 首选节点由平滑加权轮询（SWRR，nginx 经典算法）决定：本轮候选集合内
+// 各节点 currentWeight += weight，取 currentWeight 最大者为首选，并从
+// 其 currentWeight 中扣减候选集合的 totalWeight。currentWeight 是跨拨号
+// 持久的每节点状态，只有进入候选集合的节点才推进（冷却/摘除节点不累积），
+// 长期拨号量按 weight 比例分布；等权（或全部缺省 0，按 1 处理）时平局
+// 取游标旋转起点，严格退化为旧的轮询顺序。
+//
+// 故障转移链 = SWRR 首选 + 其余候选按游标旋转顺序，每个节点在一轮链中
+// 至多尝试一次（SWRR 只决定首选，不重复展开同一节点），链内顺序可预测。
 func (p *Pool) candidates() []*state {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -407,16 +428,38 @@ func (p *Pool) candidates() []*state {
 	if len(available) == 0 {
 		return nil
 	}
-	healthy := make([]*state, 0, len(ordered))
+	set := make([]*state, 0, len(available))
 	for _, st := range available {
 		if !now.Before(st.unhealthyUntil) {
-			healthy = append(healthy, st)
+			set = append(set, st)
 		}
 	}
-	if len(healthy) == 0 {
-		return available
+	if len(set) == 0 {
+		set = available
 	}
-	return healthy
+
+	// SWRR：候选集合整体推进 currentWeight，最大者为首选。按旋转顺序
+	// 遍历并用严格大于比较，平局时取旋转起点——等权时首选即旧轮询的
+	// 起始节点，等权序列与旧 round-robin 完全一致。
+	total := 0
+	var best *state
+	for _, st := range set {
+		st.currentWeight += st.weight
+		total += st.weight
+		if best == nil || st.currentWeight > best.currentWeight {
+			best = st
+		}
+	}
+	best.currentWeight -= total
+
+	chain := make([]*state, 0, len(set))
+	chain = append(chain, best)
+	for _, st := range set {
+		if st != best {
+			chain = append(chain, st)
+		}
+	}
+	return chain
 }
 
 func (p *Pool) markSuccess(st *state) {

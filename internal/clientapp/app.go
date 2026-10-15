@@ -532,7 +532,7 @@ func (b *builder) buildOutbound(cfg *config.Config, reuse *Runtime, rt *Runtime)
 	// 配置模型 → 节点运行时模型（nodes 包不反向依赖 config）。
 	// 每节点一个传输实例：协议参数（地址、口令、TLS/SNI、超时）经
 	// buildTransport 在协议构造器封闭，SHA-224 口令派生等线格式细节不出
-	// 协议包；节点池只携带地址与传输能力（nodes 彻底协议无关）。
+	// 协议包；节点池只携带地址、调度权重与传输能力（nodes 彻底协议无关）。
 	nodeCfgs := make([]nodes.Node, 0, len(cfg.Outbound.Nodes))
 	for i := range cfg.Outbound.Nodes {
 		n := cfg.Outbound.Nodes[i]
@@ -540,7 +540,7 @@ func (b *builder) buildOutbound(cfg *config.Config, reuse *Runtime, rt *Runtime)
 		if err != nil {
 			return fmt.Errorf("outbound.nodes[%d]: %w", i, err)
 		}
-		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: addr, Transport: tr})
+		nodeCfgs = append(nodeCfgs, nodes.Node{Addr: addr, Transport: tr, Weight: n.Weight})
 	}
 
 	// 节点池拨号回退路径：预热领取未命中时走节点自身传输（预热池由
