@@ -133,7 +133,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: s.readHeaderTimeout(),
-		BaseContext:       func(net.Listener) context.Context { return handlerCtx },
+		// keep-alive 空闲回收沿用 timeouts.idle，与隧道空闲同源（二者竞争同一 connlimit 名额）。
+		IdleTimeout: s.idleTimeout(),
+		BaseContext: func(net.Listener) context.Context { return handlerCtx },
 	}
 
 	serveErrCh := make(chan error, 1)
