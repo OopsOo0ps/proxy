@@ -377,6 +377,18 @@ func TestSwitchBindFailureRollsBack(t *testing.T) {
 	if restored == nil {
 		t.Fatal("restored generation did not start")
 	}
+	// restore 必须以 cur 自身为端口稳定提示重绑（Bind(cur, cur)）：回滚后
+	// 旧监听按自身已解析地址重建，:0 入站不迁移端口（快照中最后一个 Bind
+	// 事件即 restore 的重绑；首个是 switchTo 的绑新）。
+	var restoreBind *event
+	for i := range evs {
+		if evs[i].op == "Bind" {
+			restoreBind = &evs[i]
+		}
+	}
+	if restoreBind == nil || restoreBind.rt != rt1 || restoreBind.other != rt1 {
+		t.Fatalf("restore must rebind the old runtime with itself as the port-stability hint: %+v", restoreBind)
+	}
 	// restore 走 Clone：恢复对象 != 原 cur 指针，但值相等；live 持克隆。
 	if restored == rt1 {
 		t.Fatal("restore must not re-serve the original runtime pointer")
