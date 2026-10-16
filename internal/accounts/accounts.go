@@ -92,7 +92,8 @@ func (r userRecord) user() User {
 
 // Store 是动态账户存储：RWMutex 保护的内存态 +（可选）文件持久化。
 //
-// 变更类操作（Create / SetStatus / SetSubscriptionExpiresAt）先原子落盘、
+// 变更类操作（Create / SetStatus / SetSubscriptionExpiresAt /
+// ExtendSubscriptionExpiresAt）先原子落盘、
 // 成功后再应用内存（文件是权威状态，进程崩溃不会留下内存与文件不一致的
 // 中间态）。Open 构建的 Store 可变（变更即落盘）；LoadReadOnly 构建的
 // Store 只读（变更返回 ErrReadOnly）。构造后可安全并发使用。
@@ -178,6 +179,38 @@ func (s *Store) SetSubscriptionExpiresAt(username string, expiresAt time.Time) e
 	if !expiresAt.IsZero() {
 		sub.GrantedAt = s.now()
 	}
+	rec.sub = sub
+	next := s.snapshotLocked()
+	for i := range next {
+		if next[i].username == username {
+			next[i].sub = sub
+		}
+	}
+	if err := s.saveLocked(next); err != nil {
+		return err
+	}
+	s.users[username] = rec
+	return nil
+}
+
+// ExtendSubscriptionExpiresAt 单调延长订阅到期时刻（支付路径的授予语义，设计
+// 书 §1.2 Grant：new = max(old, paid_until)，只增不减——applied 幂等落地的
+// 聚合间边终点）。目标不晚于当前到期（含零值目标 / 相同目标）时不做任何变更
+// （幂等无落盘，授予时刻也不改写）；真实延长时授予时刻取当前时钟（与
+// SetSubscriptionExpiresAt 同纪律，时钟回拨检测基准随本次授予更新）。
+// 管理员纠错通道仍是 SetSubscriptionExpiresAt（可任意设置，含回退）。
+func (s *Store) ExtendSubscriptionExpiresAt(username string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.users[username]
+	if !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownUser, username)
+	}
+	current := rec.sub.ExpiresAt
+	if at.IsZero() || (!current.IsZero() && !at.After(current)) {
+		return nil // 单调：到期时刻与授予时刻都不回退、不改写
+	}
+	sub := Subscription{ExpiresAt: at, GrantedAt: s.now()}
 	rec.sub = sub
 	next := s.snapshotLocked()
 	for i := range next {

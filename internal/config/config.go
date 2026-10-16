@@ -488,6 +488,34 @@ type Control struct {
 	Listen string `yaml:"listen,omitempty"`
 }
 
+// Payment 是支付配置（设计书 §2.1 payment；网关地址与 notify 目标均为配置
+// 注入，§1.3）。段省略 = 不启用支付，行为与现状一致；段存在即启用——要求
+// accounts 与 control 两段同时存在（订阅延长落在账户库、notify 回调由控制
+// 面承载）。线格式语义校验（密钥可解析、app_id 形状）归 internal/alipay
+// 构造器，config 只把关信封形状。
+type Payment struct {
+	// GatewayURL 是支付宝网关基地址：必须是 HTTPS（真支付宝为
+	// https://openapi.alipay.com/gateway.do；本地演示指向 mockpay 的回环
+	// HTTPS 地址）。
+	GatewayURL string `yaml:"gateway_url,omitempty"`
+	// AppID 是商户应用 ID（网关线格式参数 app_id）。
+	AppID string `yaml:"app_id,omitempty"`
+	// MerchantKeyFile 是商户 RSA2 私钥 PEM 路径（PKCS#8；请求签名用）。
+	MerchantKeyFile string `yaml:"merchant_key_file,omitempty"`
+	// AlipayPublicKeyFile 是支付宝公钥 PEM 路径（PKIX；异步通知验签用）。
+	AlipayPublicKeyFile string `yaml:"alipay_public_key_file,omitempty"`
+	// NotifyURL 是异步通知回调地址：控制面承载的环回端点（与 control.listen
+	// 同一监听，POST /notify/alipay）。
+	NotifyURL string `yaml:"notify_url,omitempty"`
+	// OrdersFile 是订单库 JSON 文件路径（版本化格式；文件缺失 = 空库，
+	// 首次运行合法——与 accounts.file 的缺失即拒启动不同）。
+	OrdersFile string `yaml:"orders_file,omitempty"`
+	// PeriodDays 是订阅档位时长（天；固定单一档位，必须 > 0）。
+	PeriodDays int `yaml:"period_days,omitempty"`
+	// PriceCents 是订阅档位价格（分；固定单一档位，必须 > 0）。
+	PriceCents int64 `yaml:"price_cents,omitempty"`
+}
+
 // Config 是 proxy-client 与 proxy-server 共用的配置信封：客户端 schema 与
 // 服务端 schema 镜像同一模式（判别字段列表 + 协议自有 params），差异只在
 // 组装根传入的 ProtocolSet（client = {http, socks5, dns} 入站 + trojan 出站；
@@ -510,6 +538,8 @@ type Config struct {
 	Accounts *Accounts `yaml:"accounts,omitempty"`
 	// Control 是控制面配置（可省；accounts 模式下必填）。
 	Control *Control `yaml:"control,omitempty"`
+	// Payment 是支付配置（可省；省略 = 不启用支付，存在则要求 accounts+control）。
+	Payment *Payment `yaml:"payment,omitempty"`
 }
 
 // ProtocolSet 是组装根能分派的协议全集（解析期校验依据，设计文档 §7.3）：
@@ -611,6 +641,15 @@ func (c *Config) applyDefaults() {
 	if c.Control != nil {
 		c.Control.Listen = strings.TrimSpace(c.Control.Listen)
 	}
+	// payment 同样只做规范化（去空白），不派生隐式路径或隐式 URL。
+	if c.Payment != nil {
+		c.Payment.GatewayURL = strings.TrimSpace(c.Payment.GatewayURL)
+		c.Payment.AppID = strings.TrimSpace(c.Payment.AppID)
+		c.Payment.MerchantKeyFile = strings.TrimSpace(c.Payment.MerchantKeyFile)
+		c.Payment.AlipayPublicKeyFile = strings.TrimSpace(c.Payment.AlipayPublicKeyFile)
+		c.Payment.NotifyURL = strings.TrimSpace(c.Payment.NotifyURL)
+		c.Payment.OrdersFile = strings.TrimSpace(c.Payment.OrdersFile)
+	}
 }
 
 func (c *Config) validate(ps ProtocolSet) error {
@@ -622,6 +661,10 @@ func (c *Config) validate(ps ProtocolSet) error {
 	}
 	// accounts / control 两段（缺省即功能整体不启用，维持现状行为）。
 	if err := c.validateAccountsControl(); err != nil {
+		return err
+	}
+	// payment 段（缺省不启用；存在时要求 accounts+control 同时在场）。
+	if err := c.validatePayment(); err != nil {
 		return err
 	}
 	if len(c.Inbounds) == 0 {
@@ -981,6 +1024,56 @@ func validateControlListen(listen string) error {
 	}
 	if !IsLoopbackListen(listen) {
 		return fmt.Errorf("control.listen: only loopback addresses are allowed (got %q): the control plane manages users and subscriptions and has no remote-access escape hatch", listen)
+	}
+	return nil
+}
+
+// validatePayment 校验 payment 段（设计书 §2.1 payment / §1.3：网关地址与
+// notify 目标均为配置注入）。段省略 = 不启用，行为与现状一致；段存在即：
+//   - accounts 与 control 两段必须同时存在（订阅延长落在账户库、notify 回调
+//     由控制面承载）；
+//   - gateway_url 必须解析为带主机的 HTTPS 地址（支付网关流量永不走明文
+//     http；本地演示亦由 mockpay 以 TLS 承载）；
+//   - 商户私钥 / 支付宝公钥 / notify / 订单库路径非空（不派生隐式路径，
+//     镜像 accounts.file 的显式纪律；文件可解析性与 app_id 形状归 alipay
+//     构造器与 payment.Open 的构造期校验）；
+//   - period_days / price_cents 必须为正（固定单一档位）。
+func (c *Config) validatePayment() error {
+	p := c.Payment
+	if p == nil {
+		return nil
+	}
+	if c.Accounts == nil || c.Control == nil {
+		return errors.New("payment: requires both accounts and control sections (subscription extensions land in the account store and the notify callback is hosted by the control plane)")
+	}
+	u, err := url.Parse(p.GatewayURL)
+	if err != nil {
+		return fmt.Errorf("payment.gateway_url: invalid URL %q: %w", p.GatewayURL, err)
+	}
+	switch {
+	case u.Scheme != "https":
+		return fmt.Errorf("payment.gateway_url: must use https (got %q): gateway traffic is RSA2-signed but never sent in plain http", p.GatewayURL)
+	case u.Host == "":
+		return fmt.Errorf("payment.gateway_url: missing host in %q", p.GatewayURL)
+	}
+	for _, kv := range []struct {
+		name  string
+		value string
+	}{
+		{"payment.merchant_key_file", p.MerchantKeyFile},
+		{"payment.alipay_public_key_file", p.AlipayPublicKeyFile},
+		{"payment.notify_url", p.NotifyURL},
+		{"payment.orders_file", p.OrdersFile},
+	} {
+		if kv.value == "" {
+			return fmt.Errorf("%s: must not be empty (no implicit path is derived)", kv.name)
+		}
+	}
+	if p.PeriodDays <= 0 {
+		return fmt.Errorf("payment.period_days: must be positive, got %d", p.PeriodDays)
+	}
+	if p.PriceCents <= 0 {
+		return fmt.Errorf("payment.price_cents: must be positive, got %d", p.PriceCents)
 	}
 	return nil
 }

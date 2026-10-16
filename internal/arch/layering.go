@@ -30,6 +30,7 @@ var Layers = map[string]int{
 	// L2 领域引擎
 	"routing": 2, "ruleset": 2, "nodes": 2, "connpool": 2, "dialer": 2,
 	"accounts": 2, // 账户聚合（动态用户/订阅存储 + 门禁视图）：HTTP-free / core-free 领域包
+	"payment":  2, // 订单聚合（状态机 + trade_no 幂等落地 + orders.json 独立持久化）：applied 落地调 accounts 单调延长订阅
 	"alipay":   2, // 支付宝线格式方言 owner（RSA2 编解码/签名 + 网关客户端）：stdlib-only，零模块内依赖
 	// L3 协议端点
 	"httpproxy": 3, "socks5": 3, "dnsgw": 3, "trojan": 3,
@@ -59,6 +60,7 @@ var SameLayerEdges = map[string][]string{
 	"clientapp": {"config", "metrics", "status"},            // 组装根唯一可触配置/遥测/管理面
 	"serverapp": {"config", "metrics", "status", "control"}, // serverapp 宿主控制面服务（同层，对齐 status）
 	"outbound":  {"core"},                                   // 勘误：出口契约签名引用 core.Target（见上注释）
+	"payment":   {"accounts"},                               // 支付落地是订单状态机的终态动作（applied 幂等落地 → 订阅单调延长，设计书 §1.1）
 }
 
 // ExternalDeps 是第三方直接依赖的属主：键为 go.mod 的 module 路径，值为
@@ -76,12 +78,18 @@ var ExternalDeps = map[string][]string{
 // 覆盖它。
 var ProtocolPkgs = map[string][]string{
 	"trojan": {"trojan", "clientapp", "serverapp", "testutil", "test/integration"},
-	// accounts 是领域词汇（非线格式协议）：触达面 = 自身 + 两个组装根/控制面
-	//（clientapp 随客户端门禁迭代再扩；test/integration 走 HTTP 黑盒零 import）。
-	"accounts": {"accounts", "serverapp", "control"},
-	// alipay 是线格式方言词汇：触达面 = 自身 + 假网关 alipaymock + 控制面 +
-	// mockpay 二进制 + 黑盒集成；数据面 L0–L3 不得触达。
-	"alipay": {"alipay", "alipaymock", "control", "cmd/mockpay", "test/integration"},
+	// accounts 是领域词汇（非线格式协议）：触达面 = 自身 + 支付落地（payment
+	// 经 SameLayerEdges 的同层边消费 ExtendSubscriptionExpiresAt）+ 两个组装根
+	// 与控制面（clientapp 随客户端门禁迭代再扩；test/integration 走 HTTP 黑盒
+	// 零 import）。
+	"accounts": {"accounts", "payment", "serverapp", "control"},
+	// payment 是订单聚合的领域词汇：触达面 = 自身 + 组装根 + 控制面（下单与
+	// notify 回调）+ 黑盒集成；数据面 L0–L3 不得触达。
+	"payment": {"payment", "serverapp", "control", "test/integration"},
+	// alipay 是线格式方言词汇：触达面 = 自身 + 假网关 alipaymock + 组装根
+	//（读取密钥文件并构造 Client，PEM 字节注入控制面）+ 控制面 + mockpay
+	// 二进制 + 黑盒集成；数据面 L0–L3 不得触达。
+	"alipay": {"alipay", "alipaymock", "serverapp", "control", "cmd/mockpay", "test/integration"},
 	// alipaymock 是假网关的 HTTP 面（迭代②）：触达面 = 自身 + 假件宿主
 	// cmd/mockpay + 控制面（迭代③）+ 黑盒集成；数据面 L0–L3 不得触达。
 	"alipaymock": {"alipay", "alipaymock", "control", "cmd/mockpay", "test/integration"},
