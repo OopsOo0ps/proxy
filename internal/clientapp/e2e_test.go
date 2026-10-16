@@ -278,6 +278,32 @@ func waitForMetric(t *testing.T, addr, want string) string {
 	return ""
 }
 
+// waitForLimitReleased 轮询 /stats 直到连接名额归还（limit.current 归零）。
+// 客户端观测到连接关闭（FIN）不代表服务端已归还名额：入站 relay 的收尾
+// （半关闭传播 + 有界排空）异步完成，名额释放晚于对端可见的 FIN。直接重试
+// CONNECT 会把「名额尚未归还」误判为「过载未恢复」——超限不是熔断，恢复
+// 断言必须建立在名额可观测地空闲之后。
+func waitForLimitReleased(t *testing.T, addr string) {
+	t.Helper()
+	var stats struct {
+		Limit *struct {
+			Current int `json:"current"`
+		} `json:"limit"`
+	}
+	const budget = 10 * time.Second
+	deadline := time.Now().Add(budget)
+	for time.Now().Before(deadline) {
+		if code := getJSON(t, "http://"+addr+"/stats", &stats); code != http.StatusOK {
+			t.Fatalf("/stats status = %d, want 200", code)
+		}
+		if stats.Limit != nil && stats.Limit.Current == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("connection limit slot not released within %v (limit=%+v)", budget, stats.Limit)
+}
+
 func TestE2EConnectSuccessRateAndThreeNodes(t *testing.T) {
 	passwords := []string{"node-1-secret", "node-2-secret", "node-3-secret"}
 	nodes := make([]config.Node, 0, len(passwords))
@@ -1383,9 +1409,12 @@ func TestE2EOverloadReturnsClearErrorAndRecovers(t *testing.T) {
 		t.Fatalf("limit = %+v, want max=1 current=1 rejected=2", stats.Limit)
 	}
 
-	// 释放名额后应恢复可用（超限不是熔断）。
+	// 释放名额后应恢复可用（超限不是熔断）。先等名额可观测地归零（服务端
+	// 归还名额晚于客户端看到的 conn1 关闭），再断言新 CONNECT 被正常服务；
+	// 重试预算放宽到 10s，避免 CI 高负载下固定 3s 预算的假失败。
 	_ = conn1.Close()
-	conn4 := waitTunnelConnect(t, app.HTTPAddr(), echoAddr, 3*time.Second)
+	waitForLimitReleased(t, app.MetricsAddr())
+	conn4 := waitTunnelConnect(t, app.HTTPAddr(), echoAddr, 10*time.Second)
 	_ = conn4.Close()
 }
 
