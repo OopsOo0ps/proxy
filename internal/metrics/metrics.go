@@ -13,6 +13,9 @@
 //   - upstream_healthy（gauge，标签 node）：节点当前是否可接流量（0 = 已被摘除）
 //   - connections_rejected_total（counter，标签 proto）：未进入服务即被拒的连接
 //     （过载闸 / 认证失败等；拒绝原因不作为指标维度）
+//   - entitlement_decisions_total（counter，标签 decision/reason）：订阅门禁判定
+//     （设计书 §3.1/§6.2；decision ∈ {allow, deny}，reason 为存储期拒绝原因
+//     有限枚举，allow 恒记 none；按用户粒度的标签明确不做）
 //   - dns_queries_total（counter，标签 route/result）与 dns_query_duration_seconds
 //     （histogram，标签 route）：DNS 网关查询（路线图 3.1）
 //   - config_reloads_total（counter，标签 result）：配置热加载次数（路线图 3.2）
@@ -42,6 +45,38 @@ const (
 	ReloadError   = "error"
 )
 
+// 订阅门禁决策词汇（设计书 §3.1/§6.2，EntitlementDecision 事件归属组装根的
+// 门禁接线点）。decision ∈ {allow, deny}；reason 为存储期拒绝原因有限枚举，
+// 词汇属主是 internal/accounts 的 RejectReason——metrics 触达不了 accounts
+// （ProtocolPkgs 领域词汇 allowlist），枚举值在此按值复写，一致性由 serverapp
+// 的计数装饰器测试（全原因逐路径驱动）钉住。allow 恒记 reason=none。
+const (
+	EntitlementDecisionAllow = "allow"
+	EntitlementDecisionDeny  = "deny"
+)
+
+// 门禁拒绝原因标签值（与 accounts.RejectReason 逐字对应）。
+const (
+	EntitlementReasonNone           = "none"
+	EntitlementReasonUnknownUser    = "unknown_user"
+	EntitlementReasonBadCredentials = "bad_credentials"
+	EntitlementReasonDisabled       = "disabled"
+	EntitlementReasonNoSubscription = "no_subscription"
+	EntitlementReasonExpired        = "expired"
+	EntitlementReasonClockRollback  = "clock_rollback"
+)
+
+// entitlementDenyReasons 是 deny 决策的 reason 有限枚举（preInitialize 用：
+// 启动后 /metrics 即有全枚举序列，无序列空洞）。
+var entitlementDenyReasons = []string{
+	EntitlementReasonUnknownUser,
+	EntitlementReasonBadCredentials,
+	EntitlementReasonDisabled,
+	EntitlementReasonNoSubscription,
+	EntitlementReasonExpired,
+	EntitlementReasonClockRollback,
+}
+
 // 编译期断言：*Metrics 满足全部组件 Observer 契约（唯一 Prometheus 适配点）。
 // 换观测后端 = 写一个新适配器，L0–L3 组件零改动。
 var (
@@ -65,6 +100,7 @@ type Metrics struct {
 	healthProbes  *prometheus.CounterVec
 	upstreamAlive *prometheus.GaugeVec
 	rejected      *prometheus.CounterVec
+	entitlements  *prometheus.CounterVec
 	dnsQueries    *prometheus.CounterVec
 	dnsDuration   *prometheus.HistogramVec
 	configReloads *prometheus.CounterVec
@@ -118,6 +154,10 @@ func New(enabledProtos []string) *Metrics {
 			Name: "connections_rejected_total",
 			Help: "Total number of connections rejected due to the configured connection limit.",
 		}, []string{"proto"}),
+		entitlements: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "entitlement_decisions_total",
+			Help: "Total number of subscription gate decisions by decision (allow/deny) and storage-period reject reason (allow is always reason=none).",
+		}, []string{"decision", "reason"}),
 		dnsQueries: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "dns_queries_total",
 			Help: "Total number of DNS gateway queries by route and result.",
@@ -144,7 +184,7 @@ func New(enabledProtos []string) *Metrics {
 			Help: "Number of rules in the currently active rule set.",
 		}),
 	}
-	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.healthProbes, m.upstreamAlive, m.rejected, m.dnsQueries, m.dnsDuration, m.configReloads, m.rulesetRefreshes, m.rulesetLastSuccess, m.rulesetRules)
+	m.registry.MustRegister(m.requests, m.duration, m.active, m.poolClaims, m.poolIdle, m.poolWarmFails, m.healthProbes, m.upstreamAlive, m.rejected, m.entitlements, m.dnsQueries, m.dnsDuration, m.configReloads, m.rulesetRefreshes, m.rulesetLastSuccess, m.rulesetRules)
 	m.preInitialize(enabledProtos)
 	return m
 }
@@ -182,6 +222,12 @@ func (m *Metrics) preInitialize(enabledProtos []string) {
 	}
 	for _, result := range []string{ReloadSuccess, ReloadError} {
 		m.configReloads.WithLabelValues(result)
+	}
+	// 订阅门禁决策序列（有限枚举，协议无关恒初始化）：allow 恒记 none，
+	// deny 按存储期拒绝原因逐枚举预建。
+	m.entitlements.WithLabelValues(EntitlementDecisionAllow, EntitlementReasonNone)
+	for _, reason := range entitlementDenyReasons {
+		m.entitlements.WithLabelValues(EntitlementDecisionDeny, reason)
 	}
 	for _, result := range []string{ruleset.RefreshSuccess, ruleset.RefreshUnchanged, ruleset.RefreshError} {
 		m.rulesetRefreshes.WithLabelValues(result)
@@ -370,4 +416,16 @@ func (m *Metrics) ConfigReload(result string) {
 		return
 	}
 	m.configReloads.WithLabelValues(result).Inc()
+}
+
+// EntitlementDecision 记录一次订阅门禁判定（设计书 §3.1 可观测性）：由组装根
+// 的门禁计数装饰器在决策点上报（trojan.Verifier 契约只暴露 (user, ok)，原因
+// 细分经判定明细 API 取回——accounts 不 import metrics）。decision 取值
+// EntitlementDecisionAllow / EntitlementDecisionDeny；reason 为有限枚举
+// （deny 记存储期拒绝原因，allow 恒记 EntitlementReasonNone）。
+func (m *Metrics) EntitlementDecision(decision, reason string) {
+	if m == nil {
+		return
+	}
+	m.entitlements.WithLabelValues(decision, reason).Inc()
 }

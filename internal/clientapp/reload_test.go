@@ -2,6 +2,7 @@ package clientapp_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,6 +53,52 @@ func readBody(t *testing.T, resp *http.Response) string {
 	return string(data)
 }
 
+// —— 重载的瞬时端口抢占重试（纯测试装置，不改变任何重载语义）——
+//
+// 病灶：switchTo 切换阶段「先关旧监听、再绑新监听」，端口 0 的入站按旧
+// 已解析端口重绑。全量套件（go test ./...）并行运行多个包的测试二进制，
+// 刚释放的临时端口可能在这一关-绑窗口内被其他进程的 :0 监听抢占，重载
+// 于是带着一次性的 EADDRINUSE 失败（表现为
+// "clientapp: bind new configuration: clientapp: listen socks5 127.0.0.1:0:
+// listen tcp 127.0.0.1:NNNNN: bind: address already in use"）。
+// 这是测试环境噪声而非产品缺陷：失败重载的回滚路径已让旧配置继续服务，
+// 把重载原样再执行一遍即可换到未被抢占的端口。
+
+// reloadBindAttempts 是单次重载针对瞬时端口抢占的最大尝试次数（含首次）。
+const reloadBindAttempts = 3
+
+// isTransientBindRace 判定 err 是否为上述瞬时端口抢占（EADDRINUSE）：
+// errors.Is 为主（错误链全程 %w），字符串兜底覆盖经 %v 中转的包装路径。
+func isTransientBindRace(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) ||
+		strings.Contains(err.Error(), "address already in use")
+}
+
+// retryTransientBindRace 对 reload 做有界重试：仅当错误是瞬时端口抢占时
+// 重试，其余错误原样透传——由调用方按既有断言处置（该报错的报错、该
+// 断言的断言），绝不掩盖真实的重载失败（构建错误、entitlement 拒绝、
+// 回滚失败等一律原样上抛）。
+func retryTransientBindRace(t *testing.T, reload func() error) error {
+	t.Helper()
+	var err error
+	for attempt := 1; attempt <= reloadBindAttempts; attempt++ {
+		err = reload()
+		if err == nil || !isTransientBindRace(err) {
+			return err
+		}
+		t.Logf("reload hit a transient ephemeral-port bind race (attempt %d/%d): %v",
+			attempt, reloadBindAttempts, err)
+	}
+	return err
+}
+
+// reloadWithPortRetry 等价于 app.ReloadFile(cfgPath, levelOverride)，仅对
+// 瞬时端口抢占自动重试（见 retryTransientBindRace）。
+func reloadWithPortRetry(t *testing.T, app *clientapp.App, cfgPath, levelOverride string) error {
+	t.Helper()
+	return retryTransientBindRace(t, func() error { return app.ReloadFile(cfgPath, levelOverride) })
+}
+
 // TestReloadSwapsInboundAuth 验证热加载后入站凭据原子替换：
 // 新凭据立即生效，旧凭据立即失效，且请求链路（经出口节点）全程可用。
 // 两个入站均为端口 0（自动分配）：重载沿用已解析端口（同端口重载成功）。
@@ -71,7 +119,7 @@ func TestReloadSwapsInboundAuth(t *testing.T) {
 	for i := range next.Inbounds {
 		next.Inbounds[i].Auth = &config.AuthConfig{Users: []config.User{{Username: "bob", Password: "pw-bob"}}}
 	}
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	// 同端口重载：监听地址保持不变（端口 0 的配置沿用已解析端口）。
@@ -137,7 +185,7 @@ func TestReloadSwapsExitNodes(t *testing.T) {
 	next := cloneCfg(cfg)
 	next.Outbound.Nodes = []config.Node{trojanNode(t, "new", newNode.addr, "new-secret")}
 	next.Outbound.Pool.Prewarm.Size = intPtr(1)
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	resp = fetchThroughProxy(t, app, target.URL, "u", "p")
@@ -177,7 +225,7 @@ func TestReloadAppliesHealthCheckConfig(t *testing.T) {
 	// 热加载关闭主动探测：节点池重建，死节点恢复“未摘除”初始状态。
 	next := cloneCfg(cfg)
 	next.Outbound.Pool.Health = config.HealthConfig{Interval: durationPtr(0)}
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	waitUpstream(t, app.MetricsAddr(), deadAddr, func(up upstreamStats) bool { return !up.Removed })
@@ -248,7 +296,7 @@ func TestReloadKeepsReusedPoolHealthLoopRunning(t *testing.T) {
 	// Reload 只改日志级别：不得触碰 health/pool/nodes（保证指纹不变 → 池复用）。
 	next := cloneCfg(cfg)
 	next.Log.Level = "info"
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 
@@ -325,7 +373,7 @@ func TestReloadRebindsMovedListener(t *testing.T) {
 	newAddr := "127.0.0.1:" + portOf(freeTCPAddr(t))
 	next := cloneCfg(cfg)
 	next.Inbounds[0].Listen = newAddr
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload with moved listener: %v", err)
 	}
 	if got := app.HTTPAddr(); got != newAddr {

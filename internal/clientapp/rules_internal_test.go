@@ -29,7 +29,7 @@ func TestReloadReusesRulesProviderWhenSourceUnchanged(t *testing.T) {
 
 	writeRules(t, rulesPath, "rules:\n  - action: direct\n    match: [\"*.example.net\"]\n")
 	next := baseReloadCfg(t, rulesPath)
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	after := app.live.Load().providers[0]
@@ -59,7 +59,7 @@ func TestReloadSwitchesRulesProviderWhenSourceChanges(t *testing.T) {
 	before := app.live.Load().providers[0]
 
 	next := baseReloadCfg(t, rulesB)
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	after := app.live.Load().providers[0]

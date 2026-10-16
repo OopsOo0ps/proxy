@@ -17,21 +17,23 @@ import (
 // 判定式（设计书 §3.1）：允许 = 口令匹配 ∧ 状态启用 ∧ (¬on ∨ 订阅有效)；
 // 订阅有效 = now ≥ granted_at ∧ now < expires_at（时钟回拨即拒绝，fail-closed）。
 //
-// 本期 on 恒为 false（无配置旋钮）：行为与现状等价（口令正确 ∧ 状态启用即
-// 放行），门禁启用与 fail-closed 配置链随迭代④。订阅维度的存储期拒绝原因
-// 即便在门禁关闭时也按同一枚举给出，供调用方记日志/计数。
+// on 是门禁开关（Store.Gate(enabled) 注入，来源 cfg.Gate.Enabled）：关闭时
+// 行为与现状等价（口令正确 ∧ 状态启用即放行，订阅维度不参与判定）；开启时
+// deny-by-default——无有效订阅即拒绝。订阅维度的存储期拒绝原因即便在门禁
+// 关闭时也按同一枚举给出，供调用方记日志/计数。
 //
 // 拒绝原因只进日志与计数器，绝不写入协议响应——拒绝在线上与认证失败同形
 // （HTTP 407 / SOCKS5 失败码 / trojan 伪装页，设计书 §1.1 I2）。
 type GateView struct {
 	store *Store
-	on    bool // 本期恒 false；无配置旋钮（门禁启用随迭代④）
+	on    bool // cfg.Gate.Enabled；关闭 = 与现状等价，开启 = 无订阅即拒绝
 }
 
-// NewGateView 构建账户库的门禁读视图（门禁关闭；视图读经 Store 的动态内存态，
-// 账户变更对后续判定立即可见——生效边界为下一次判定，与既有凭据语义一致）。
-func NewGateView(store *Store) *GateView {
-	return &GateView{store: store}
+// Gate 构建账户库的门禁读视图（设计书 §3.1：服务端以 store.Gate(cfg.Gate.Enabled)
+// 构造）。on = 门禁开关；视图读经 Store 的动态内存态，账户变更对后续判定
+// 立即可见——生效边界为下一次判定，与既有凭据语义一致。
+func (s *Store) Gate(on bool) *GateView {
+	return &GateView{store: s, on: on}
 }
 
 // Decision 是一次门禁判定：允许与否 + 存储期拒绝原因（仅日志/计数用途）。

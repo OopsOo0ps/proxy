@@ -103,7 +103,7 @@ func reopenStore(t *testing.T, path string) *accounts.Store {
 // 全程断言：凭据明文与摘要不出现在任何响应里，且变更确实落盘。
 func TestUsersCRUDHappyPath(t *testing.T) {
 	store, path, ts := newTestServer(t)
-	gate := accounts.NewGateView(store)
+	gate := store.Gate(false)
 
 	const (
 		username = "alice"

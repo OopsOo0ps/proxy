@@ -63,9 +63,10 @@ type Runtime struct {
 	// nil = 未启用（静态凭据模式维持现状行为）。
 	Control *control.Server
 
-	// gate 是账户门禁视图（accounts 模式的隧道凭据校验器，buildInbound 消费）；
-	// nil = 静态凭据模式。
-	gate *accounts.GateView
+	// gate 是账户门禁的隧道凭据校验器（accounts 模式，buildInbound 消费）：
+	// 门禁视图经计数装饰器包装（on = cfg.Gate.Enabled，决策计数在组装根，
+	// 见 control.go）；nil = 静态凭据模式。
+	gate trojan.Verifier
 
 	cfg *config.Config
 }
@@ -390,7 +391,7 @@ func bindAddr(configured, previous string) string {
 
 // liveView 是 trojan 服务端的热加载视图：凭据与伪装页锚定构建该入站时的
 // 快照（生效边界 = 新握手），超时读当前快照。verifier 为接口形态：静态凭据
-// 模式传 *auth.Store，accounts 模式传账户门禁视图（*accounts.GateView，
+// 模式传 *auth.Store，accounts 模式传门禁视图的计数装饰器（countingGate，
 // 见 control.go 的编译期断言）。
 type liveView struct {
 	live     *atomic.Pointer[Runtime]

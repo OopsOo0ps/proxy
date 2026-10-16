@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -159,7 +160,7 @@ func TestReloadRereadsRulesFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	next := baseReloadCfg(t, rulesPath)
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if got := app.live.Load().table.Decide("a.example.net"); got != core.RouteDirect {
@@ -226,7 +227,7 @@ func TestReloadAppliesLimitsAndLogConfig(t *testing.T) {
 	next := baseReloadCfg(t, rulesPath)
 	next.Limits.MaxConnections = intPtr(3)
 	next.Log.Level = "debug"
-	if err := app.Reload(next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if got := app.b.limiter.Max(); got != 3 {
@@ -242,7 +243,7 @@ func TestReloadAppliesLimitsAndLogConfig(t *testing.T) {
 	// 重载也接受 0（不限制）。
 	unlimited := baseReloadCfg(t, rulesPath)
 	unlimited.Limits.MaxConnections = intPtr(0)
-	if err := app.Reload(unlimited); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(unlimited) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if got := app.b.limiter.Max(); got != 0 {
@@ -272,7 +273,7 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 	hot := *rt.cfg
 	hot.Log.Level = "debug"
 	hot.Limits.MaxConnections = intPtr(2048)
-	if err := app.Reload(&hot); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(&hot) }); err != nil {
 		t.Fatalf("reload (non-upstream): %v", err)
 	}
 	rt2 := app.live.Load()
@@ -283,7 +284,7 @@ func TestReloadReusesOrRebuildsUpstreamPools(t *testing.T) {
 	// 上游变更：指纹变化，池必须重建。
 	cold := *rt2.cfg
 	cold.Timeouts.Dial = config.Duration(9 * time.Second)
-	if err := app.Reload(&cold); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(&cold) }); err != nil {
 		t.Fatalf("reload (upstream): %v", err)
 	}
 	rt3 := app.live.Load()
@@ -315,13 +316,47 @@ func TestReloadRebuildsPoolOnNodeWeightChange(t *testing.T) {
 	ob.Nodes = append([]config.Node(nil), ob.Nodes...)
 	ob.Nodes[0].Weight = 7
 	weighted.Outbound = &ob
-	if err := app.Reload(&weighted); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(&weighted) }); err != nil {
 		t.Fatalf("reload (weight change): %v", err)
 	}
 	rt2 := app.live.Load()
 	if rt2.pool == rt.pool {
 		t.Fatal("weight 变更必须重建节点池（weight 应参与出口指纹）")
 	}
+}
+
+// —— 瞬时端口抢占重试（与外部测试包 reload_test.go 的 retryTransientBindRace
+// 同源：同目录的 clientapp / clientapp_test 两个测试包无法共享未导出助手，
+// 故保留一份精简副本）。病灶与透传语义见彼处的完整注释——switchTo 的
+// 「关旧监听 → 绑新监听」窗口内，旧端口可能被并行套件里其他进程的 :0
+// 监听抢占，产生一次性的 EADDRINUSE；重试一遍重载即可换端口。仅对
+// EADDRINUSE 重试，其余错误原样透传，不掩盖真实的重载失败。注意：
+// TestReloadFileCountsEveryAttempt 故意不套重试——它断言重载计数的
+// 「恰一次」口径，重试会污染 config_reloads_total。
+
+// reloadBindAttempts 是单次重载针对瞬时端口抢占的最大尝试次数（含首次）。
+const reloadBindAttempts = 3
+
+// isTransientBindRace 判定 err 是否为瞬时端口抢占（EADDRINUSE）。
+func isTransientBindRace(err error) bool {
+	return errors.Is(err, syscall.EADDRINUSE) ||
+		strings.Contains(err.Error(), "address already in use")
+}
+
+// retryTransientBindRace 对 reload 做有界重试：仅当错误是瞬时端口抢占时
+// 重试，其余错误原样透传（由调用方按既有断言处置）。
+func retryTransientBindRace(t *testing.T, reload func() error) error {
+	t.Helper()
+	var err error
+	for attempt := 1; attempt <= reloadBindAttempts; attempt++ {
+		err = reload()
+		if err == nil || !isTransientBindRace(err) {
+			return err
+		}
+		t.Logf("reload hit a transient ephemeral-port bind race (attempt %d/%d): %v",
+			attempt, reloadBindAttempts, err)
+	}
+	return err
 }
 
 // —— switchTo 阶段绑定失败 → 回滚（restore）路径 ——
