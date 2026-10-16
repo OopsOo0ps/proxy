@@ -63,6 +63,15 @@ type Runtime struct {
 	// nil = 未启用（静态凭据模式维持现状行为）。
 	Control *control.Server
 
+	// adminAddr / controlAddr 是运维端点 / 控制面端点绑定成功后的已解析地址
+	//（bindRuntime 记录，绑定属于构建步骤，记录随之不可变）。status.Server
+	// 与 control.Server 关闭后自身 Addr() 返回空串（Close 置空监听快照），
+	// 端口 0 的配置在重载 / 回滚重绑时以本字段为端口稳定提示——与入站的
+	// resolvedAddrOf 同一机制（入站 Addr 闭包持有已关闭监听，关闭后仍返回
+	// 原地址，故无需等价字段）。
+	adminAddr   string
+	controlAddr string
+
 	// gate 是账户门禁的隧道凭据校验器（accounts 模式，buildInbound 消费）：
 	// 门禁视图经计数装饰器包装（on = cfg.Gate.Enabled，决策计数在组装根，
 	// 见 control.go）；nil = 静态凭据模式。
@@ -243,9 +252,11 @@ func (b *builder) assemble(cfg *config.Config) (*Runtime, error) {
 	return rt, nil
 }
 
-// bindRuntime 绑定运行时的全部监听（入站 + 运维端点）。previous 非 nil 时，
-// 与旧入站同（type, listen）的端点沿用其已解析地址（端口 0 的配置在重载后
-// 保持原端口）。任何失败关闭已绑定的一切并返回错误（不变量 3）。
+// bindRuntime 绑定运行时的全部监听（入站 + 运维端点 + 控制面）。previous
+// 非 nil 时，与旧入站同（type, listen）的端点沿用其已解析地址；运维端点与
+// 控制面以 previous 记录的 adminAddr / controlAddr 为提示——端口 0 的配置
+// 在重载 / 回滚重绑后保持原端口（bindAddr 的提示规则对三者一致）。任何失败
+// 关闭已绑定的一切并返回错误（不变量 3）。
 func (b *builder) bindRuntime(rt *Runtime, previous *Runtime) error {
 	for i := range rt.Inbounds {
 		hint := ""
@@ -259,21 +270,34 @@ func (b *builder) bindRuntime(rt *Runtime, previous *Runtime) error {
 		}
 		rt.Inbounds[i].apply(bound)
 	}
-	if err := rt.Admin.Bind(rt.cfg.API.Listen); err != nil {
+	// 运维端点：端口 0 沿用旧代际已解析端口（adminAddr 在绑定成功时记录，
+	// Close 后仍可读）；显式端口按配置原样绑定；空 api.listen = no-op。
+	adminHint := ""
+	if previous != nil {
+		adminHint = previous.adminAddr
+	}
+	if err := rt.Admin.Bind(bindAddr(rt.cfg.API.Listen, adminHint)); err != nil {
 		rt.closeListeners()
 		return err
 	}
+	rt.adminAddr = rt.Admin.Addr()
 	// 控制面监听（accounts 模式才有 Control）：仅环回由 config 校验层强制
 	//（无逃生口），此处不做非环回警告分支。空 addr = no-op（未配置时零行为）。
+	// 端口稳定性与运维端点同一机制（controlAddr 在绑定成功时记录）。
 	if rt.Control != nil {
 		listen := ""
 		if rt.cfg.Control != nil {
 			listen = rt.cfg.Control.Listen
 		}
-		if err := rt.Control.Bind(listen); err != nil {
+		controlHint := ""
+		if previous != nil {
+			controlHint = previous.controlAddr
+		}
+		if err := rt.Control.Bind(bindAddr(listen, controlHint)); err != nil {
 			rt.closeListeners()
 			return err
 		}
+		rt.controlAddr = rt.Control.Addr()
 	}
 	if addr := rt.cfg.API.Listen; addr != "" && !config.IsLoopbackListen(addr) {
 		b.logger.Warn("ops endpoints are bound to a non-loopback address; keep them behind a firewall and note PUT /log/level stays loopback-only", "listen", addr)

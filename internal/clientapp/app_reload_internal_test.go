@@ -497,20 +497,24 @@ func TestReloadSwitchBindFailureRollsBackOldListeners(t *testing.T) {
 	}
 }
 
-// TestReloadRollbackKeepsEphemeralPorts 验证回滚端口稳定（open-items #2）：
-// :0 入站在失败重载的回滚重绑后保持原监听地址——restore 以 cur 自身已解析
-// 地址为提示重绑（Bind(cur, cur)），与 switchTo 成功路径的同端口语义一致
-// （固定端口行为由 TestReloadSwitchBindFailureRollsBackOldListeners 覆盖）。
-// 刻意制造确定性的切换阶段绑定失败（新配置把 http 入站指向被持有的固定
-// 端口），因此不走瞬时端口抢占重试 helper。
+// TestReloadRollbackKeepsEphemeralPorts 验证回滚端口稳定（open-items #2/#3）：
+// :0 入站与 :0 运维端点在失败重载的回滚重绑后保持原监听地址——restore 以
+// cur 自身记录的已解析地址为提示重绑（Bind(cur, cur)：入站取 Addr 闭包、
+// 运维端点取 bindRuntime 记录的 adminAddr——status.Server 关闭后自身 Addr()
+// 为空串，不能现读），与 switchTo 成功路径的同端口语义一致（固定端口行为由
+// TestReloadSwitchBindFailureRollsBackOldListeners 覆盖，成功重载路径由
+// TestReloadKeepsEphemeralAdminPortOnSuccess 覆盖）。刻意制造确定性的切换
+// 阶段绑定失败（新配置把 http 入站指向被持有的固定端口），因此不走瞬时端口
+// 抢占重试 helper。
 func TestReloadRollbackKeepsEphemeralPorts(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("rollback-ok"))
 	}))
 	t.Cleanup(target.Close)
 
-	// 两个 :0 入站（http + socks5）：初始绑定各自获得临时端口。
+	// 两个 :0 入站（http + socks5）+ :0 运维端点：初始绑定各自获得临时端口。
 	cfg := rollbackCfg("127.0.0.1:0")
+	cfg.API.Listen = "127.0.0.1:0"
 	cfg.Inbounds = append(cfg.Inbounds, config.Inbound{Type: config.TypeSOCKS5, Listen: "127.0.0.1:0"})
 	app, err := New(cfg, nil, nil)
 	if err != nil {
@@ -518,13 +522,16 @@ func TestReloadRollbackKeepsEphemeralPorts(t *testing.T) {
 	}
 	served := startServingApp(t, app)
 	httpBefore, socksBefore := app.HTTPAddr(), app.SOCKS5Addr()
-	if httpBefore == "" || socksBefore == "" {
-		t.Fatalf("inbounds not bound: http=%q socks5=%q", httpBefore, socksBefore)
+	adminBefore := app.MetricsAddr()
+	if httpBefore == "" || socksBefore == "" || adminBefore == "" {
+		t.Fatalf("endpoints not bound: http=%q socks5=%q admin=%q", httpBefore, socksBefore, adminBefore)
 	}
 
 	// 新配置把 http 入站指向被测试全程持有的固定端口（确定性冲突），socks5
-	// 保持 :0：绑新在 http 处失败进入 restore，两个 :0 入站都按旧地址重绑。
+	// 与运维端点保持 :0：绑新在 http 处失败进入 restore，三个 :0 端点都按
+	// 旧地址重绑。
 	next := rollbackCfg(holdLoopbackListener(t))
+	next.API.Listen = "127.0.0.1:0"
 	next.Inbounds = append(next.Inbounds, config.Inbound{Type: config.TypeSOCKS5, Listen: "127.0.0.1:0"})
 	if err := app.Reload(next); err == nil {
 		t.Fatal("reload with conflicting listener must fail")
@@ -532,12 +539,15 @@ func TestReloadRollbackKeepsEphemeralPorts(t *testing.T) {
 		t.Fatalf("reload error should be a switch-stage bind failure with a successful rollback: %v", err)
 	}
 
-	// 端口稳定：两个 :0 入站的监听地址与重载前完全一致；运行时未切换。
+	// 端口稳定：两个 :0 入站与运维端点的监听地址与重载前完全一致；运行时未切换。
 	if got := app.HTTPAddr(); got != httpBefore {
 		t.Fatalf("rollback moved the :0 http listener: %s -> %s", httpBefore, got)
 	}
 	if got := app.SOCKS5Addr(); got != socksBefore {
 		t.Fatalf("rollback moved the :0 socks5 listener: %s -> %s", socksBefore, got)
+	}
+	if got := app.MetricsAddr(); got != adminBefore {
+		t.Fatalf("rollback moved the :0 admin listener: %s -> %s", adminBefore, got)
 	}
 	if rt := app.live.Load(); rt.cfg != cfg {
 		t.Fatal("runtime switched despite failed reload")
@@ -558,6 +568,73 @@ func TestReloadRollbackKeepsEphemeralPorts(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK || string(body) != "rollback-ok" {
 		t.Fatalf("old endpoint after rollback: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
+// TestReloadKeepsEphemeralAdminPortOnSuccess 验证成功重载的端口稳定
+// （open-items #3）：api.listen 为 :0 时，运维端点在成功重载（switchTo 的
+// Bind(next, cur)）后保持原监听地址——bindRuntime 以旧代际记录的 adminAddr
+// 为提示重绑，与 :0 入站的同端口语义一致（回滚路径由
+// TestReloadRollbackKeepsEphemeralPorts 覆盖）。
+func TestReloadKeepsEphemeralAdminPortOnSuccess(t *testing.T) {
+	cfg := rollbackCfg("127.0.0.1:0")
+	cfg.API.Listen = "127.0.0.1:0"
+	app, err := New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := startServingApp(t, app)
+	httpBefore, adminBefore := app.HTTPAddr(), app.MetricsAddr()
+	if httpBefore == "" || adminBefore == "" {
+		t.Fatalf("endpoints not bound: http=%q admin=%q", httpBefore, adminBefore)
+	}
+
+	// 成功重载（同 :0 配置 + 日志级别变化触发真实重建）：运维端点地址不变。
+	next := rollbackCfg("127.0.0.1:0")
+	next.API.Listen = "127.0.0.1:0"
+	next.Log.Level = "debug"
+	if err := retryTransientBindRace(t, func() error { return app.Reload(next) }); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := app.MetricsAddr(); got != adminBefore {
+		t.Fatalf("successful reload moved the :0 admin listener: %s -> %s", adminBefore, got)
+	}
+	if got := app.HTTPAddr(); got != httpBefore {
+		t.Fatalf("successful reload moved the :0 http listener: %s -> %s", httpBefore, got)
+	}
+	if rt := app.live.Load(); rt.cfg != next {
+		t.Fatal("runtime did not switch after successful reload")
+	}
+
+	// 运维端点在新代际继续服务（新代际 Serve 协程刚拉起，允许短暂重试）。
+	waitForAdminOK(t, app.MetricsAddr())
+
+	// Serve 未被一次成功的重载终止。
+	select {
+	case err := <-served:
+		t.Fatalf("Serve exited on a successful reload: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+// waitForAdminOK 轮询运维端点 /health 直到返回 200（代际切换后 Serve 协程
+// 拉起的短窗口内允许重试；超时判失败）。
+func waitForAdminOK(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/health")
+		if err == nil {
+			code := resp.StatusCode
+			_ = resp.Body.Close()
+			if code == http.StatusOK {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admin endpoint %s did not serve /health 200", addr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

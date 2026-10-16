@@ -68,8 +68,10 @@ func (b *builder) assemble(cfg *config.Config, reuse *Runtime) (*Runtime, error)
 }
 
 // bindRuntime 绑定运行时的全部监听（入站 + 运维端点）。previous 非 nil 时，
-// 与旧入站同（type, listen）的端点沿用其已解析地址（端口 0 的配置在重载后
-// 保持原端口）。任何失败关闭已绑定的一切并返回错误（不变量 3）。
+// 与旧入站同（type, listen）的端点沿用其已解析地址；运维端点以 previous
+// 记录的 adminAddr 为提示——端口 0 的配置在重载 / 回滚重绑后保持原端口
+// （bindAddr 的提示规则对两者一致）。任何失败关闭已绑定的一切并返回错误
+// （不变量 3）。
 func (b *builder) bindRuntime(rt *Runtime, previous *Runtime) error {
 	for i := range rt.Inbounds {
 		hint := ""
@@ -83,10 +85,17 @@ func (b *builder) bindRuntime(rt *Runtime, previous *Runtime) error {
 		}
 		rt.Inbounds[i].apply(bound)
 	}
-	if err := rt.Admin.Bind(rt.cfg.API.Listen); err != nil {
+	// 运维端点：端口 0 沿用旧代际已解析端口（adminAddr 在绑定成功时记录，
+	// Close 后仍可读）；显式端口按配置原样绑定；空 api.listen = no-op。
+	adminHint := ""
+	if previous != nil {
+		adminHint = previous.adminAddr
+	}
+	if err := rt.Admin.Bind(bindAddr(rt.cfg.API.Listen, adminHint)); err != nil {
 		rt.closeListeners()
 		return err
 	}
+	rt.adminAddr = rt.Admin.Addr()
 	if addr := rt.cfg.API.Listen; addr != "" && !config.IsLoopbackListen(addr) {
 		b.logger.Warn("ops endpoints are bound to a non-loopback address; keep them behind a firewall and note PUT /log/level stays loopback-only", "listen", addr)
 	}
