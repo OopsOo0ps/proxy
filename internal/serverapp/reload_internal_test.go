@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"testing"
@@ -207,6 +208,97 @@ func TestReloadSwitchBindFailureRollsBack(t *testing.T) {
 	// 旧隧道仍可通：凭据未变，回显目标经隧道可达。
 	if got := tunnelEcho(t, app, "secret", target, "ping-rollback"); got != "ping-rollback" {
 		t.Fatalf("tunnel after rollback: echo = %q", got)
+	}
+}
+
+// TestReloadRollbackKeepsEphemeralAdminPort 验证运维端点回滚端口稳定
+// （open-items #3）：api.listen 为 :0 时，失败重载的回滚重绑（restore 的
+// Bind(cur, cur)）保持运维端点原监听地址——status.Server 关闭后自身 Addr()
+// 为空串，端口提示取自 bindRuntime 记录的 adminAddr；成功重载（Bind(next,
+// cur)）的同端口稳定一并在本用例断言：两条路径都不得迁移 :0 运维端点
+// （固定端口行为由 TestReloadSwitchBindFailureRollsBack 覆盖）。
+func TestReloadRollbackKeepsEphemeralAdminPort(t *testing.T) {
+	target := startEchoTarget(t)
+
+	cfg := rollbackCfg(t, "127.0.0.1:0")
+	cfg.API.Listen = "127.0.0.1:0"
+	app, err := New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := startServingApp(t, app)
+	tunnelBefore, adminBefore := app.TunnelAddr(), app.MetricsAddr()
+	if tunnelBefore == "" || adminBefore == "" {
+		t.Fatalf("endpoints not bound: tunnel=%q admin=%q", tunnelBefore, adminBefore)
+	}
+
+	// 切换阶段绑定失败：新入站监听端口被测试全程持有（确定性冲突），运维
+	// 端点保持 :0——绑新在入站处失败进入 restore，两个 :0 端点都按旧地址重绑。
+	next := rollbackCfg(t, holdLoopbackListener(t))
+	next.API.Listen = "127.0.0.1:0"
+	if err := app.Reload(next); err == nil {
+		t.Fatal("reload with conflicting listener must fail")
+	} else if !strings.Contains(err.Error(), "bind new configuration") {
+		t.Fatalf("reload error should report the switch-stage bind failure: %v", err)
+	}
+
+	// 回滚端口稳定：:0 隧道入站与运维端点的监听地址都与重载前一致。
+	if got := app.TunnelAddr(); got != tunnelBefore {
+		t.Fatalf("rollback moved the :0 tunnel listener: %s -> %s", tunnelBefore, got)
+	}
+	if got := app.MetricsAddr(); got != adminBefore {
+		t.Fatalf("rollback moved the :0 admin listener: %s -> %s", adminBefore, got)
+	}
+	if rt := app.live.Load(); rt.cfg != cfg {
+		t.Fatal("runtime switched despite failed reload")
+	}
+	waitForAdminOK(t, adminBefore)
+
+	// 成功重载（同 :0 配置，换证书触发真实重建）：运维端点地址依旧不变。
+	nextOK := rollbackCfg(t, "127.0.0.1:0")
+	nextOK.API.Listen = "127.0.0.1:0"
+	if err := app.Reload(nextOK); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := app.TunnelAddr(); got != tunnelBefore {
+		t.Fatalf("successful reload moved the :0 tunnel listener: %s -> %s", tunnelBefore, got)
+	}
+	if got := app.MetricsAddr(); got != adminBefore {
+		t.Fatalf("successful reload moved the :0 admin listener: %s -> %s", adminBefore, got)
+	}
+	waitForAdminOK(t, adminBefore)
+
+	// Serve 未被回滚与重载终止。
+	select {
+	case err := <-served:
+		t.Fatalf("Serve exited: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// 隧道在回滚与重载后仍可通（凭据未变；测试证书经 InsecureSkipVerify 直连）。
+	if got := tunnelEcho(t, app, "secret", target, "ping-admin-stable"); got != "ping-admin-stable" {
+		t.Fatalf("tunnel after reloads: echo = %q", got)
+	}
+}
+
+// waitForAdminOK 轮询运维端点 /health 直到返回 200（代际切换后 Serve 协程
+// 拉起的短窗口内允许重试；超时判失败）。
+func waitForAdminOK(t *testing.T, addr string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := http.Get("http://" + addr + "/health")
+		if err == nil {
+			code := resp.StatusCode
+			_ = resp.Body.Close()
+			if code == http.StatusOK {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("admin endpoint %s did not serve /health 200", addr)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

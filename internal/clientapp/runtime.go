@@ -33,6 +33,13 @@ type Runtime struct {
 	// Admin 是运维端点（/metrics /health /stats /log/level）。
 	Admin *status.Server
 
+	// adminAddr 是运维端点绑定成功后的已解析地址（bindRuntime 记录，绑定属
+	// 于构建步骤，记录随之不可变）。status.Server 关闭后自身 Addr() 返回空串
+	//（Close 置空监听快照），端口 0 的配置在重载 / 回滚重绑时以本字段为端口
+	// 稳定提示——与入站的 resolvedAddrOf 同一机制（入站 Addr 闭包持有已关闭
+	// 监听，关闭后仍返回原地址，故无需等价字段）。
+	adminAddr string
+
 	cfg        *config.Config
 	table      *routeTable
 	providers  []*ruleset.Provider
