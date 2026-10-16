@@ -11,9 +11,10 @@
 //   - switchTo 三阶段：停旧（取消旧代际 ctx → 关旧监听）→ 绑新（失败
 //     回滚：关新监听 → CloseOwned → restore）→ 提交（live.Store → 上线
 //     新代际 → 最后释放被替换资源——顺序颠倒会误关新代际共享的池）；
-//   - restore：重绑旧监听并经 Clone 浅拷贝上线恢复代际——必须走 Clone，
-//     不得 Store 原 rt（旧代际仍持有该指针）；restore 也失败则 fail-closed
-//     （记录首个致命错误并触发应用级关停）；
+//   - restore：按旧运行时自身已解析地址端口稳定重绑（:0 入站回滚后保持
+//     原端口，与 switchTo 成功路径同语义）并经 Clone 浅拷贝上线恢复代际
+//     ——必须走 Clone，不得 Store 原 rt（旧代际仍持有该指针）；restore
+//     也失败则 fail-closed（记录首个致命错误并触发应用级关停）；
 //   - Reload：关停期拒绝重载；构建 / 切换失败保持旧配置继续服务；每次
 //     尝试（无论失败在哪一步）恰好记账一次（OnReloadResult）。
 //
@@ -393,8 +394,9 @@ func (a *App[RT, C]) shuttingDown() bool {
 //  1. 停旧：先取消旧代际 ctx（触发既有 drain/force 语义——session/http
 //     机械会自行关闭监听并排空存量），再同步关闭旧监听释放端口；
 //  2. 绑新：旧监听已停，同端口可重绑；任何失败回滚——关闭新运行时刚绑定
-//     的监听与新建资源，用旧运行时保存的入站配置重建旧监听并恢复服务
-//     （最终效果：reload 失败时旧配置仍在原端口继续服务）；回滚也失败时
+//     的监听与新建资源，用旧运行时保存的入站配置按其自身已解析地址端口
+//     稳定地重建旧监听并恢复服务（最终效果：reload 失败时旧配置仍在原
+//     端口继续服务，:0 入站不迁移端口）；回滚也失败时
 //     fail-closed（fail → 应用级关停，Serve 返回，进程交由进程管理器重启）；
 //  3. 提交：新快照上线（新代际），被替换的旧资源释放，旧存量连接排空。
 func (a *App[RT, C]) switchTo(cur, next *RT) error {
@@ -428,12 +430,17 @@ func (a *App[RT, C]) switchTo(cur, next *RT) error {
 	return nil
 }
 
-// restore 在绑定失败后恢复旧配置服务：用旧运行时保存的入站配置重建监听
-// 并重新上线（旧组件全部存活——切换失败路径只关闭了新运行时新建的资源）。
-// 恢复代际必须经 Clone 浅拷贝上线：旧代际（及其服务协程闭包）仍持有原
-// 指针，Store 原 rt 会与旧代际共享同一快照身份。
+// restore 在绑定失败后恢复旧配置服务：按旧运行时（cur）自身已解析的监听
+// 地址重绑全部监听（previous=cur 的端口稳定重绑：:0 入站回滚后保持原监听
+// 地址，与 switchTo 成功路径 Bind(next, cur) 的同端口语义一致；固定端口
+// 按配置重绑行为不变），并重新上线（旧组件全部存活——切换失败路径只关闭
+// 了新运行时新建的资源）。cur 的已解析地址在 CloseListeners 之后仍可读取
+// （入站 Addr 闭包持有已绑定监听，net.Listener 关闭后 Addr 仍返回原地址，
+// 成功路径在同样时序下依赖同一性质）。恢复代际必须经 Clone 浅拷贝上线：
+// 旧代际（及其服务协程闭包）仍持有原指针，Store 原 rt 会与旧代际共享同一
+// 快照身份。
 func (a *App[RT, C]) restore(cur *RT) error {
-	if err := a.opts.Port.Bind(cur, nil); err != nil {
+	if err := a.opts.Port.Bind(cur, cur); err != nil {
 		return err
 	}
 	if a.serving.Load() {

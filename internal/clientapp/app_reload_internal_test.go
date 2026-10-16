@@ -497,6 +497,70 @@ func TestReloadSwitchBindFailureRollsBackOldListeners(t *testing.T) {
 	}
 }
 
+// TestReloadRollbackKeepsEphemeralPorts 验证回滚端口稳定（open-items #2）：
+// :0 入站在失败重载的回滚重绑后保持原监听地址——restore 以 cur 自身已解析
+// 地址为提示重绑（Bind(cur, cur)），与 switchTo 成功路径的同端口语义一致
+// （固定端口行为由 TestReloadSwitchBindFailureRollsBackOldListeners 覆盖）。
+// 刻意制造确定性的切换阶段绑定失败（新配置把 http 入站指向被持有的固定
+// 端口），因此不走瞬时端口抢占重试 helper。
+func TestReloadRollbackKeepsEphemeralPorts(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("rollback-ok"))
+	}))
+	t.Cleanup(target.Close)
+
+	// 两个 :0 入站（http + socks5）：初始绑定各自获得临时端口。
+	cfg := rollbackCfg("127.0.0.1:0")
+	cfg.Inbounds = append(cfg.Inbounds, config.Inbound{Type: config.TypeSOCKS5, Listen: "127.0.0.1:0"})
+	app, err := New(cfg, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	served := startServingApp(t, app)
+	httpBefore, socksBefore := app.HTTPAddr(), app.SOCKS5Addr()
+	if httpBefore == "" || socksBefore == "" {
+		t.Fatalf("inbounds not bound: http=%q socks5=%q", httpBefore, socksBefore)
+	}
+
+	// 新配置把 http 入站指向被测试全程持有的固定端口（确定性冲突），socks5
+	// 保持 :0：绑新在 http 处失败进入 restore，两个 :0 入站都按旧地址重绑。
+	next := rollbackCfg(holdLoopbackListener(t))
+	next.Inbounds = append(next.Inbounds, config.Inbound{Type: config.TypeSOCKS5, Listen: "127.0.0.1:0"})
+	if err := app.Reload(next); err == nil {
+		t.Fatal("reload with conflicting listener must fail")
+	} else if !strings.Contains(err.Error(), "bind new configuration") || strings.Contains(err.Error(), "rollback failed") {
+		t.Fatalf("reload error should be a switch-stage bind failure with a successful rollback: %v", err)
+	}
+
+	// 端口稳定：两个 :0 入站的监听地址与重载前完全一致；运行时未切换。
+	if got := app.HTTPAddr(); got != httpBefore {
+		t.Fatalf("rollback moved the :0 http listener: %s -> %s", httpBefore, got)
+	}
+	if got := app.SOCKS5Addr(); got != socksBefore {
+		t.Fatalf("rollback moved the :0 socks5 listener: %s -> %s", socksBefore, got)
+	}
+	if rt := app.live.Load(); rt.cfg != cfg {
+		t.Fatal("runtime switched despite failed reload")
+	}
+
+	// Serve 未被一次回滚成功的失败重载终止。
+	select {
+	case err := <-served:
+		t.Fatalf("Serve exited on a rolled-back reload: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// 服务在原端口继续：经恢复的 http 监听请求环回目标（私网直连）。
+	resp := proxyGet(t, app.HTTPAddr(), target.URL)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != "rollback-ok" {
+		t.Fatalf("old endpoint after rollback: status=%d body=%q", resp.StatusCode, body)
+	}
+}
+
 // TestReloadRollbackFailureFailsClosed 验证回滚失败 → fail-closed：
 // 注入 restore 的绑定失败（旧监听无法重建）后，Reload 返回错误且 Serve
 // 退出并上报该错误——进程不以零监听状态静默存活，交由进程管理器重启。
