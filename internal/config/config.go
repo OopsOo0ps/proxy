@@ -471,12 +471,21 @@ type API struct {
 	AllowRemote bool `yaml:"allow-remote,omitempty"`
 }
 
-// Accounts 是账户库配置（accounts 模式：动态用户/订阅存储）。
-// 段省略 = 不启用账户模式，行为与现状一致；启用后与静态凭据
-// （auth.users / params.users）互斥（身份命名空间唯一）。
+// Accounts 是账户库配置。段省略 = 不启用，行为与现状一致。两个组装根 schema
+// 对同一段的语义不同（ProtocolSet 是解析期唯一注入的形状信息）：
+//
+//   - 服务端 schema（无出站侧）= accounts 模式：动态用户/订阅存储，与静态
+//     凭据（auth.users / params.users）互斥（身份命名空间唯一），且要求
+//     control.listen（账户只能经控制面管理）；
+//   - 客户端 schema（有出站侧，设计书 §3.1 客户端行 / §2.2，迭代④）=
+//     管理员分发的 entitlement 文件：同一文件格式（文件分发零转换），只读
+//     消费——不要求 control（客户端无控制面）、不与静态凭据互斥（复合认证
+//     = 静态凭据 ∧ 订阅有效），且必须与 gate.enabled 成对出现（客户端上该
+//     文件只服务门禁，孤立配置按解析期错误拒绝，不允许「配了但不生效」）。
 type Accounts struct {
 	// File 是账户库 JSON 文件路径（版本化格式，严格加载：缺失/损坏即启动
-	// 失败；空账户列表合法）。不派生隐式路径，必须显式给出。
+	// 失败；空账户列表合法）。不派生隐式路径，必须显式给出。服务端可变
+	//（控制面变更即原子落盘）；客户端只读（entitlement 视图，重载时重读）。
 	File string `yaml:"file,omitempty"`
 }
 
@@ -516,6 +525,19 @@ type Payment struct {
 	PriceCents int64 `yaml:"price_cents,omitempty"`
 }
 
+// Gate 是订阅门禁配置（设计书 §3）。段缺省 = 门禁关闭，行为与现状逐字一致；
+// enabled 即开启订阅门禁：无有效订阅的账户无法经代理出站（判定在服务端
+// 身份建立原语处，组装修正见 serverapp 的门禁视图接线）。
+// 开启即触发解析期 fail-closed 链（validateGate / 入站校验处强制）：
+//   - accounts 段必须在场（门禁视图构建在账户库之上）；
+//   - http/socks5 入站必须配 auth（环回也不例外，requiredAuth 收紧）；
+//   - dns 入站被禁止（网关无身份概念，设计书 §3.3）。
+type Gate struct {
+	// Enabled 开启订阅门禁。零值 / 段缺省 = 关闭（deny-by-default 只在
+	// 开启后生效：开启时无订阅即拒绝）。
+	Enabled bool `yaml:"enabled,omitempty"`
+}
+
 // Config 是 proxy-client 与 proxy-server 共用的配置信封：客户端 schema 与
 // 服务端 schema 镜像同一模式（判别字段列表 + 协议自有 params），差异只在
 // 组装根传入的 ProtocolSet（client = {http, socks5, dns} 入站 + trojan 出站；
@@ -540,6 +562,8 @@ type Config struct {
 	Control *Control `yaml:"control,omitempty"`
 	// Payment 是支付配置（可省；省略 = 不启用支付，存在则要求 accounts+control）。
 	Payment *Payment `yaml:"payment,omitempty"`
+	// Gate 是订阅门禁配置（可省；省略 = 门禁关闭，行为与现状一致）。
+	Gate *Gate `yaml:"gate,omitempty"`
 }
 
 // ProtocolSet 是组装根能分派的协议全集（解析期校验依据，设计文档 §7.3）：
@@ -567,6 +591,12 @@ func (s ProtocolSet) allowsOutbound(p string) bool {
 	}
 	return false
 }
+
+// hasOutboundSide 报告组装根是否有出站侧（client schema = true，server
+// schema = false）。共享 Config 信封的 client / server 差异校验按此判别：
+// ProtocolSet 是解析期注入的唯一形状信息（客户端 entitlement 复用 accounts
+// 段时按它放宽服务端专属规则，见 validateAccountsControl）。
+func (ps ProtocolSet) hasOutboundSide() bool { return len(ps.Outbound) > 0 }
 
 // Load 从 path 读取、解析并校验配置（protocols 为组装根的已知协议集）。
 func Load(path string, protocols ProtocolSet) (*Config, error) {
@@ -659,12 +689,17 @@ func (c *Config) validate(ps ProtocolSet) error {
 	if err := validateAPI(c.API); err != nil {
 		return err
 	}
-	// accounts / control 两段（缺省即功能整体不启用，维持现状行为）。
-	if err := c.validateAccountsControl(); err != nil {
+	// accounts / control 两段（按组装根 schema 分派；缺省即功能整体不启用，
+	// 维持现状行为）。
+	if err := c.validateAccountsControl(ps); err != nil {
 		return err
 	}
 	// payment 段（缺省不启用；存在时要求 accounts+control 同时在场）。
 	if err := c.validatePayment(); err != nil {
+		return err
+	}
+	// gate 段（缺省 = 门禁关闭，零行为；enabled 即解析期 fail-closed 链）。
+	if err := c.validateGate(); err != nil {
 		return err
 	}
 	if len(c.Inbounds) == 0 {
@@ -686,6 +721,9 @@ func (c *Config) validate(ps ProtocolSet) error {
 			return err
 		}
 		if ic.Type == TypeDNS {
+			if c.gateEnabled() {
+				return fmt.Errorf("%s: dns inbound is forbidden while the subscription gate is enabled (the dns gateway has no identity concept, so the gate could never cover it): remove the dns inbound or disable gate.enabled", what)
+			}
 			if ic.Auth != nil {
 				return fmt.Errorf("%s: dns inbound does not support auth", what)
 			}
@@ -693,7 +731,8 @@ func (c *Config) validate(ps ProtocolSet) error {
 				return fmt.Errorf("%s: only loopback addresses are allowed for the dns gateway (got %q): refusing to run as an open resolver", what, ic.Listen)
 			}
 		}
-		if err := validateAuth(what+".auth", ic.Auth, requiredAuth(ic.Type, ic.Listen)); err != nil {
+		required, why := requiredAuth(ic.Type, ic.Listen, c.gateEnabled())
+		if err := validateAuth(what+".auth", ic.Auth, required, why); err != nil {
 			return err
 		}
 	}
@@ -914,10 +953,12 @@ func (d DNSRouting) validate(dnsListen string) error {
 }
 
 // validateAuth 校验入站认证（auth 是入站共性机制，通用检查归 config）。
-func validateAuth(what string, a *AuthConfig, required bool) error {
+// required 为 true 且未配置 users 时以 why（必填原因的完整错误语，区分
+// 非环回强制与门禁强制）拒绝。
+func validateAuth(what string, a *AuthConfig, required bool, why string) error {
 	if a == nil || len(a.Users) == 0 {
 		if required {
-			return fmt.Errorf("%s: listening on a non-loopback address requires auth", what)
+			return fmt.Errorf("%s: %s", what, why)
 		}
 		return nil
 	}
@@ -940,14 +981,46 @@ func validateAuth(what string, a *AuthConfig, required bool) error {
 	return nil
 }
 
-// requiredAuth 报告某入站在该监听地址上是否必须配置共性认证。
-// dns 网关无认证概念；trojan 服务端的凭据属协议 params（协议自有校验）；
-// http/socks5 监听非环回地址时必填。
-func requiredAuth(inboundType, listen string) bool {
+// requiredAuth 报告某入站在该监听地址上是否必须配置共性认证，必填时同时给出
+// 完整错误语 why（区分非环回强制与门禁强制）。dns 网关无认证概念（门禁开启
+// 时 dns 入站整个被禁止）；trojan 服务端的凭据属协议 params（协议自有校验；
+// accounts 模式经门禁视图判定）；http/socks5 监听非环回地址时必填；门禁
+// 开启时一律必填——环回也不例外（门禁语义 = 任何有出站能力的入站必须先建立
+// 身份，设计书 §1.1 I1 / §3.3）。
+func requiredAuth(inboundType, listen string, gateEnabled bool) (required bool, why string) {
 	if inboundType == TypeDNS || inboundType == TypeTrojan {
-		return false
+		return false, ""
 	}
-	return !IsLoopbackListen(listen)
+	if gateEnabled {
+		return true, "the subscription gate requires auth on every http/socks5 inbound (loopback is not exempt)"
+	}
+	if !IsLoopbackListen(listen) {
+		return true, "listening on a non-loopback address requires auth"
+	}
+	return false, ""
+}
+
+// gateEnabled 报告订阅门禁是否开启（段缺省 = 关闭，行为与现状逐字一致）。
+func (c *Config) gateEnabled() bool {
+	return c.Gate != nil && c.Gate.Enabled
+}
+
+// validateGate 校验 gate 段（设计书 §3.3 fail-closed 链的解析期一环）。
+// 段缺省 = 门禁关闭，零行为；enabled ⇒ accounts 段必须在场（两个 schema 同
+// 规则）：服务端门禁视图构建在账户库之上（store.Gate(enabled)），客户端构建
+// 在 entitlement 文件的只读视图之上（accounts.LoadReadOnly + Store.Gate）——
+// 静态凭据没有订阅维度可判，门禁开启却无判定依据，只能落成「静默放行或全员
+// 拒绝」的二义状态，按 fail-closed 直接拒绝启动，要求运维显式补齐 accounts。
+// 另外两条（http/socks5 必须配 auth、dns 入站禁止）在入站校验处执行：
+// requiredAuth 收紧 + TypeDNS 分支拦截，那里才有逐入站的错误定位。
+func (c *Config) validateGate() error {
+	if !c.gateEnabled() {
+		return nil
+	}
+	if c.Accounts == nil {
+		return errors.New("gate.enabled: requires the accounts section (the subscription gate is a view over the account store; static credentials carry no subscription to enforce)")
+	}
+	return nil
 }
 
 func validateLog(l Log) error {
@@ -980,12 +1053,25 @@ func validateAPI(a API) error {
 	return nil
 }
 
-// validateAccountsControl 校验 accounts / control 两段（迭代①：门禁未启用，
-// 无 gate 配置段——函数按可扩展结构书写，gate.enabled 相关校验随④追加）：
+// validateAccountsControl 校验 accounts / control 两段（按组装根 schema 分派）。
+//
+// 服务端 schema（无出站侧）：
 //   - accounts 模式与静态凭据（auth.users / params.users）互斥（身份命名空间唯一）；
 //   - control 仅环回（无逃生口）；
 //   - accounts 段存在 ⇒ control.listen 必填（账户只能经控制面管理），反向不要求。
-func (c *Config) validateAccountsControl() error {
+//
+// 客户端 schema（有出站侧，设计书 §3.1 客户端行 / §2.2，迭代④）：
+//   - 无控制面（clientapp 不获得 →control 边）：control 段整个拒绝；
+//   - accounts 段 = entitlement 文件（只读）：不与静态凭据互斥（复合认证 =
+//     静态凭据 ∧ 订阅有效）、不要求 control，且必须与 gate.enabled 成对出现
+//     （客户端上该文件只服务门禁，孤立配置按解析期错误拒绝——不允许「配了
+//     但不生效」的静默漂移）。
+//
+// gate.enabled 相关校验在 validateGate 与入站校验处（requiredAuth / dns 分支）。
+func (c *Config) validateAccountsControl(ps ProtocolSet) error {
+	if ps.hasOutboundSide() {
+		return c.validateClientAccountsControl()
+	}
 	if c.Accounts == nil {
 		if c.Control != nil {
 			return validateControlListen(c.Control.Listen)
@@ -1009,6 +1095,26 @@ func (c *Config) validateAccountsControl() error {
 		if paramsHasStaticUsers(&ic.Params) {
 			return fmt.Errorf("inbounds[%d] (%s): params.users is mutually exclusive with accounts mode (the identity namespace must be unique)", i, ic.Type)
 		}
+	}
+	return nil
+}
+
+// validateClientAccountsControl 校验客户端 schema 的 accounts / control 段
+// （设计书 §3.1 客户端行：客户端把 entitlement 文件与入站静态凭据复合成同一
+// 形状的 Authenticate——静态 users 在客户端不是「另一个身份命名空间」，而是
+// 复合体的第一维；control / payment 是服务端专属词汇，出现即解析失败）。
+func (c *Config) validateClientAccountsControl() error {
+	if c.Control != nil {
+		return errors.New("control: this binary has no control plane (on the client the accounts file is a read-only entitlement source distributed by the admin; accounts are managed server-side)")
+	}
+	if c.Accounts == nil {
+		return nil
+	}
+	if c.Accounts.File == "" {
+		return errors.New("accounts.file: must not be empty (no implicit path is derived)")
+	}
+	if !c.gateEnabled() {
+		return errors.New("accounts: on the client the accounts file is the entitlement source of the subscription gate; set gate.enabled or remove the accounts section")
 	}
 	return nil
 }

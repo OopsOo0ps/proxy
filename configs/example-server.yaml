@@ -55,6 +55,14 @@ payment:
   period_days: 30
   price_cents: 3000
 
+# 订阅门禁（设计书 §3）。enabled: true 即开启：无有效订阅的账户无法经代理
+# 出站（判定在服务端隧道凭据校验处，生效边界 = 新握手）。开启即触发解析期
+# fail-closed 链：必须配置 accounts 段（下方已配置）；http/socks5 入站必须
+# 配 auth（环回也不例外）；dns 入站被禁止。本示例只有 trojan 入站，两条入站
+# 规则空转。默认关闭——先跑通订阅售卖，再显式开启强制。
+gate:
+  enabled: false
+
 # 入站端点（列表 + 判别字段 type；服务端为 trojan 隧道接受器，可配置多个）。
 # 建议通过防火墙/安全组限制来源；生产可监听 443 以融入普通 HTTPS 流量。
 inbounds:

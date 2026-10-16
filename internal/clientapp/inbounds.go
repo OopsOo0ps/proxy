@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/OopsOo0ps/proxy/internal/accounts"
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
@@ -21,7 +22,7 @@ import (
 func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, error) {
 	switch ic.Type {
 	case config.TypeHTTP:
-		live, err := b.liveView(ic)
+		live, err := b.liveView(ic, rt.entitlement)
 		if err != nil {
 			return InboundServer{}, err
 		}
@@ -51,7 +52,7 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 		return is, nil
 
 	case config.TypeSOCKS5:
-		live, err := b.liveView(ic)
+		live, err := b.liveView(ic, rt.entitlement)
 		if err != nil {
 			return InboundServer{}, err
 		}
@@ -126,13 +127,14 @@ func (b *builder) buildInbound(ic *config.Inbound, rt *Runtime) (InboundServer, 
 	}
 }
 
-// liveView 为 http / socks5 入站构建热加载视图（认证锚定该入站凭据）。
-func (b *builder) liveView(ic *config.Inbound) (liveView, error) {
+// liveView 为 http / socks5 入站构建热加载视图（认证锚定该入站静态凭据与
+// 本次组装加载的 entitlement 门禁视图，二者在 Auth() 处复合）。
+func (b *builder) liveView(ic *config.Inbound, gate *accounts.GateView) (liveView, error) {
 	store, err := inboundAuth(ic)
 	if err != nil {
 		return liveView{}, err
 	}
-	return liveView{live: b.live, auth: store}, nil
+	return liveView{live: b.live, auth: store, gate: gate}, nil
 }
 
 // liveViewShared 返回无认证锚定的共享视图（dns 网关无认证概念）。

@@ -112,6 +112,21 @@ routing:
   #     - "192.168.1.1:53"
   #   timeout: 5s            # 单次查询超时
 
+# 订阅门禁（客户端侧，设计书 §3.1 客户端行）。开启即：入站静态凭据与
+# entitlement 文件复合成同一认证（静态凭据 ∧ 订阅有效，两者都必须通过），
+# 无有效订阅的本地请求在握手期即被拒（407 / SOCKS5 失败码，零隧道往返）。
+# entitlement 文件 = 管理员分发的账户库文件（与 accounts 模式同一 JSON 格式，
+# 形状见 configs/example-accounts.json），客户端只读消费，SIGHUP 重载时重读
+#（重载失败保留上一份有效配置继续服务；启动期加载失败拒绝启动）。
+# fail-closed 链：必须配置 accounts 段（客户端上两者成对出现）；http/socks5
+# 入站必须配 auth（上方已配置）；dns 入站被禁止；控制面（control 段）属于
+# 服务端，客户端配置里出现即解析失败。真相源在服务端——客户端门禁的价值
+# 是本地快速失败，不是防篡改。
+# gate:
+#   enabled: true
+# accounts:
+#   file: /etc/proxy/entitlements.json
+
 # 过载保护：进程级并发连接上限（全部入站合计）；0 = 不限制。
 # 超限时 HTTP 入站回 503、SOCKS5 回 0x05 0xFF；拒绝计入 connections_rejected_total。
 limits:

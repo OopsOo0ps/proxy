@@ -230,7 +230,7 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	// 远程内容变化 + SIGHUP：立即重拉并生效，无需等待刷新周期。
 	body.Store(remoteRulesProxyLoopback)
 	next := *cfg
-	if err := app.Reload(&next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(&next) }); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	resp = fetchThroughProxy(t, app, target.URL, "u", "p")
@@ -244,7 +244,7 @@ func TestE2ERulesSighupRechecksURL(t *testing.T) {
 	// 规则服务不可用 + SIGHUP：重载成功但保持现有规则（容错语义）。
 	rulesSrv.Close()
 	next = *cfg
-	if err := app.Reload(&next); err != nil {
+	if err := retryTransientBindRace(t, func() error { return app.Reload(&next) }); err != nil {
 		t.Fatalf("reload with unreachable rules URL must stay lenient: %v", err)
 	}
 	resp = fetchThroughProxy(t, app, target.URL, "u", "p")

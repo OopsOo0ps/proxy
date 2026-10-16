@@ -10,6 +10,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/OopsOo0ps/proxy/internal/accounts"
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
@@ -39,6 +40,10 @@ type Runtime struct {
 	dnsRemote  string
 	dnsLocal   []string
 	dnsTimeout time.Duration
+	// entitlement 是客户端 entitlement 门禁视图（nil = 门禁不活跃）：本次
+	// 组装从管理员分发的 entitlement 文件只读加载，注入各 http/socks5 入站
+	// 的 liveView 与静态凭据复合（设计书 §3.1 客户端行；重载时整份重建）。
+	entitlement *accounts.GateView
 }
 
 // InboundServer 是构建完成的一个入站端点：协议端点就绪，监听由绑定步骤

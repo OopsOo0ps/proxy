@@ -1,7 +1,8 @@
 // accounts / control / payment 接线（设计书 §2.1 / §3.1，迭代①③）：accounts
 // 模式下构建进程级账户存储（builder 持有，跨代际复用——metrics/limiter/logCtrl
-// 的进程级组件先例）、门禁读视图（隧道凭据校验器）与控制面端点；payment 模式
-// （cfg.Payment 在场）再构建进程级网关客户端与订单服务注入控制面。
+// 的进程级组件先例）、门禁读视图（隧道凭据校验器，on = cfg.Gate.Enabled）与
+// 控制面端点；payment 模式（cfg.Payment 在场）再构建进程级网关客户端与订单
+// 服务注入控制面。
 //
 // cfg.Accounts 为 nil（缺省）= 全部不构建：rt.Control 与 rt.gate 保持 nil，
 // 入站沿用静态凭据（auth.NewStore），行为与现状逐字一致。accounts 模式与
@@ -18,13 +19,17 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/alipay"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/control"
+	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/payment"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
 )
 
-// 编译期断言：门禁视图结构化满足数据面契约（trojan.Verifier），accounts 包
-// 不感知消费方（设计书 §3.1；先例：app.go 的 var _ trojan.LivePolicy）。
-var _ trojan.Verifier = (*accounts.GateView)(nil)
+// 编译期断言：门禁视图与其计数装饰器都结构化满足数据面契约（trojan.Verifier），
+// accounts 包不感知消费方（设计书 §3.1；先例：app.go 的 var _ trojan.LivePolicy）。
+var (
+	_ trojan.Verifier = (*accounts.GateView)(nil)
+	_ trojan.Verifier = countingGate{}
+)
 
 // buildAccountsControl 构建 accounts 模式的进程级组件与控制面端点（cfg.Accounts
 // 为 nil 时零构建）。产物挂到 rt：
@@ -47,7 +52,14 @@ func (b *builder) buildAccountsControl(cfg *config.Config, rt *Runtime) error {
 	if err != nil {
 		return err
 	}
-	rt.gate = accounts.NewGateView(store)
+	// 门禁视图（设计书 §3.1）：on = cfg.Gate.Enabled（段缺省 = 关闭，行为与
+	// 现状逐字一致；开启 = 无有效订阅即拒绝，deny-by-default）。经计数装饰器
+	// 包装后作为隧道凭据校验器——决策计数发生在组装根（L4），accounts（L2）
+	// 不 import metrics（L4 以下禁止，arch 守护强制）。
+	rt.gate = countingGate{
+		gate: store.Gate(cfg.Gate != nil && cfg.Gate.Enabled),
+		m:    b.metrics,
+	}
 	deps := control.Deps{Store: store, Logger: b.logger}
 	if cfg.Payment != nil {
 		pay, err := b.paymentService(cfg, store)
@@ -67,6 +79,29 @@ func (b *builder) buildAccountsControl(cfg *config.Config, rt *Runtime) error {
 		return fmt.Errorf("control endpoint: %w", err)
 	}
 	return nil
+}
+
+// countingGate 是账户门禁视图的计数装饰器（L4 组装根持有，设计书 §3.1
+// 可观测性）：trojan.Verifier 契约只暴露 (user, ok)，存储期拒绝原因经视图的
+// 判定明细 API（DecideTunnel）取回，计入 entitlement_decisions_total{decision,
+// reason}（有限枚举；allow 记 reason=none）。计数点 = 门禁决策点：一次隧道
+// 握手恰好一次判定 ⇒ 恰好一次计数。计数发生在组装根，accounts（L2）不
+// import metrics（L4 以下禁止，arch 守护强制）。
+type countingGate struct {
+	gate *accounts.GateView
+	m    *metrics.Metrics
+}
+
+// VerifyTunnel 实现 trojan.Verifier：判定经门禁视图的明细 API，随后按决策
+// 计数；返回值与视图逐字一致（拒绝时仍返回匹配名，供日志定位）。
+func (g countingGate) VerifyTunnel(hashHex string) (string, bool) {
+	name, d := g.gate.DecideTunnel(hashHex)
+	if d.Allow {
+		g.m.EntitlementDecision(metrics.EntitlementDecisionAllow, metrics.EntitlementReasonNone)
+		return name, true
+	}
+	g.m.EntitlementDecision(metrics.EntitlementDecisionDeny, string(d.Reason))
+	return name, false
 }
 
 // paymentCacheKey 是进程级订单服务的构建键：热加载后键与既有实例一致则复用

@@ -56,18 +56,34 @@ func newGateFixture(t *testing.T) *gateFixture {
 	if err := st.SetSubscriptionExpiresAt("alice", start.Add(90*24*time.Hour)); err != nil {
 		t.Fatalf("grant alice subscription: %v", err)
 	}
-	return &gateFixture{store: st, gate: NewGateView(st), clock: clock}
+	return &gateFixture{store: st, gate: st.Gate(false), clock: clock}
 }
 
-// gateOn 返回门禁强制开启的视图。on 无配置旋钮（本期恒 false，启用随迭代④）；
-// 此处直接置位未导出字段，仅为④的判定分支提供形状预置与回归保护。
+// gateOn 返回门禁强制开启的视图（on = cfg.Gate.Enabled 的注入点，Store.Gate）。
 func (f *gateFixture) gateOn() *GateView {
-	g := NewGateView(f.store)
-	g.on = true
-	return g
+	return f.store.Gate(true)
 }
 
-// —— 门禁关闭（本期唯一启用的形态：行为与现状等价）——
+// TestGateSwitchDenyByDefault 钉住开关语义：同一 Store，Gate(false) 对无订阅
+// 用户放行（现状等价），Gate(true) 立即拒绝（deny-by-default）——开关只影响
+// 订阅维度，口令与状态维度不受影响。
+func TestGateSwitchDenyByDefault(t *testing.T) {
+	f := newGateFixture(t)
+
+	if !f.gate.Authenticate("carol", carolPw) {
+		t.Fatal("gate off: user without subscription must pass (status quo equivalence)")
+	}
+	if f.store.Gate(true).Authenticate("carol", carolPw) {
+		t.Fatal("gate on: user without subscription must be denied")
+	}
+	// 隧道路径同判：门禁开 + 无订阅 ⇒ 拒绝且原因 no_subscription。
+	name, d := f.store.Gate(true).DecideTunnel(sha224HexOf(carolPw))
+	if d.Allow || d.Reason != ReasonNoSubscription || name != "carol" {
+		t.Fatalf("tunnel gate on = %q, %+v, want deny/no_subscription", name, d)
+	}
+}
+
+// —— 门禁关闭（与现状等价的形态：订阅维度不参与判定）——
 
 func TestGateOffAuthenticateBranches(t *testing.T) {
 	f := newGateFixture(t)
@@ -129,7 +145,7 @@ func TestGateOffTunnelBranches(t *testing.T) {
 	}
 }
 
-// —— 门禁开启（④的判定分支：本期形状预置，经未导出字段置位驱动）——
+// —— 门禁开启（Store.Gate(true)：无有效订阅即拒绝，deny-by-default）——
 
 func TestGateOnSubscriptionBranches(t *testing.T) {
 	f := newGateFixture(t)

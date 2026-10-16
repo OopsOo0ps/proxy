@@ -80,9 +80,10 @@ var ProtocolPkgs = map[string][]string{
 	"trojan": {"trojan", "clientapp", "serverapp", "testutil", "test/integration"},
 	// accounts 是领域词汇（非线格式协议）：触达面 = 自身 + 支付落地（payment
 	// 经 SameLayerEdges 的同层边消费 ExtendSubscriptionExpiresAt）+ 两个组装根
-	// 与控制面（clientapp 随客户端门禁迭代再扩；test/integration 走 HTTP 黑盒
-	// 零 import）。
-	"accounts": {"accounts", "payment", "serverapp", "control"},
+	// 与控制面（clientapp 自迭代④起触达：只读消费管理员分发的 entitlement
+	// 文件并与入站静态凭据复合，设计书 §2.2 clientapp ──► accounts，不获得
+	// →control 边；test/integration 走 HTTP 黑盒零 import）。
+	"accounts": {"accounts", "payment", "serverapp", "control", "clientapp"},
 	// payment 是订单聚合的领域词汇：触达面 = 自身 + 组装根 + 控制面（下单与
 	// notify 回调）+ 黑盒集成；数据面 L0–L3 不得触达。
 	"payment": {"payment", "serverapp", "control", "test/integration"},

@@ -115,6 +115,70 @@ func TestConnDonePoolLabelShape(t *testing.T) {
 	}
 }
 
+// TestEntitlementDecisionCounter 钉住订阅门禁决策口径（设计书 §3.1）：决策
+// 计入 entitlement_decisions_total{decision,reason}，allow 恒记 reason=none，
+// deny 按存储期拒绝原因细分（有限枚举，不上协议线）。
+func TestEntitlementDecisionCounter(t *testing.T) {
+	m := New(clientProtos())
+	m.EntitlementDecision(EntitlementDecisionAllow, EntitlementReasonNone)
+	m.EntitlementDecision(EntitlementDecisionDeny, EntitlementReasonExpired)
+	m.EntitlementDecision(EntitlementDecisionDeny, EntitlementReasonExpired)
+	m.EntitlementDecision(EntitlementDecisionDeny, EntitlementReasonNoSubscription)
+
+	if got := testutil.ToFloat64(m.entitlements.WithLabelValues(EntitlementDecisionAllow, EntitlementReasonNone)); got != 1 {
+		t.Fatalf("entitlement_decisions_total{allow,none} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.entitlements.WithLabelValues(EntitlementDecisionDeny, EntitlementReasonExpired)); got != 2 {
+		t.Fatalf("entitlement_decisions_total{deny,expired} = %v, want 2", got)
+	}
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`entitlement_decisions_total{decision="allow",reason="none"} 1`,
+		`entitlement_decisions_total{decision="deny",reason="expired"} 2`,
+		`entitlement_decisions_total{decision="deny",reason="no_subscription"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics missing %q:\n%s", want, body)
+		}
+	}
+
+	// nil 接收者不应 panic。
+	var nilMetrics *Metrics
+	nilMetrics.EntitlementDecision(EntitlementDecisionAllow, EntitlementReasonNone)
+}
+
+// TestEntitlementPreInitializedEnum 钉住有限枚举：零流量时 /metrics 即暴露
+// 全枚举序列（allow/none + deny×6），且不存在枚举之外的序列（如空 reason）。
+func TestEntitlementPreInitializedEnum(t *testing.T) {
+	m := New(nil)
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	body := rec.Body.String()
+
+	wantSeries := map[string]bool{
+		`entitlement_decisions_total{decision="allow",reason="none"} 0`:           true,
+		`entitlement_decisions_total{decision="deny",reason="unknown_user"} 0`:    true,
+		`entitlement_decisions_total{decision="deny",reason="bad_credentials"} 0`: true,
+		`entitlement_decisions_total{decision="deny",reason="disabled"} 0`:        true,
+		`entitlement_decisions_total{decision="deny",reason="no_subscription"} 0`: true,
+		`entitlement_decisions_total{decision="deny",reason="expired"} 0`:         true,
+		`entitlement_decisions_total{decision="deny",reason="clock_rollback"} 0`:  true,
+	}
+	for want := range wantSeries {
+		if !strings.Contains(body, want) {
+			t.Fatalf("/metrics missing preinitialized series %q:\n%s", want, body)
+		}
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "entitlement_decisions_total{") && !wantSeries[strings.TrimSpace(line)] {
+			t.Fatalf("unexpected series outside the finite enum: %q", strings.TrimSpace(line))
+		}
+	}
+}
+
 func TestHandlerExposesRequiredMetricNames(t *testing.T) {
 	m := New(clientProtos())
 	m.ConnDone(attrsOf(core.ProtoTunnel, core.Route{Action: core.RouteDirect}, core.ResultOK, 10*time.Millisecond))

@@ -161,7 +161,7 @@ func TestOpenEmptyListLegal(t *testing.T) {
 	if st.Len() != 0 || len(st.List()) != 0 {
 		t.Fatalf("empty library = %d users", st.Len())
 	}
-	g := NewGateView(st)
+	g := st.Gate(false)
 	if g.Authenticate("alice", testPassword) {
 		t.Fatal("empty library must reject any credential")
 	}
@@ -405,7 +405,7 @@ func TestConcurrentCRUDAndGate(t *testing.T) {
 		}()
 		go func() {
 			defer wg.Done()
-			g := NewGateView(st)
+			g := st.Gate(false)
 			_ = g.Authenticate(name, pw)
 			_, _ = g.VerifyTunnel(sha224HexOf(pw))
 		}()

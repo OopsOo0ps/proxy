@@ -107,7 +107,7 @@ inbounds:
 }
 
 func TestAccountsModeMutexWithStaticUsers(t *testing.T) {
-	// params.users（trojan 静态凭据）。
+	// 服务端 schema：params.users（trojan 静态凭据）与 accounts 模式互斥。
 	mustFail(t, `
 accounts:
   file: var/accounts.json
@@ -121,18 +121,8 @@ inbounds:
       key-file: server.key
       users: [{ username: alice, password: change-me }]
 `, serverProtocols, "params.users is mutually exclusive with accounts mode")
-
-	// auth.users（http/socks5 共性认证）。
-	mustFail(t, `
-accounts:
-  file: var/accounts.json
-control:
-  listen: "127.0.0.1:9300"
-inbounds:
-  - type: http
-    listen: "127.0.0.1:8080"
-    auth: { users: [{ username: alice, password: change-me }] }
-`, clientProtocols, "auth.users is mutually exclusive with accounts mode")
+	// 客户端 schema 不适用该互斥（静态凭据 + entitlement 是复合认证的两维，
+	// 见 client_entitlement_test.go 的正向用例）。
 }
 
 func TestControlWithoutAccountsLegal(t *testing.T) {

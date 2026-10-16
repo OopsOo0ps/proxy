@@ -37,6 +37,16 @@ func (b *builder) assemble(cfg *config.Config, reuse *Runtime) (*Runtime, error)
 		rt.dnsLocal = b.resolveDNSLocal(cfg.Routing, dnsListen)
 	}
 
+	// entitlement 门禁（客户端迭代④，设计书 §3.1）：必须在入站构建之前
+	// 加载——入站的复合认证器引用本次构建的视图。重载路径走同一处：文件
+	// 缺失/损坏 = 组装失败 = 旧快照原子保留继续服务（fail-closed，§3.3）。
+	gate, err := b.buildEntitlement(cfg)
+	if err != nil {
+		rt.closeOwned(reuse)
+		return nil, err
+	}
+	rt.entitlement = gate
+
 	for i := range cfg.Inbounds {
 		is, err := b.buildInbound(&cfg.Inbounds[i], rt)
 		if err != nil {
