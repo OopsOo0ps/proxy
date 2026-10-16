@@ -991,11 +991,31 @@ func TestServeIdleKeepAliveReleased(t *testing.T) {
 		}
 	}
 
-	// 名额已归还：第二条连接应能被正常服务。
+	// 名额已归还：第二条连接应能被正常服务。客户端观测到 EOF 只说明服务端
+	// 已发出 FIN；名额归还在 limitedConn.Close 中紧随 conn.Close 之后，可能
+	// 晚于对端可见的 FIN——先等占用可观测地归零，再拨号断言，消除竞态。
+	waitForLimitReleased(t, limiter)
 	second, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = second.Close() }()
 	sendForwardRequest(t, second)
+}
+
+// waitForLimitReleased 轮询等待 connlimit 名额全部归还。
+// 客户端观测到连接关闭（EOF/FIN）早于服务端 limitedConn.Close 中的 Release，
+// 直接拨号下一条连接可能仍被拒绝（单名额下表现为连接被关闭）；等待可观测
+// 的占用归零后再行动，替代对释放时机的猜测。
+func waitForLimitReleased(t *testing.T, limiter *connlimit.Limiter) {
+	t.Helper()
+	const budget = 5 * time.Second
+	deadline := time.Now().Add(budget)
+	for limiter.Active() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("connlimit slot not released within %v (active=%d rejected=%d)",
+				budget, limiter.Active(), limiter.Rejected())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
