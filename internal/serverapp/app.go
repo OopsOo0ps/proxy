@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/OopsOo0ps/proxy/internal/accounts"
+	"github.com/OopsOo0ps/proxy/internal/alipay"
 	"github.com/OopsOo0ps/proxy/internal/auth"
 	"github.com/OopsOo0ps/proxy/internal/config"
 	"github.com/OopsOo0ps/proxy/internal/connlimit"
@@ -34,6 +35,7 @@ import (
 	"github.com/OopsOo0ps/proxy/internal/logging"
 	"github.com/OopsOo0ps/proxy/internal/metrics"
 	"github.com/OopsOo0ps/proxy/internal/netutil"
+	"github.com/OopsOo0ps/proxy/internal/payment"
 	"github.com/OopsOo0ps/proxy/internal/status"
 	"github.com/OopsOo0ps/proxy/internal/trojan"
 	"github.com/OopsOo0ps/proxy/internal/version"
@@ -174,6 +176,15 @@ type builder struct {
 	// 构建路径（路径变更的热加载触发重读）。nil = 静态凭据模式。
 	accounts     *accounts.Store
 	accountsPath string
+
+	// payment / alipay 是进程级支付组件（payment 模式，见 control.go）：
+	// builder 持有、跨代际复用（orders.json 单写者由单例保证；构建键缓存在
+	// *Key——热加载后键一致则复用，任一输入变更则重建并严格重读）。nil = 未
+	// 启用支付。
+	payment    *payment.Service
+	paymentKey paymentCacheKey
+	alipay     *alipay.Client
+	alipayKey  alipayCacheKey
 
 	rejects rejectThrottle
 }

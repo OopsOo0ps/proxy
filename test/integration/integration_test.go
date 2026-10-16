@@ -62,6 +62,7 @@ func buildBinaries(dir string) int {
 	for _, bin := range []struct{ name, pkg string }{
 		{"proxy-server", "./cmd/server"},
 		{"proxy-client", "./cmd/client"},
+		{"mockpay", "./cmd/mockpay"}, // 假支付宝网关（订阅门禁迭代③支付链路黑盒用例）
 	} {
 		out := filepath.Join(dir, bin.name)
 		cmd := exec.Command("go", "build", "-o", out, bin.pkg)

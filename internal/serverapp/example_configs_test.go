@@ -17,12 +17,14 @@ import (
 // 防“示例配置与代码漂移”：协议 params 严格解码、信封校验、缺省值文档——
 // 任何一侧漂移即失败。
 //
-// 示例引用 var/dev-cert.pem（make dev-cert 生成，/var/ 已忽略）：缺失时由
-// 本测试生成，保证全新检出直接 go test 也能守护。示例绑定固定演示端口；
+// 示例引用 var/dev-cert.pem（make dev-cert 生成，var/ 已忽略）与
+// var/alipay-merchant-key.pem、var/alipay-gateway-pub.pem（make dev-keys 生成）：
+// 缺失时由本测试生成，保证全新检出直接 go test 也能守护。示例绑定固定演示端口；
 // 若本机正在运行 make demo，监听会因端口占用失败——先 make demo-down。
 func TestExampleConfigsBuild(t *testing.T) {
 	t.Chdir(repoRoot(t))
 	ensureDevCerts(t)
+	ensureDevPayKeys(t)
 
 	paths := examplePaths(t)
 	if len(paths) == 0 {
@@ -102,6 +104,38 @@ func ensureDevCerts(t *testing.T) {
 		if err := os.WriteFile(to, data, 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// ensureDevPayKeys 保证 var/alipay-merchant-key.pem 与 var/alipay-gateway-pub.pem
+// 存在（示例 payment 段引用它们）。缺失时生成一对全新的 RSA2 2048 演示密钥，
+// 格式与 make dev-keys 逐字一致：商户私钥 PKCS#8（0600 落盘——仓库安全底线：
+// 私钥材料只落 gitignored 的 var/，永不进版本库）、支付宝公钥 PKIX。
+func ensureDevPayKeys(t *testing.T) {
+	t.Helper()
+	merchantKey := filepath.Join("var", "alipay-merchant-key.pem")
+	gatewayPub := filepath.Join("var", "alipay-gateway-pub.pem")
+	if _, err := os.Stat(merchantKey); err == nil {
+		if _, err := os.Stat(gatewayPub); err == nil {
+			return
+		}
+	}
+	if err := os.MkdirAll("var", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	merchantPriv, _, err := testutil.NewRSAKeyPEM()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, gatewayPubPEM, err := testutil.NewRSAKeyPEM()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(merchantKey, merchantPriv, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(gatewayPub, gatewayPubPEM, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
