@@ -46,7 +46,10 @@ const (
 // 并发背压（config limits 段文档化）。
 const (
 	// MaxConnections 是进程级并发连接上限的缺省值；0 = 不限制。
-	MaxConnections = 1024
+	// 缺省依据：2 vCPU / 4GB 实测每条隧道（双进程合计）约 200KB 内存，8192 条
+	// 约 1.6GB，落在 4GB 机器的安全水位内；小内存机器（如 1GB/2GB）应在配置里
+	// 显式调低 `limits.max-connections`，或压缩单连接开销。
+	MaxConnections = 8192
 )
 
 // 规则源（config routing.rulesets 段文档化）。

@@ -11,9 +11,22 @@
 - 出口节点故障转移总超时预算 `timeouts.failover`（缺省 30s，可配置）：
   单次请求在全部候选节点上的等待收敛为预算上限，不再随节点数量线性放大；
   预算或调用方取消导致的尝试中断不计入节点被动失败，健康节点不会被误冷却。
+- 客户端 TLS 会话复用：出口节点 TLS 配置启用 `ClientSessionCache`（每节点
+  LRU 1024 条会话），新建隧道可恢复会话，省去一次完整 TLS 握手，显著抬高
+  冷路径（每请求新建隧道）吞吐。
+- 入站 HTTP 请求头大小上限收敛为 64KiB（stdlib 缺省 1MiB）：高并发下的
+  头部缓冲内存风险面相应收敛，任何正常 CONNECT / 绝对地址请求（含
+  `Proxy-Authorization`）不受影响。
+- systemd 单元（`deploy/systemd/`）内置运行时资源约束：`GOMEMLIMIT`、
+  `MemoryHigh`、`MemoryMax` 与 `TasksMax=infinity`，取值面向 2 vCPU / 4GB
+  目标环境（`GOMEMLIMIT` 低于 `MemoryMax`，让 GC 先行软限回收）。
 
 ### 变更（Changed）
 
+- `limits.max-connections` 默认值 1024 → 8192。**升级影响**：进程并发上限
+  提高 8 倍，超限拒绝（HTTP 503 / SOCKS5 `0x05 0xFF` / 隧道关闭）随之更晚
+  触发，内存占用随并发上升；按实测口径每条隧道（双进程合计）≈200KB，小内存
+  机器应显式调低该值。
 - 核心模型抽象重构（内部结构演进，PR #32–#35）：新增 `core` / `outbound` /
   `session` 契约与生命周期包、依赖方向守护测试（`internal/arch`）、遥测改为
   组件 Observer 窄接口、Trojan 协议知识收进协议包且出口节点池协议无关。

@@ -130,7 +130,7 @@ routing:
 # 过载保护：进程级并发连接上限（全部入站合计）；0 = 不限制。
 # 超限时 HTTP 入站回 503、SOCKS5 回 0x05 0xFF；拒绝计入 connections_rejected_total。
 limits:
-  max-connections: 1024
+  max-connections: 8192
 
 # 超时。纯数字按秒解释。
 timeouts:

@@ -66,5 +66,18 @@ AmbientCapabilities=
 # 高并发连接需要更大的 fd 上限（与 limits.max_connections 配合）。
 LimitNOFILE=65535
 
+# ---- 资源约束（2 vCPU / 4GB 目标环境）----
+# GOMEMLIMIT（Go 运行时软上限）必须低于 MemoryMax：让 GC 先行回收、避免持续
+# 增长，而不是直接被内核 cgroup OOM kill。取值依据：limits.max-connections
+# 缺省 8192 × ≈200KB/条隧道（双进程合计）≈1.6GB；client 端留出系统其余部分
+# 与突发缓冲后取 GOMEMLIMIT=1536MiB / MemoryHigh=1792M / MemoryMax=2G。
+# TasksMax 计内核任务（线程/进程），不是 goroutine：Go 默认线程上限 10000，
+# 而 Ubuntu 默认 DefaultTasksMax 按用户/百分比可能低于它，误伤阻塞系统调用
+# （DNS、TLS 握手等）产生的线程，故显式放开。
+Environment=GOMEMLIMIT=1536MiB
+MemoryHigh=1792M
+MemoryMax=2G
+TasksMax=infinity
+
 [Install]
 WantedBy=multi-user.target
