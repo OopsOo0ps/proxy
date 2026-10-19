@@ -53,9 +53,16 @@ func clientTLSConfig(p trojan.Params) (*tls.Config, error) {
 	if p.InsecureSkipVerify && !config.IsLoopbackListen(p.Addr) {
 		return nil, fmt.Errorf("insecure-skip-verify is only allowed for loopback addresses (got %q); configure ca-file instead", p.Addr)
 	}
+	// ClientSessionCache 启用 TLS 会话恢复（session resumption）：不缓存时每条
+	// 新隧道都要与出口节点做完整 TLS 握手，是冷路径（每请求新建隧道）吞吐的
+	// 实测瓶颈。容量 1024 是每节点 LRU 会话条目数，足以覆盖 8192 并发上限下的
+	// 在用节点会话。该 *tls.Config 每节点一份、由该节点所有连接共享；当 SNI
+	// 为空时 trojan 侧会对它做浅拷贝（Clone）补 ServerName，cache 指针仍被
+	// 复制共享，恢复照常生效。
 	tlsCfg := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
 		InsecureSkipVerify: p.InsecureSkipVerify, // 仅环回自签调试
+		ClientSessionCache: tls.NewLRUClientSessionCache(1024),
 	}
 	if p.SNI != "" {
 		tlsCfg.ServerName = p.SNI

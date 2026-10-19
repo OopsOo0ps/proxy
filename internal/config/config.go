@@ -400,7 +400,7 @@ type Limits struct {
 	MaxConnections *int `yaml:"max-connections,omitempty"`
 }
 
-// EffectiveMaxConnections 返回生效的并发连接上限（缺省 1024，0 = 不限制）。
+// EffectiveMaxConnections 返回生效的并发连接上限（缺省 8192，0 = 不限制）。
 func (l Limits) EffectiveMaxConnections() int {
 	if l.MaxConnections == nil {
 		return defaults.MaxConnections

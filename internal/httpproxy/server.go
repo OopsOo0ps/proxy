@@ -92,6 +92,12 @@ type Server struct {
 	handler   *handler // Serve 启动后写入；CloseIdleConnections 读取
 }
 
+// maxHeaderBytes 是入站 HTTP 请求头的字节上限。stdlib http.Server 缺省 1MiB：
+// 8192 并发连接全部处于读头部阶段时，仅头部缓冲的理论上限就是 8GiB 量级的
+// 内存风险面；64KiB 已足够任何正常的 CONNECT / 绝对地址请求（含 Proxy-
+// Authorization 等头部），超限由 stdlib 回 431 并关闭连接。
+const maxHeaderBytes = 64 << 10
+
 // defaultThrottle 是缺省的认证退避器（nil Throttle 时共用）。
 var defaultThrottle = throttle.NewDefaultIPThrottle()
 
@@ -133,6 +139,9 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: s.readHeaderTimeout(),
+		// 请求头上限收敛到 maxHeaderBytes：stdlib 缺省 1MiB 在高并发下的
+		// 内存风险面过大（见常量注释）。
+		MaxHeaderBytes: maxHeaderBytes,
 		// keep-alive 空闲回收沿用 timeouts.idle，与隧道空闲同源（二者竞争同一 connlimit 名额）。
 		IdleTimeout: s.idleTimeout(),
 		BaseContext: func(net.Listener) context.Context { return handlerCtx },

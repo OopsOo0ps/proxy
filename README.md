@@ -47,7 +47,7 @@ flowchart LR
 | 隧道出站 | Trojan over TLS；出口节点轮询、主动健康检查（连续失败摘除 / 连续成功加回）、失败冷却切换 |
 | 连接池 | 上游隧道预热池：启动预热、请求领取，省去一次完整握手；空闲数与 TTL 可配，失效自动回退新建 |
 | 优雅关闭 | SIGTERM/SIGINT 后停止接受新连接，存量请求排空后退出；超时强制断开剩余连接 |
-| 背压（过载保护） | 进程级并发连接上限（默认 1024，0 = 不限制）；超限返回明确错误并计入 `connections_rejected_total` |
+| 背压（过载保护） | 进程级并发连接上限（默认 8192，0 = 不限制）；超限返回明确错误并计入 `connections_rejected_total` |
 | 分流 | 规则文件驱动 direct / proxy；环回与私网地址默认直连 |
 | 规则集动态加载 | 规则源 `rulesets`（远程 url 或本地 file）；周期刷新、失败保持现有规则、SIGHUP 立即重拉 |
 | DNS 处理 | **remote DNS（默认）**：域名随隧道到出口解析；**可选 DNS 网关**：本机环回监听，按同一分流规则转发查询 |
@@ -179,7 +179,7 @@ timeouts:                    # 纯数字按秒解释
   shutdown: 15s              # 优雅关停排空期限
 
 limits:
-  max-connections: 1024      # 进程级并发上限（全部入站合计）；0 = 不限制
+  max-connections: 8192      # 进程级并发上限（全部入站合计）；0 = 不限制
 ```
 
 ```yaml
@@ -199,7 +199,7 @@ inbounds:
           password: change-me-alice
 
 limits:
-  max-connections: 1024      # 进程级并发隧道上限
+  max-connections: 8192      # 进程级并发隧道上限
 ```
 
 入口校验：http / socks5 监听非环回地址时必须配置 `auth`，否则启动直接报错。
