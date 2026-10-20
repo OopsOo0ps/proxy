@@ -49,6 +49,33 @@ func NewTransport(cfg ClientConfig) (*Transport, error) {
 // 包住已完成 TLS 握手、尚未绑定目标的空闲连接，对预热池不透明。
 type idleConn struct{ net.Conn }
 
+// closeWriter / closeReader 是支持半关闭的连接（*net.TCPConn、*tls.Conn 均实现）。
+type (
+	closeWriter interface{ CloseWrite() error }
+	closeReader interface{ CloseRead() error }
+)
+
+// CloseWrite 透传底层半关闭写方向的能力：预热领取的连接（动态类型
+// idleConn）与 DialTunnel 新建的 *tls.Conn 必须语义等价，否则 relay 的
+// 半关闭会静默失效（relay.halfClose 只对实现 closeWriter 的连接生效），
+// 客户端 FIN 传不到节点，转发要等 timeouts.idle 超时才结束，预热名额
+// 也被整段占住。底层不支持半关闭时返回 nil（与 relay.halfClose 的容忍
+// 语义一致，连接最终会被整体关闭）。
+func (c idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+// CloseRead 透传底层半关闭读方向的能力，语义与 CloseWrite 对称。
+func (c idleConn) CloseRead() error {
+	if cr, ok := c.Conn.(closeReader); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
 // Discard 释放底层连接。当前实现与 Close 等价：预热池在 TTL 淘汰、节点
 // 摘除或关停时直接 Close 底层连接，不经过 Discard；全仓唯一的 Discard
 // 调用点是 nodes.prewarmNode 的句柄类型断言失败分支。保留为未来非 Close
