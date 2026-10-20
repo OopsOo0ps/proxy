@@ -297,6 +297,25 @@ func prewarmNode(addr string, pw outbound.Prewarmer) connpool.Node {
 // pooledPrepared 把池内空闲连接包装回两阶段句柄（bind 阶段的入参形态）。
 type pooledPrepared struct{ net.Conn }
 
+// CloseWrite / CloseRead 透传底层半关闭能力：预热链路上的包装类型必须与
+// DialTunnel 新建的 *tls.Conn 语义等价，否则 relay 的半关闭会静默失效
+// （relay.halfClose 只对实现 closeWriter 的连接生效），客户端 FIN 传不到
+// 节点，连接名额要等 timeouts.idle 超时才释放。底层不支持半关闭时返回 nil
+// （与 relay.halfClose 的容忍语义一致，连接最终会被整体关闭）。
+func (c pooledPrepared) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func (c pooledPrepared) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
 // Discard 释放底层连接（与预热池“以关闭连接释放”的语义一致）。
 func (c pooledPrepared) Discard() { _ = c.Close() }
 
